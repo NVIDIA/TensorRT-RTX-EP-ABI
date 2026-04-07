@@ -1,154 +1,164 @@
-# __NVIDIA_OSS__ Standard Repo Template
+# NVIDIA TensorRT RTX Execution Provider
 
-This README file is from the NVIDIA_OSS standard repo template of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file). It provides a list of files in the PLC-OSS-Template and guidelines on how to use (clone and customize) them.
+The NVIDIA TensorRT RTX Execution Provider (EP) is an inference deployment solution designed specifically for NVIDIA RTX GPUs, optimized for client-centric use cases.
 
-**Upon completing the customization for the project repo, the repo admin should replace this README template with the project specific README file.**
+This EP is built as a **standalone plugin** (`onnxruntime_providers_nv_tensorrt_rtx.dll`) that implements the ORT EP ABI interfaces (`OrtEpFactory`, `OrtEp`, `OrtNodeComputeInfo`, `OrtDataTransferImpl`, etc.) introduced in ORT 1.23.0. It does **not** need to be built together with ONNX Runtime.
 
-- Files (org-wide templates in the NVIDIA .github org repo; per-repo overrides allowed) in [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
+The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvidia.com/tensorrt-rtx) engine to accelerate ONNX models on RTX GPUs. It supports RTX GPUs based on Ampere and later architectures (NVIDIA GeForce RTX 30xx and above).
 
-   - Root 
-     - README.md skeleton (CTA + Quickstart + Support/Security/Governance links) 
-     - LICENSE (Apache 2.0 by default)
-        - For other licenses, see the [Confluence page](https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816) for other licenses
-        - CLA.md file (delete if not using MIT or BSD licenses)
-     - CODE_OF_CONDUCT.md 
-     - SECURITY.md (vuln reporting path) 
-     - CONTRIBUTING.md (base; repo can add specifics)
-     - SUPPORT.md (Support levels/channels)
-     - GOVERNANCE.md (baseline; repo may extend)
-     - CITATION.md (for projects that need citation)
+**Benefits:**
 
-   - .github/ 
-     - ISSUE_TEMPLATE/ (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository>)
-       - bug.yml, feature.yml, task.yml, config.yml 
-     - PULL_REQUEST_TEMPLATE.md (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/creating-a-pull-request-template-for-your-repository>)
-     - workflows/
-     - Note: workflow-templates/ for starter workflows should live in the org-level .github repo, not per-repo
+- **Small package footprint** — optimized resource usage on end-user systems at just under 200 MB.
+- **Faster model compile and load times** — leverages just-in-time compilation to build RTX hardware-optimized engines on end-user devices in seconds.
+- **Portability** — seamlessly use cached models across multiple RTX GPUs.
 
-   - Repo-specific (not org-template, maintained by the team)
-     - CODEOWNERS (place at .github/CODEOWNERS or repo root)
-     - CHANGELOG.md (or RELEASE.md) 
-     - ROADMAP.md 
-     - MAINTAINERS.md 
-     - NOTICE or THIRD_PARTY_NOTICES / THIRD_PARTY_LICENSES (dependency specific)
-     - Build/package files (CMake, pyproject, Dockerfile, etc.)
+## Contents
 
-   - Recommended structure and hygiene
-     - docs/
-     - examples/
-     - tests/
-     - scripts/
-     - Container/dev env: Dockerfile, docker/, .devcontainer/ (optional)
-     - Build/package (language-specific):
-       - Python: pyproject.toml, setup.cfg/setup.py, requirements.txt, environment.yml
-       - C++: CMakeLists.txt, cmake/, vcpkg.json
-     - Repo hygiene: .gitignore, .gitattributes, .editorconfig, .pre-commit-config.yaml, .clang-format
+- [Build from Source](#build-from-source)
+- [Usage](#usage)
+- [Features](#features)
+  - [CUDA Graph](#cuda-graph)
+  - [EP Context Model](#ep-context-model)
+  - [Runtime Cache](#runtime-cache)
+- [Execution Provider Options](#execution-provider-options)
+- [Performance Test](#performance-test)
+- [Plugin Support](#plugin-support)
+- [Project Layout](#project-layout)
+- [Documentation](#documentation)
+- [Examples](#examples)
 
+## Build from Source
 
-## Usage of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file) for NEW NVIDIA OSS repos
+### Prerequisites
 
-1. Clone the [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
-2. Find/replace all in the clone of `___PROJECT___` and `__PROJECT_NAME__` with the name of the specific project.
-3. Inspect all files to make sure all replacements work and update text as needed
+| Dependency | Minimum Version | Platform |
+|------------|-----------------|----------|
+| CMake | 3.15 | All |
+| Visual Studio | 2019 or 2022 (Desktop C++ workload) | Windows |
+| GCC / Clang | C++17-capable | Linux |
+| CUDA Toolkit | 12.9+ | All |
+| ONNX Runtime SDK | 1.24.0+ | All |
+| TensorRT RTX SDK | 1.1.1+ | All |
 
+### Quick Build
 
-**What you can reuse immediately**
-- CODE_OF_CONDUCT.md
-- SECURITY.md
-- CONTRIBUTING.md (base)
-- .github/ISSUE_TEMPLATE/.yml (bug/feature/task + config.yml)
-- .github/PULL_REQUEST_TEMPLATE.md
-- Reusable workflows 
+Configure and build using standard CMake commands. Three CMake cache variables control where the dependencies are found:
 
-**What you must customize per repo**
-- README.md: copy the skeleton and fill in product-specific details (Quickstart, Requirements, Usage, Support level, links)
-- LICENSE: check file is correct, update year, consult Confluence for alternatives https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816, add CLA.md only if your license/process requires it
-- CODEOWNERS: replace <TEAM> with your GitHub team handle(s). Place at .github/CODEOWNERS (or repo root)
-- MAINTAINERS.md: list maintainers names/roles, escalation path
-- CHANGELOG.md (or RELEASE.md): track releases/changes
-- SUPPORT.md: Update for your project
-- ROADMAP.md (optional): upcoming milestones
-- NOTICE / THIRD_PARTY_NOTICES (if you ship third‑party content)
-- Build/package files (CMake/pyproject/Dockerfile/etc.), tests/, docs/, examples/, scripts/ as appropriate
-- Workflows: Edit if you need custom behavior 
+| CMake Variable | Description                                                                           |
+|----------------|---------------------------------------------------------------------------------------|
+| `CUDAToolkit_ROOT` | Path to the CUDA Toolkit installation (optional as it will be taken from environment) |
+| `ONNXRUNTIME_ROOT` | Path to the ONNX Runtime SDK (contains `include/` and `lib/`)                         |
+| `TRT_RTX_ROOT` | Path to the TensorRT RTX SDK (contains `include/` and `lib/`)                         |
 
+**Windows**
 
-4. Change git origin to point to new repo and push
-5. Remove the line break below and everything above it
-
-## Usage for existing NVIDIA OSS repos
-
-1. Follow the steps above, but add the files to your existing repo and merge
-
-<!-- REMOVE THE LINE BELOW AND EVERYTHING ABOVE -->
------------------------------------------
-# [Project Title]
-One-sentence value proposition for users. Who is it for, and why it matters. 
-
-# Overview
-What the project does? Why the project is useful?
-Provide a brief overview, highlighting key features or problem-solving capabilities.
-
-# Getting Started
-Guide users on how they can get started with the project. This should include basic installation step, quick-start examples 
-```bash
-# Option A: Package manager (pip/conda/npm/etc.)
-<copy-paste install>
-
-# Option B: Container
-docker run <image> <args>
-
-# Verify (hello world)
-<one-liner or ~10-line example>
+```powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64 `
+      -DONNXRUNTIME_ROOT="C:\SDK\onnxruntime-win-x64-1.24.0" `
+      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.1.1.36"
+cmake --build build --config Release
 ```
-# Requirements
-Include a list of pre-requisites. 
-- OS/Arch: <summary or link to full matrix>
-- Runtime/Compiler: <versions>
-- GPU/Drivers (if applicable): CUDA <ver>, driver <ver>, etc.
 
-# Usage
+Note: If you already have protobuf installed on your system from e.g. `winget` this will conflict with cmake and fail the configuration. 
+
+**Linux**
+
 ```bash
-# Minimal runnable snippet (≤20 lines)
-<code>
+cmake -B build \
+      -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
+      -DTRT_RTX_ROOT=/path/to/tensorrt-rtx
+cmake --build build
 ```
-- More examples/tutorials: <link>
-- API reference: <link>
 
-# Performance (Optional)
-Summary of benchmarks; link to detailed results and hardware used.
+The output library is at:
+- Windows: `build\Release\onnxruntime_providers_nv_tensorrt_rtx.dll`
+- Linux: `build/libonnxruntime_providers_nv_tensorrt_rtx.so`
 
-## Releases & Roadmap 
-- Releases/Changelog: <link>
-- (Optional) Next milestones or link to `ROADMAP.md`.
-  
-# Contribution Guidelines
-- Start here: `CONTRIBUTING.md`
-- Code of Conduct: `CODE_OF_CONDUCT.md`
-- Development quickstart (build/test):
-```bash
-<clone> && <deps> && <build/test>
+
+## Usage
+
+The TensorRT RTX EP uses the **V2 device-based EP API** introduced in ORT 1.23.0. The EP library is registered dynamically at runtime, then devices are enumerated and appended to the session.
+
+### C/C++
+
+```cpp
+#include <onnxruntime_cxx_api.h>
+
+OrtApi const& ortApi = Ort::GetApi();
+Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "MyApp");
+Ort::SessionOptions session_options;
+
+// 1. Register the EP plugin library
+ortApi.RegisterExecutionProviderLibrary(
+    env, "NvTensorRTRTXExecutionProvider",
+    ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
+
+// 2. Enumerate available EP devices and find TensorRT RTX
+const OrtEpDevice* const* ep_devices = nullptr;
+size_t num_ep_devices;
+ortApi.GetEpDevices(env, &ep_devices, &num_ep_devices);
+
+const OrtEpDevice* trt_device = nullptr;
+for (size_t i = 0; i < num_ep_devices; i++) {
+    if (strcmp(ortApi.EpDevice_EpName(ep_devices[i]),
+              "NvTensorRTRTXExecutionProvider") == 0) {
+        trt_device = ep_devices[i];
+        break;
+    }
+}
+
+// 3. Append the EP with provider options
+const char* keys[]   = {"enable_cuda_graph"};
+const char* values[] = {"1"};
+ortApi.SessionOptionsAppendExecutionProvider_V2(
+    session_options, env, &trt_device, 1,
+    keys, values, 1);
+
+// 4. Create session
+Ort::Session session(env, ORT_TSTR("model.onnx"), session_options);
 ```
-## Governance & Maintainers
-- Governance: `GOVERNANCE.md`
-- Maintainers: <team/handles>
-- Labeling/triage policy: <link>
 
-## Security
-- Vulnerability disclosure: `SECURITY.md`
-- Do not file public issues for security reports.
+### Python
 
-## Support
-- Level: <Experimental | Maintained | Stable>
-- How to get help: Issues/Discussions/<channel link>
-- Response expectations (if any).
+Register the EP plugin library, discover the EP device, and add it to session options with provider-specific options.
 
-# Community
-Provide the channel for community communications.
+```python
+import onnxruntime as ort
 
-# References
-Provide a list of related references
+# 1. Register the EP plugin DLL
+ort.register_execution_provider_library(
+    "NvTensorRTRTXExecutionProvider",
+    "onnxruntime_providers_nv_tensorrt_rtx.dll")
 
-# License
-This project is licensed under the [NAME HERE] License - see the LICENSE.md file for details
-- License: <link>
+# 2. Discover the TensorRT RTX EP device
+ep_devices = ort.get_ep_devices()
+trt_device = None
+for ep_device in ep_devices:
+    if ep_device.ep_name == "NvTensorRTRTXExecutionProvider":
+        trt_device = ep_device
+        break
+
+# 3. Add EP device to session options with provider options
+session_options = ort.SessionOptions()
+session_options.add_provider_for_devices(
+    [trt_device],
+    {"nv_runtime_cache_path": "./cache"})
+
+# 4. Create session and run inference
+session = ort.InferenceSession("model.onnx", sess_options=session_options)
+result = session.run([], {"input": input_data})
+
+# 5. Cleanup: delete session before unregistering
+del session
+ort.unregister_execution_provider_library("NvTensorRTRTXExecutionProvider")
+```
+
+## Documentation
+
+For detailed documentation on features, execution provider options, and API usage, see the official ONNX Runtime documentation:
+
+- [NVIDIA TensorRT RTX Execution Provider](https://onnxruntime.ai/docs/execution-providers/TensorRTRTX-ExecutionProvider.html)
+
+## Examples
+
+See [examples/cxx/README.md](examples/cxx/README.md) for build instructions and the full list of C++ samples demonstrating EP device selection, device tensors, CUDA stream interop, and EP context model workflows.
