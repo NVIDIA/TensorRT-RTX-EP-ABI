@@ -15,15 +15,11 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 ## Contents
 
 - [Build from Source](#build-from-source)
+  - [Prerequisites](#prerequisites)
+  - [Quick Build](#quick-build)
 - [Usage](#usage)
-- [Features](#features)
-  - [CUDA Graph](#cuda-graph)
-  - [EP Context Model](#ep-context-model)
-  - [Runtime Cache](#runtime-cache)
-- [Execution Provider Options](#execution-provider-options)
-- [Performance Test](#performance-test)
-- [Plugin Support](#plugin-support)
-- [Project Layout](#project-layout)
+  - [C/C++](#cc)
+  - [Python](#python)
 - [Documentation](#documentation)
 - [Examples](#examples)
 
