@@ -1,0 +1,149 @@
+# TensorRT RTX Execution Provider clang-format configuration
+# Based on CODING-GUIDELINES.md
+
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+
+# Brace Style - Allman
+BreakBeforeBraces: Allman
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterClass: true
+  AfterControlStatement: Always
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  AfterExternBlock: true
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: true
+  BeforeWhile: false
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+IndentCaseLabels: false
+IndentCaseBlocks: false
+IndentPPDirectives: AfterHash
+NamespaceIndentation: None
+AccessModifierOffset: -4
+
+# Line Length
+ColumnLimit: 120
+
+# Include Ordering
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Corresponding header file (for .cc files)
+  - Regex: '^"(tensorrt_rtx_|cuda_graph|ep_arena|onnx_ctx)'
+    Priority: 1
+    SortPriority: 1
+  # Project headers
+  - Regex: '^"(utils/|nv_includes)'
+    Priority: 2
+    SortPriority: 2
+  # ONNX Runtime headers
+  - Regex: '^"onnxruntime'
+    Priority: 3
+    SortPriority: 3
+  # TensorRT headers
+  - Regex: '^<Nv'
+    Priority: 4
+    SortPriority: 4
+  # CUDA headers
+  - Regex: '^<cuda'
+    Priority: 5
+    SortPriority: 5
+  # Standard library headers
+  - Regex: '^<[a-z_]+>'
+    Priority: 6
+    SortPriority: 6
+  # Third-party headers
+  - Regex: '.*'
+    Priority: 7
+    SortPriority: 7
+
+# Spacing
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyBlock: false
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 2
+SpacesInAngles: Never
+SpacesInCStyleCastParentheses: false
+SpacesInConditionalStatement: false
+SpacesInContainerLiterals: true
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# Alignment
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: None
+AlignConsecutiveBitFields: None
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: None
+AlignEscapedNewlines: Left
+AlignOperands: Align
+AlignTrailingComments: true
+
+# Breaking and Packing
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Empty
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterReturnType: None
+AlwaysBreakBeforeMultilineStrings: false
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: None
+BreakBeforeConceptDeclarations: true
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeComma
+BreakInheritanceList: BeforeComma
+BreakStringLiterals: true
+
+# Pointer and Reference Alignment
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# Other
+CompactNamespaces: false
+FixNamespaceComments: true
+SortIncludes: CaseInsensitive
+SortUsingDeclarations: true
+ReflowComments: true
+
+# Penalties for breaking
+PenaltyBreakAssignment: 2
+PenaltyBreakBeforeFirstCallParameter: 19
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakOpenParenthesis: 0
+PenaltyBreakString: 1000
+PenaltyBreakTemplateDeclaration: 10
+PenaltyExcessCharacter: 1000000
+PenaltyIndentedWhitespace: 0
+PenaltyReturnTypeOnItsOwnLine: 60
+
