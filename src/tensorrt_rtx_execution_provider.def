@@ -1,0 +1,5 @@
+LIBRARY "onnxruntime_providers_nv_tensorrt_rtx.dll"
+EXPORTS
+ CreateEpFactories @1
+ ReleaseEpFactory @2
+ 
