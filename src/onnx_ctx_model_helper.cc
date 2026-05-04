@@ -24,6 +24,15 @@
 #include <fstream>
 #include <iostream>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace trt_rtx_ep
 {
 
@@ -142,6 +151,17 @@ bool IsRelativePathToParentPath(const std::string& path_string)
 //!
 //! \brief Return the directory where the ep context model locates.
 //!
+//! Semantics:
+//!  - If ep_context_file_path ends with a path separator (e.g., "/tmp/out/"),
+//!    it is treated as a directory and returned as-is.
+//!  - Otherwise ep_context_file_path is treated as a file (or file stem), and
+//!    its parent directory is returned. This matches both the SetOutputModelPath
+//!    case (e.g., "dir/model.onnx" -> "dir") and the SetEpContextBinaryInformation
+//!    case (e.g., "dir/stem" -> "dir"). We deliberately do NOT rely on
+//!    std::filesystem::is_directory() here because a same-named directory may
+//!    pre-exist on disk from earlier runs, which would otherwise flip the
+//!    interpretation in a state-dependent way.
+//!
 std::filesystem::path GetPathOrParentPathOfCtxModel(const std::string& ep_context_file_path)
 {
     if (ep_context_file_path.empty())
@@ -149,14 +169,16 @@ std::filesystem::path GetPathOrParentPathOfCtxModel(const std::string& ep_contex
         return std::filesystem::path();
     }
     std::filesystem::path ctx_path(ep_context_file_path);
-    if (std::filesystem::is_directory(ep_context_file_path))
+    const char back = ep_context_file_path.back();
+    // A trailing path separator alone implies directory semantics. We deliberately
+    // do not probe the filesystem here so that interpretation is stable regardless
+    // of whether a same-named directory happens to exist from a previous run.
+    const bool has_trailing_sep = (back == '/' || back == '\\');
+    if (has_trailing_sep)
     {
         return ctx_path;
     }
-    else
-    {
-        return ctx_path.parent_path();
-    }
+    return ctx_path.parent_path();
 }
 
 bool IsWeightStrippedEngineCache(std::filesystem::path& engine_cache_path)
@@ -390,11 +412,16 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
     int64_t embed_mode = 0;
     RETURN_IF_ORT_STATUS_ERROR(node_attr.GetValue(embed_mode));
 
-    // Get "partition_name" (fused node name at build time) for runtime cache path consistency across sessions
+    // Get "partition_name" (fused node name at build time) for runtime cache path consistency across sessions.
+    //
+    // NOTE: The Ort C++ wrapper Node_GetAttributeByName returns IsOK()==true for
+    // attributes that are NOT present, leaving the attr as a null OrtOpAttr*.
+    // Calling GetType() on that null pointer causes an access violation. Guard here.
     partition_name_.clear();
     {
         Ort::ConstOpAttr part_attr;
         if (node.GetAttributeByName(PARTITION_NAME.c_str(), part_attr).IsOK() &&
+            static_cast<const OrtOpAttr*>(part_attr) != nullptr &&
             part_attr.GetType() == OrtOpAttrType::ORT_OP_ATTR_STRING)
         {
             (void)part_attr.GetValue<std::string>(partition_name_);
@@ -465,8 +492,15 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
             return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
         }
 
-        // The engine cache and context model (current model) should be in the same directory
-        std::filesystem::path ctx_model_dir(GetPathOrParentPathOfCtxModel(ep_context_model_path_));
+        // The engine cache and context model (current model) should be in the same directory.
+        // When the context model is loaded from a buffer, ep_context_model_path_ is empty,
+        // so there is no model-file location to anchor the relative ep_cache_context path.
+        // Fall back to the ep_context_file_path session option (set via
+        // kOrtSessionOptionEpContextFilePath), which the caller is expected to provide to
+        // locate external engine binaries in that scenario (matches the QNN EP pattern).
+        const std::string& effective_ctx_path =
+            !ep_context_model_path_.empty() ? ep_context_model_path_ : ep_.GetEpContextFilePath();
+        std::filesystem::path ctx_model_dir(GetPathOrParentPathOfCtxModel(effective_ctx_path));
         auto engine_cache_path = ctx_model_dir.append(cache_path);
 
         std::string message = "[TensorRT EP] GetEpContextFromGraph engine_cache_path: " + engine_cache_path.string();
@@ -503,13 +537,65 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
 
-        std::ifstream engine_file(engine_cache_path.string(), std::ios::binary | std::ios::in);
-        engine_file.seekg(0, std::ios::end);
-        size_t engine_size = engine_file.tellg();
-        engine_file.seekg(0, std::ios::beg);
-        std::unique_ptr<char[]> engine_buf{new char[engine_size]};
-        engine_file.read((char*)engine_buf.get(), engine_size);
-        *(trt_rtx_engine_) = std::unique_ptr<nvinfer1::ICudaEngine>(trt_rtx_runtime_->deserializeCudaEngine(engine_buf.get(), engine_size));
+#if defined(_WIN32)
+        HANDLE file_handle = CreateFileW(engine_cache_path.wstring().c_str(),
+                                         GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file_handle == INVALID_HANDLE_VALUE)
+        {
+            std::string error_msg = "TensorRT EP failed to open engine cache: " + engine_cache_path.string();
+            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
+        }
+        LARGE_INTEGER file_size_li{};
+        if (!GetFileSizeEx(file_handle, &file_size_li))
+        {
+            CloseHandle(file_handle);
+            std::string error_msg = "TensorRT EP failed to get size of engine cache: " + engine_cache_path.string();
+            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
+        }
+        const size_t engine_size = static_cast<size_t>(file_size_li.QuadPart);
+        HANDLE mapping_handle = CreateFileMappingW(file_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        const void* mapped_data = (mapping_handle != nullptr)
+                                      ? MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0)
+                                      : nullptr;
+        if (!mapped_data)
+        {
+            if (mapping_handle) CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            std::string error_msg = "TensorRT EP failed to map engine cache: " + engine_cache_path.string();
+            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
+        }
+        *(trt_rtx_engine_) = std::unique_ptr<nvinfer1::ICudaEngine>(
+            trt_rtx_runtime_->deserializeCudaEngine(mapped_data, engine_size));
+        UnmapViewOfFile(mapped_data);
+        CloseHandle(mapping_handle);
+        CloseHandle(file_handle);
+#else
+        const int fd = ::open(engine_cache_path.c_str(), O_RDONLY);
+        if (fd == -1)
+        {
+            std::string error_msg = "TensorRT EP failed to open engine cache: " + engine_cache_path.string();
+            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
+        }
+        struct stat st{};
+        if (::fstat(fd, &st) == -1)
+        {
+            ::close(fd);
+            std::string error_msg = "TensorRT EP failed to fstat engine cache: " + engine_cache_path.string();
+            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
+        }
+        const size_t engine_size = static_cast<size_t>(st.st_size);
+        void* mapped_data = ::mmap(nullptr, engine_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (mapped_data == MAP_FAILED)
+        {
+            std::string error_msg = "TensorRT EP failed to map engine cache: " + engine_cache_path.string();
+            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
+        }
+        *(trt_rtx_engine_) = std::unique_ptr<nvinfer1::ICudaEngine>(
+            trt_rtx_runtime_->deserializeCudaEngine(mapped_data, engine_size));
+        ::munmap(mapped_data, engine_size);
+#endif
         if (!(*trt_rtx_engine_))
         {
             std::string error_msg = "TensorRT EP could not deserialize engine from cache: " + engine_cache_path.string();

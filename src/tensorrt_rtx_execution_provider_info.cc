@@ -69,6 +69,7 @@ TensorrtRtxExecutionProviderInfo TensorrtRtxExecutionProviderInfo::FromProviderO
             .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kUseExternalDataInitializer, info.use_external_data_initializer)
             .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kMultiProfileEnable, info.multi_profile_enable)
             .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kRuntimeCacheFile, info.runtime_cache_path)
+            .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kOpTypesToExclude, info.op_types_to_exclude)
             .AddAssignmentToReference(kOrtSessionOptionEpContextEnable, info.dump_ep_context_model)
             .AddAssignmentToReference(kOrtSessionOptionEpContextFilePath, info.ep_context_file_path)
             .AddAssignmentToReference(kOrtSessionOptionEpContextEmbedMode, info.ep_context_embed_mode)

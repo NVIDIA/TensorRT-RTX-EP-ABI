@@ -55,6 +55,13 @@ using trt_rtx_ep::kCudaGraphAnnotationSkip;
 namespace trt_rtx_ep
 {
 
+// SubGraph_t and SubGraphCollection_t were removed from NvOnnxParser.h between
+// TRT-RTX 1.5.0.97 and 1.5.0.99. Define them here for those builds and all 1.6.x+.
+#if TRT_MAJOR_RTX >= 2 || TRT_MINOR_RTX >= 6 || (TRT_MINOR_RTX == 5 && TRT_BUILD_RTX >= 99)
+using SubGraph_t = std::pair<std::vector<size_t>, bool>;
+using SubGraphCollection_t = std::vector<SubGraph_t>;
+#endif
+
 constexpr size_t kTensorRTEngineHeaderSize = 64;
 
 // Helper functions for engine header validation

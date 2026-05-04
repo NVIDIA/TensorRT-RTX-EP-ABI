@@ -43,6 +43,13 @@ ArenaImpl::ArenaImpl(AllocatorUniquePtr<OrtAllocator> allocator, const ArenaConf
 
   stats_.bytes_limit = static_cast<int64_t>(config.max_mem);
 
+  // kSameAsRequested: consider all regions (including the first) for shrinkage since the initial
+  // chunk size is irrelevant and the arena only extends by the exact request size.
+  // kNextPowerOfTwo: keep the first region to preserve the user's chosen initial allocation and
+  // avoid unnecessary re-growth.
+  consider_first_allocation_region_for_shrinkage_ =
+      (config_.arena_extend_strategy == ArenaExtendStrategy::kSameAsRequested);
+
   // Create a bunch of bins of various good sizes.
 
   // We create bins to fit all possible ranges that cover the
@@ -776,6 +783,68 @@ OrtStatus* ArenaImpl::ResetChunksUsingStream(const OrtSyncStreamImpl* stream_imp
       h = c->next;
     }
   }
+
+  return nullptr;
+}
+
+OrtStatus* ArenaImpl::Shrink() {
+  std::lock_guard<std::mutex> lock(lock_);
+
+  auto num_regions = region_manager_.regions().size();
+  std::vector<void*> region_ptrs;
+  std::vector<size_t> region_sizes;
+  region_ptrs.reserve(num_regions);
+  region_sizes.reserve(num_regions);
+
+  for (const auto& region : region_manager_.regions()) {
+    if (consider_first_allocation_region_for_shrinkage_ || region.id() != 0) {
+      region_ptrs.push_back(region.ptr());
+      region_sizes.push_back(region.memory_size());
+    }
+  }
+
+  size_t i = 0;
+  for (void* region_ptr : region_ptrs) {
+    bool deallocate_region = true;
+    ChunkHandle region_begin_chunk = region_manager_.get_handle(region_ptr);
+    ChunkHandle h = region_begin_chunk;
+    while (h != kInvalidChunkHandle) {
+      const Chunk* c = ChunkFromHandle(h);
+      if (c->in_use()) {
+        deallocate_region = false;
+        break;
+      }
+      h = c->next;
+    }
+
+    if (deallocate_region) {
+      auto shrink_size = region_sizes[i];
+      stats_.num_arena_shrinkages += 1;
+      stats_.total_allocated_bytes -= shrink_size;
+
+      LOG(VERBOSE, allocator_name_ << " Arena shrunk by " << shrink_size << " bytes."
+                                   << " The total allocated bytes is now " << stats_.total_allocated_bytes);
+
+      h = region_begin_chunk;
+      ChunkHandle temp = region_begin_chunk;
+      while (h != kInvalidChunkHandle) {
+        const Chunk* c = ChunkFromHandle(h);
+        temp = c->next;
+        RemoveFreeChunkFromBin(h);
+        DeleteChunk(h);
+        h = temp;
+      }
+
+      device_allocator_->Free(device_allocator_.get(), region_ptr);
+      region_manager_.RemoveAllocationRegion(region_ptr);
+      stats_.num_arena_extensions--;
+    }
+
+    ++i;
+  }
+
+  // Reset region allocation tracking so the arena can re-grow from the initial growth size
+  curr_region_allocation_bytes_ = config_.initial_growth_chunk_size_bytes;
 
   return nullptr;
 }
