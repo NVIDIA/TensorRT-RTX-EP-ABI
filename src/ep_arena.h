@@ -209,6 +209,10 @@ class ArenaImpl {
   // usage is asynchronous on the GPU side, and the code assigning memory is running on CPU prior to that.
   OrtStatus* ResetChunksUsingStream(const OrtSyncStreamImpl* stream_impl);
 
+  // Release unused memory regions back to the device allocator.
+  // Iterates all allocation regions and frees any that contain only free (unused) chunks.
+  OrtStatus* Shrink();
+
  private:
   void* AllocateRawInternal(size_t num_bytes, OrtSyncStream* stream, bool dump_log_on_failure);
   void DeallocateRawInternal(void* ptr);
@@ -600,6 +604,11 @@ class ArenaImpl {
 
   AllocatorStats stats_;
 
+  // If true, the first allocation region is eligible for shrinkage.
+  // kSameAsRequested: all regions (including first) can be shrunk.
+  // kNextPowerOfTwo: the first region is kept to avoid re-growing from scratch.
+  bool consider_first_allocation_region_for_shrinkage_;
+
   const OrtApi& api_;
   const OrtEpApi& ep_api_;
   const OrtLogger& logger_;
@@ -643,6 +652,13 @@ struct ArenaAllocator : OrtAllocator {
     Info = InfoImpl;
     GetStats = GetStatsImpl;
     AllocOnStream = nullptr;
+#if defined(ORT_API_VERSION) && ORT_API_VERSION >= 25
+    // OrtAllocator::Shrink was added in ORT 1.25 (ORT_API_VERSION 25).
+    // When building against older headers the field does not exist, so the
+    // assignment is compiled out. Callers on older runtimes never invoke
+    // arena shrinkage via this path.
+    Shrink = ShrinkImpl;
+#endif
   }
 
   // remove the OrtSyncStream* from any chunks that were using the stream
@@ -680,6 +696,11 @@ struct ArenaAllocator : OrtAllocator {
     const auto& arena = *static_cast<const ArenaAllocator*>(this_);
     return arena.impl_->GetStats(out);
   };
+
+  static OrtStatus* ORT_API_CALL ShrinkImpl(struct OrtAllocator* this_) noexcept {
+    auto& arena = *static_cast<ArenaAllocator*>(this_);
+    return arena.impl_->Shrink();
+  }
 
  private:
   std::unique_ptr<ArenaImpl> impl_;

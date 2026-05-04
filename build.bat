@@ -36,6 +36,11 @@ set "DO_PRODUCTION=0"
 set "TRT_RTX_EP_VERSION="
 set "FLAGS_SPECIFIED=0"
 set "BUILD_FAILED=0"
+set "USE_VCPKG=OFF"
+set "ARCH=x64"
+set "VCPKG_TARGET_TRIPLET="
+set "VCPKG_HOST_TRIPLET="
+set "VCPKG_TOOLCHAIN_FILE="
 
 REM Parse named arguments
 :parse_args
@@ -91,6 +96,14 @@ if /i "%~1"=="--build" (
 )
 if /i "%~1"=="--production" (
     set "DO_PRODUCTION=1"
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--use_vcpkg" (
+    set "USE_VCPKG=ON"
+    set "VCPKG_TARGET_TRIPLET=x64-windows-static-md"
+    set "VCPKG_HOST_TRIPLET=x64-windows"
+    set "VCPKG_TOOLCHAIN_FILE=..\vcpkg\scripts\buildsystems\vcpkg.cmake"
     shift
     goto :parse_args
 )
@@ -198,6 +211,7 @@ echo   Version:             %TRT_RTX_EP_VERSION%
 echo   Version:             0.0.0 ^(default^)
 )
 )
+echo   Target Architecture: %ARCH%
 echo ============================================================================
 echo.
 
@@ -230,6 +244,31 @@ if "%DO_UPDATE%"=="1" (
             exit /b 1
         )
     )
+
+REM ============================================================================
+REM Step 2.5: Install vcpkg (if requested)
+REM ============================================================================
+if "%USE_VCPKG%"=="ON" (
+    REM Clone vcpkg
+    if not exist "vcpkg" (
+        git clone https://github.com/microsoft/vcpkg.git
+        if !ERRORLEVEL! NEQ 0 (
+            echo ERROR: Failed to clone vcpkg.
+            exit /b 1
+        )
+        REM Init vcpkg
+        pushd "vcpkg"
+        call .\bootstrap-vcpkg.bat
+        if !ERRORLEVEL! NEQ 0 (
+            echo ERROR: Failed to bootstrap vcpkg.
+            popd
+            exit /b 1
+        )
+        REM Return to root
+        popd
+    )  
+)
+
     
     cd /d "%BUILD_DIR%"
     
@@ -244,10 +283,14 @@ if "%DO_UPDATE%"=="1" (
     ) else (
         set "VERSION_FLAG="
     )
-    cmake -G "Visual Studio 17 2022" -A x64 ^
+    cmake -G "Visual Studio 17 2022" -A %ARCH% ^
           -DCUDAToolkit_ROOT="%CUDA_TOOLKIT_PATH%" ^
           -DONNXRUNTIME_ROOT="%ONNXRUNTIME_ROOT%" ^
           -DTRT_RTX_ROOT="%TRT_RTX_ROOT%" ^
+          -DUSE_VCPKG="%USE_VCPKG%" ^
+          -DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN_FILE% ^
+          -DVCPKG_TARGET_TRIPLET=%VCPKG_TARGET_TRIPLET% ^
+          -DVCPKG_HOST_TRIPLET=%VCPKG_HOST_TRIPLET% ^
           !PRODUCTION_FLAG! ^
           !VERSION_FLAG! ^
           "%SOURCE_DIR%"
@@ -335,6 +378,7 @@ echo   --update                   Run CMake configuration
 echo   --build                    Compile the project
 echo   --version ^<M.m.p^>          Set EP version (e.g. 1.2.3). Required for --production
 echo   --production               Enable production build with signature verification
+echo   --use_vcpkg                Use VCPKG package manager
 echo   -h, --help, /?             Show this help message
 echo.
 echo Build Actions (can be combined, executed in order: clean -^> update -^> build):

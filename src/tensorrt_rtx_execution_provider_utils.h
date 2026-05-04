@@ -326,6 +326,9 @@ inline HashValue TRTGenerateId(const OrtGraph* graph, const std::string& trt_ver
     {
         for (auto output : node.GetOutputs())
         {
+            const OrtValueInfo* out_ptr = (const OrtValueInfo*)(output);
+            if (out_ptr == nullptr)
+                continue;  // skip unconnected optional outputs (e.g., LSTM Y sequence output)
             hash_str(output.GetName());
         }
     }

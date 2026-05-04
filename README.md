@@ -36,14 +36,14 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 
 ### Prerequisites
 
-| Dependency | Minimum Version | Platform |
-|------------|-----------------|----------|
-| CMake | 3.15 | All |
-| Visual Studio | 2019 or 2022 (Desktop C++ workload) | Windows |
-| GCC / Clang | C++17-capable | Linux |
-| CUDA Toolkit | 12.9+ | All |
-| ONNX Runtime SDK | 1.24.0+ | All |
-| TensorRT RTX SDK | 1.1.1+ | All |
+| Dependency | Minimum Version | Platform | Notes |
+|------------|-----------------|----------|-------|
+| CMake | 3.15 | All | |
+| Visual Studio | 2019 or 2022 (Desktop C++ workload) | Windows | |
+| GCC / Clang | C++17-capable | Linux | |
+| CUDA Toolkit | 12.9+ | All | |
+| ONNX Runtime SDK | 1.24.0+ | All | |
+| TensorRT RTX SDK | 1.1.1+ | All | |
 
 ### Quick Build
 
@@ -64,7 +64,22 @@ cmake -B build -G "Visual Studio 17 2022" -A x64 `
 cmake --build build --config Release
 ```
 
-Note: If you already have protobuf installed on your system from e.g. `winget` this will conflict with cmake and fail the configuration. 
+Note: If you already have protobuf installed on your system from e.g. `winget` this will conflict with cmake and fail the configuration.
+
+**Windows with vcpkg Package Manager**
+
+vcpkg can optionally be used to manage dependencies (protobuf, ONNX, abseil) instead of CMake FetchContent.
+
+```powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64 `
+      -DONNXRUNTIME_ROOT="C:\SDK\onnxruntime-win-x64-1.24.0" `
+      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.1.1.36" `
+      -DUSE_VCPKG=ON `
+      -DCMAKE_TOOLCHAIN_FILE="..\vcpkg\scripts\buildsystems\vcpkg.cmake" `
+      -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+      -DVCPKG_HOST_TRIPLET=x64-windows
+cmake --build build --config Release
+```
 
 **Linux**
 
@@ -72,6 +87,19 @@ Note: If you already have protobuf installed on your system from e.g. `winget` t
 cmake -B build \
       -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
       -DTRT_RTX_ROOT=/path/to/tensorrt-rtx
+cmake --build build
+```
+
+**Linux with vcpkg Package Manager**
+
+```bash
+cmake -B build \
+      -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
+      -DTRT_RTX_ROOT=/path/to/tensorrt-rtx \
+      -DUSE_VCPKG=ON \
+      -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake \
+      -DVCPKG_TARGET_TRIPLET=x64-linux \
+      -DVCPKG_HOST_TRIPLET=x64-linux
 cmake --build build
 ```
 

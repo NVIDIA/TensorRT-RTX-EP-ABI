@@ -16,10 +16,12 @@
 #include "tensorrt_rtx_execution_provider.h"
 
 #include "onnx_ctx_model_helper.h"
+#include "proto_node_id_utils.h"
 #include "tensorrt_rtx_allocator.h"
 #include "tensorrt_rtx_execution_provider_stream_support.h"
 #include "tensorrt_rtx_provider_factory.h"
 #include "tensorrt_rtx_provider_options.h"
+#include "trt_proto_preprocessing.h"
 
 #include "utils/cuda/cuda_call.h"
 #include "utils/ep_utils.h"
@@ -38,15 +40,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iostream>
 #include <list>
-#include <thread>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
@@ -101,9 +103,11 @@ int GetNumProfiles(std::unordered_map<std::string, std::vector<std::vector<int64
     return num_profile;
 }
 
-// Anonymous namespace for cycle detection helper
+// Anonymous namespace for local helpers used during graph serialization/remap.
 namespace
 {
+constexpr const char* kExternalMemAddrLocation = "_MEM_ADDR_";
+
 // Helper function to detect cycles in graph using DFS
 bool FindCycleHelper(size_t i, const std::list<size_t>* adjacency_map, bool visited[], bool* st,
                      std::vector<size_t>& cycles)
@@ -130,8 +134,8 @@ bool FindCycleHelper(size_t i, const std::list<size_t>* adjacency_map, bool visi
     return false;
 }
 
-// Helper function to create initializer data handler for OrtGraphToProto
-// Initializers are stored as external references with memory addresses
+// OrtGraphToProto stores initializer payloads as external references, so we
+// encode the original memory address in the TensorProto offset field.
 OrtEpUtils::HandleInitializerDataFunc CreateInitializerDataHandler()
 {
     return [](const OrtValueInfo* value_info, const void* data, size_t bytes, bool& is_external, std::string& location,
@@ -140,7 +144,7 @@ OrtEpUtils::HandleInitializerDataFunc CreateInitializerDataHandler()
         (void)value_info;
         (void)bytes;
         offset = reinterpret_cast<int64_t>(data);
-        location = "_MEM_ADDR_";  // Special location tag indicating offset is a memory pointer
+        location = kExternalMemAddrLocation;
         is_external = true;
         return Ort::Status{nullptr};
     };
@@ -513,9 +517,9 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
             parent_id_to_index[parent_nodes[idx].GetId()] = idx;
         }
 
-        auto subgraph_nodes = subgraph_owner.GetNodes();
-        subgraph_parent_indices.reserve(subgraph_nodes.size());
-        for (const auto& node : subgraph_nodes)
+        auto subgraph_node_views = subgraph_owner.GetNodes();
+        subgraph_parent_indices.reserve(subgraph_node_views.size());
+        for (const auto& node : subgraph_node_views)
         {
             auto it = parent_id_to_index.find(node.GetId());
             if (it != parent_id_to_index.end())
@@ -528,6 +532,12 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
         const OrtGraph& graph_to_serialize = *subgraph_owner;
         auto status = OrtEpUtils::OrtGraphToProto(graph_to_serialize, model_proto, handle_initializer_data);
         Ort::ThrowOnError(status);
+        // Capability discovery must see the same proto preprocessing sequence
+        // that engine build will later apply. Today that includes policy-driven
+        // Q/DQ lowering plus logical-output compatibility cleanup for
+        // Chromium's bool->uint8 bridge, Clip bound compatibility for WebNN
+        // clamp defaults, and dilated pooling compatibility lowering.
+        const auto lowered_qdq_info = RunTensorRtProtoPreprocessing(model_proto);
 
         // TRT parser consumes serialized model bytes.
         std::string string_buf;
@@ -568,32 +578,37 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
             std::unique_ptr<nvinfer1::INetworkDefinition>(trt_builder->createNetworkV2(network_flags));
         bool is_model_supported = false;
 
-        // Build mapping from proto node index -> ORT node index using doc_string node ids.
-        auto build_proto_to_ort_index = [&model_proto](const Ort::ConstGraph& ort_subgraph_view) {
-            auto ort_nodes = ort_subgraph_view.GetNodes();
-            std::unordered_map<size_t, size_t> ort_node_id_to_index;
-            ort_node_id_to_index.reserve(ort_nodes.size());
-            for (size_t idx = 0; idx < ort_nodes.size(); ++idx)
-            {
-                ort_node_id_to_index[ort_nodes[idx].GetId()] = idx;
-            }
-
-            std::vector<size_t> proto_idx_to_ort_idx;
+        // Lowering can expand one original ORT node into several serialized ONNX nodes:
+        //
+        //   ORT node 2: QuantizeLinear
+        //        |
+        //        v
+        //   proto: Div(doc=2) -> Add(doc=2) -> Round(doc=2) -> Clamp(doc=2) -> Cast(doc=2)
+        //
+        // TRT reports support in terms of proto node indices, but ORT capability
+        // partitioning still needs the original ORT node index. We therefore read
+        // the original ORT node id back out of doc_string and map:
+        //
+        //   proto node index -> original ORT node id -> ORT node index
+        //
+        // Any proto node without a valid original ORT id is a lowering-only helper
+        // and must not claim ownership of an unrelated ORT node.
+        auto build_proto_to_ort_index = [&model_proto](const std::unordered_map<size_t, size_t>& ort_node_id_to_index) {
+            std::vector<std::optional<size_t>> proto_idx_to_ort_idx;
             const auto& graph_proto = model_proto.graph();
             proto_idx_to_ort_idx.reserve(graph_proto.node_size());
             for (int proto_idx = 0; proto_idx < graph_proto.node_size(); ++proto_idx)
             {
                 const auto& node_proto = graph_proto.node(proto_idx);
-                try
+                if (const auto node_id = TryParseNodeId(node_proto.doc_string()))
                 {
-                    size_t ort_node_id = std::stoull(node_proto.doc_string());
-                    auto it = ort_node_id_to_index.find(ort_node_id);
-                    proto_idx_to_ort_idx.push_back(
-                        (it != ort_node_id_to_index.end()) ? it->second : static_cast<size_t>(proto_idx));
+                    auto it = ort_node_id_to_index.find(*node_id);
+                    proto_idx_to_ort_idx.push_back((it != ort_node_id_to_index.end()) ? std::optional<size_t>(it->second)
+                                                                                       : std::nullopt);
                 }
-                catch (...)
+                else
                 {
-                    proto_idx_to_ort_idx.push_back(static_cast<size_t>(proto_idx));
+                    proto_idx_to_ort_idx.push_back(std::nullopt);
                 }
             }
 
@@ -613,29 +628,138 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
 
             // Get ORT nodes from subgraph
             Ort::ConstGraph ort_subgraph_view{subgraph_view};
-            auto proto_idx_to_ort_idx = build_proto_to_ort_index(ort_subgraph_view);
-
-            // TRT returns subgraph nodes as indices into the serialized model graph.
-            // Convert those to ORT node indices for recursive processing.
-            // Note: Calling getNbSubgraphs or getSubgraphNodes before calling supportsModelV2 results in
-            // undefined behavior.
-            auto num_subgraphs = trt_parser->getNbSubgraphs();
-            parser_nodes_list.reserve(num_subgraphs);
-
-            for (int64_t i = 0; i < num_subgraphs; ++i)
+            auto ort_nodes = ort_subgraph_view.GetNodes();
+            std::unordered_map<size_t, size_t> ort_node_id_to_index;
+            ort_node_id_to_index.reserve(ort_nodes.size());
+            for (size_t idx = 0; idx < ort_nodes.size(); ++idx)
             {
-                int64_t subgraph_len = 0;
-                int64_t* subgraph_nodes = trt_parser->getSubgraphNodes(i, subgraph_len);
-                parser_nodes_list.emplace_back();
-                parser_nodes_list.back().first.reserve(subgraph_len);
-                for (int64_t j = 0; j < subgraph_len; ++j)
+                ort_node_id_to_index[ort_nodes[idx].GetId()] = idx;
+            }
+            auto proto_idx_to_ort_idx = build_proto_to_ort_index(ort_node_id_to_index);
+
+            // Only query subgraph info when parsing succeeded.
+            // Calling getNbSubgraphs()/getSubgraphNodes() on a failed parser
+            // crashes — leave parser_nodes_list empty so the recursion correctly
+            // treats this group as fully unsupported.
+            if (is_model_supported)
+            {
+                // TRT returns subgraph nodes as indices into the serialized model graph.
+                // Convert those to ORT node indices for recursive processing.
+                // Note: Calling getNbSubgraphs or getSubgraphNodes before calling supportsModelV2 results in
+                // undefined behavior.
+                auto num_subgraphs = trt_parser->getNbSubgraphs();
+                parser_nodes_list.reserve(num_subgraphs);
+
+                for (int64_t i = 0; i < num_subgraphs; ++i)
                 {
-                    // Map proto node index to ORT node index
-                    size_t proto_node_idx = static_cast<size_t>(subgraph_nodes[j]);
-                    size_t ort_node_idx = proto_idx_to_ort_idx[proto_node_idx];
-                    parser_nodes_list.back().first.push_back(static_cast<int64_t>(ort_node_idx));
+                    int64_t subgraph_len = 0;
+                    int64_t* subgraph_nodes = trt_parser->getSubgraphNodes(i, subgraph_len);
+                    parser_nodes_list.emplace_back();
+                    parser_nodes_list.back().first.reserve(subgraph_len);
+                    std::unordered_set<size_t> seen_ort_node_indices;
+                    for (int64_t j = 0; j < subgraph_len; ++j)
+                    {
+                        // Lowering can expand one ORT node into several proto nodes. We only
+                        // keep parser nodes that still carry a valid original ORT node id.
+                        size_t proto_node_idx = static_cast<size_t>(subgraph_nodes[j]);
+                        if (proto_node_idx >= proto_idx_to_ort_idx.size() || !proto_idx_to_ort_idx[proto_node_idx].has_value())
+                        {
+                            continue;
+                        }
+
+                        size_t ort_node_idx = *proto_idx_to_ort_idx[proto_node_idx];
+                        if (seen_ort_node_indices.insert(ort_node_idx).second)
+                        {
+                            parser_nodes_list.back().first.push_back(static_cast<int64_t>(ort_node_idx));
+                        }
+                    }
+                    parser_nodes_list.back().second = is_model_supported;
                 }
-                parser_nodes_list.back().second = is_model_supported;
+            }
+
+            if (!lowered_qdq_info.folded_constant_nodes.empty())
+            {
+                // Constant-folded DQ nodes can disappear from the parser's node list entirely.
+                // Reattach the original ORT node to every supported subgraph that still references
+                // the folded tensor so partition ownership matches the pre-lowered graph.
+                //
+                //   before lowering: dq_node --> consumer
+                //   after folding   : folded_initializer -- Identity? --> consumer
+                //
+                // If TRT prunes the helper Identity, the parser may only report the consumer.
+                // We recover ownership by looking for subgraphs that still mention the folded
+                // tensor name and then reattaching the original ORT DQ node to those subgraphs.
+                std::unordered_map<std::string, std::vector<size_t>> tensor_to_parser_subgraphs;
+                const auto& graph_proto = model_proto.graph();
+                for (size_t parser_idx = 0; parser_idx < parser_nodes_list.size(); ++parser_idx)
+                {
+                    for (const auto proto_node_index_i64 : parser_nodes_list[parser_idx].first)
+                    {
+                        const size_t ort_node_index = static_cast<size_t>(proto_node_index_i64);
+                        if (ort_node_index >= ort_nodes.size())
+                        {
+                            continue;
+                        }
+                        const auto ort_node_id = ort_nodes[ort_node_index].GetId();
+                        for (int proto_idx = 0; proto_idx < graph_proto.node_size(); ++proto_idx)
+                        {
+                            const auto& node_proto = graph_proto.node(proto_idx);
+                            const auto node_id = TryParseNodeId(node_proto.doc_string());
+                            if (!node_id || *node_id != ort_node_id)
+                            {
+                                continue;
+                            }
+                            for (const auto& input_name : node_proto.input())
+                            {
+                                if (!input_name.empty())
+                                {
+                                    tensor_to_parser_subgraphs[input_name].push_back(parser_idx);
+                                }
+                            }
+                            for (const auto& output_name : node_proto.output())
+                            {
+                                if (!output_name.empty())
+                                {
+                                    tensor_to_parser_subgraphs[output_name].push_back(parser_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                std::vector<std::unordered_set<size_t>> seen_ort_node_indices(parser_nodes_list.size());
+                for (size_t parser_idx = 0; parser_idx < parser_nodes_list.size(); ++parser_idx)
+                {
+                    seen_ort_node_indices[parser_idx].insert(parser_nodes_list[parser_idx].first.begin(),
+                                                             parser_nodes_list[parser_idx].first.end());
+                }
+
+                for (const auto& folded_node : lowered_qdq_info.folded_constant_nodes)
+                {
+                    auto ort_it = ort_node_id_to_index.find(folded_node.original_node_id);
+                    if (ort_it == ort_node_id_to_index.end())
+                    {
+                        continue;
+                    }
+
+                    auto subgraph_it = tensor_to_parser_subgraphs.find(folded_node.output_name);
+                    if (subgraph_it == tensor_to_parser_subgraphs.end())
+                    {
+                        continue;
+                    }
+
+                    for (const size_t parser_idx : subgraph_it->second)
+                    {
+                        if (parser_idx >= parser_nodes_list.size())
+                        {
+                            continue;
+                        }
+                        if (seen_ort_node_indices[parser_idx].insert(ort_it->second).second)
+                        {
+                            parser_nodes_list[parser_idx].first.push_back(static_cast<int64_t>(ort_it->second));
+                        }
+                    }
+                }
             }
         }
 
@@ -675,8 +799,10 @@ static bool CheckNodeDataTypes(const Ort::ConstNode& node)
 
         if (input_ptr != nullptr)
         {
-
             auto type_info = input.TypeInfo();
+            if (!type_info || type_info.GetONNXType() != ONNX_TYPE_TENSOR)
+                continue;  // skip unconnected or non-tensor inputs
+
             if (!IsSupportedDataType(type_info.GetTensorTypeAndShapeInfo().GetElementType()))
             {
                 return false;
@@ -686,7 +812,17 @@ static bool CheckNodeDataTypes(const Ort::ConstNode& node)
     // Check output data types
     for (auto output : node.GetOutputs())
     {
+        const OrtValueInfo* output_ptr = (const OrtValueInfo*)(output);
+        if (output_ptr == nullptr)
+            continue;  // optional unconnected output (e.g., LSTM Y sequence output)
+
         auto type_info = output.TypeInfo();
+        if (!type_info)
+            continue;  // no type info for unconnected optional output
+
+        if (type_info.GetONNXType() != ONNX_TYPE_TENSOR)
+            continue;  // non-tensor outputs (sequence, map, etc.) are not type-checked here
+
         if (!IsSupportedDataType(type_info.GetTensorTypeAndShapeInfo().GetElementType()))
         {
             return false;
@@ -947,10 +1083,14 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     auto handle_initializer_data = CreateInitializerDataHandler();
 
     OrtEpUtils::OrtGraphToProto(*graph, model_proto, handle_initializer_data);
+    // Engine build must replay the same preprocessing sequence as
+    // GetSupportedList so TRT compiles the exact proto whose support we
+    // advertised during partitioning.
+    (void)RunTensorRtProtoPreprocessing(model_proto);
     std::string string_buf;
     model_proto.SerializeToString(&string_buf);
 
-    if ( dump_subgraphs_)
+    if (dump_subgraphs_)
     {
         // Dump TensorRT subgraphs
         const char* name = nullptr;
@@ -1598,19 +1738,37 @@ bool TensorrtRtxExecutionProvider::DetectTensorRTGraphCycles(SubGraphCollection_
                 // Process inputs
                 for (auto input : node.GetInputs())
                 {
-                    input_to_nodes_map[input.GetName()].insert(node_name);
+                    const OrtValueInfo* in_ptr = (const OrtValueInfo*)(input);
+                    if (in_ptr == nullptr)
+                        continue;  // optional unconnected input
+                    std::string in_name = input.GetName();
+                    if (in_name.empty())
+                        continue;
+                    input_to_nodes_map[in_name].insert(node_name);
                 }
 
                 // Process implicit inputs
                 for (auto input : node.GetImplicitInputs())
                 {
-                    input_to_nodes_map[input.GetName()].insert(node_name);
+                    const OrtValueInfo* in_ptr = (const OrtValueInfo*)(input);
+                    if (in_ptr == nullptr)
+                        continue;  // optional unconnected implicit input
+                    std::string in_name = input.GetName();
+                    if (in_name.empty())
+                        continue;
+                    input_to_nodes_map[in_name].insert(node_name);
                 }
 
                 // Process outputs
                 for (auto output : node.GetOutputs())
                 {
-                    node_to_outputs_map[node_name].insert(output.GetName());
+                    const OrtValueInfo* out_ptr = (const OrtValueInfo*)(output);
+                    if (out_ptr == nullptr)
+                        continue;  // optional unconnected output (e.g., GRU/LSTM Y sequence output)
+                    std::string out_name = output.GetName();
+                    if (out_name.empty())
+                        continue;
+                    node_to_outputs_map[node_name].insert(out_name);
                 }
             }
         }
@@ -2015,16 +2173,12 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
         min_subgraph_size_ = 1;
     }
 
-    // If ep_context_file_path_ is provided as a directory, create it if it's not existed
-    if (dump_ep_context_model_ && !ep_context_file_path_.empty() &&
-        std::filesystem::path(ep_context_file_path_).extension().empty() &&
-        !std::filesystem::is_directory(ep_context_file_path_))
-    {
-        if (!std::filesystem::create_directory(ep_context_file_path_))
-        {
-            throw std::runtime_error("Failed to create directory " + ep_context_file_path_);
-        }
-    }
+    // Note: Previously this block auto-created a directory when ep_context_file_path_
+    // had no extension. That was wrong: SetEpContextBinaryInformation(dir, stem) produces
+    // ep_context_file_path_ = "dir/stem" (no extension), which is a file stem, not a
+    // directory. Creating it as a directory caused the engine cache to be placed in a
+    // stem-named subfolder instead of the requested dir. Directory semantics are now
+    // expressed only via trailing separator (handled in GetPathOrParentPathOfCtxModel).
 
     // If dump_ep_context_model_ is enabled, TRT EP forces cache_path_ to be the relative path of ep_context_file_path_.
     // For example,
@@ -2358,8 +2512,15 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
         {
             // Only claim EPContext nodes that belong to this EP.
             // If the "source" attribute is present and doesn't match our EP name, skip the node.
+            //
+            // NOTE: The Ort C++ wrapper for Node_GetAttributeByName returns IsOK()==true
+            // for attributes that are NOT present on the node, leaving `source_attr` as a
+            // null OrtOpAttr*. Calling GetType() on that null pointer causes an access
+            // violation. Guard with an explicit validity check to support backward
+            // compatibility with legacy EPContext models that don't set a "source" attribute.
             Ort::ConstOpAttr source_attr;
             if (node.GetAttributeByName(SOURCE.c_str(), source_attr).IsOK() &&
+                static_cast<const OrtOpAttr*>(source_attr) != nullptr &&
                 source_attr.GetType() == OrtOpAttrType::ORT_OP_ATTR_STRING)
             {
                 std::string source_value;

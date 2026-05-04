@@ -348,6 +348,7 @@ static Ort::Status KahnsTopologicalSort(
     }
 
     for (auto output : current.GetOutputs()) {
+      if (output == nullptr || output.GetName().empty()) continue;  // unconnected optional output
       auto consumer_infos = output.GetConsumers();
       for (auto consumer_info : consumer_infos) {
         const Ort::ConstNode consumer = consumer_info.node;
@@ -499,11 +500,13 @@ Ort::Status OrtGraphToProto(const OrtGraph& graph,
       // Handle node inputs
       std::vector<Ort::ConstValueInfo> ort_inputs = ort_node.GetInputs();
       for (const auto& vi : ort_inputs) {
-        if (vi == nullptr) {
-          // missing optional input.
+        if (vi == nullptr || vi.GetName().empty()) {
+          // missing or unconnected optional input.
           node_proto->add_input("");
           continue;
         }
+
+        std::string vi_name = vi.GetName();
 
         std::optional<std::string> value_name;
         value_name.emplace();
@@ -522,11 +525,15 @@ Ort::Status OrtGraphToProto(const OrtGraph& graph,
       // Handle node outputs
       std::vector<Ort::ConstValueInfo> ort_outputs = ort_node.GetOutputs();
       for (const auto& vi : ort_outputs) {
-        if (vi == nullptr) {
-          // missing optional output.
+        if (vi == nullptr || vi.GetName().empty()) {
+          // missing or unconnected optional output (e.g., LSTM Y sequence output when
+          // returnSequence=false). Calling ORT graph query APIs on such outputs can
+          // dereference null inside onnxruntime.dll and crash the GPU process.
           node_proto->add_output("");
           continue;
         }
+
+        std::string vi_name = vi.GetName();
 
         std::optional<std::string> value_name;
         value_name.emplace();
@@ -669,6 +676,13 @@ static Ort::Status GetOrtValueInfoTensorTypeShape(Ort::ConstValueInfo vi,
                                                   /*out*/ bool& has_shape) {
   try {
     Ort::ConstTypeInfo ort_type_info = vi.TypeInfo();
+    if (!ort_type_info) {
+      // Optional output with no type info (e.g., unconnected LSTM sequence output Y).
+      // Return with undefined element type and no shape — TRT will treat it as unsupported.
+      has_shape = false;
+      elem_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+      return Ort::Status{nullptr};
+    }
     ONNXType ort_onnx_type = ort_type_info.GetONNXType();
     ORT_EP_UTILS_C_RETURN_IF(ort_onnx_type != ONNX_TYPE_TENSOR, "Expected OrtValueInfo to represent a Tensor");
 

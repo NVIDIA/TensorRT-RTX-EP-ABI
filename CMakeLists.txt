@@ -84,6 +84,13 @@ if(MSVC)
     
     # Enable Control Flow Guard for linker as well
     add_link_options(/guard:cf)
+
+    # RelWithDebInfo: disable incremental linking and enable dead-code stripping
+    # to keep DLL size close to Release while retaining debug symbols in the PDB.
+    string(REPLACE "/INCREMENTAL" "/INCREMENTAL:NO"
+        CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO}")
+    set(CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO
+        "${CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO} /OPT:REF /OPT:ICF")
 endif()
 
 # Find CUDA Toolkit (required)
@@ -213,17 +220,25 @@ message(STATUS "TensorRT ONNX Parser library: ${TRT_ONNX_PARSER_LIB}")
 # =============================================================================
 # External Dependencies (FetchContent)
 # =============================================================================
-include(FetchContent)
+option(USE_VCPKG "use vcpkg package manager" OFF)
 
-# Add ONNX
-FetchContent_Declare(
-    onnx
-    GIT_REPOSITORY https://github.com/onnx/onnx.git
-    GIT_TAG        v1.18.0
-)
-FetchContent_MakeAvailable(onnx)
+if(USE_VCPKG MATCHES "OFF")
+    include(FetchContent)
 
-set(DEPS_PATH "${CMAKE_BINARY_DIR}/_deps")
+    # Add ONNX
+    FetchContent_Declare(
+        onnx
+        GIT_REPOSITORY https://github.com/onnx/onnx.git
+#        GIT_TAG        v1.21.0
+        GIT_TAG        v1.18.0
+    )
+    FetchContent_MakeAvailable(onnx)
+
+    set(DEPS_PATH "${CMAKE_BINARY_DIR}/_deps")
+else()
+    find_package(protobuf CONFIG REQUIRED)
+    find_package(ONNX CONFIG REQUIRED)
+endif()
 
 # =============================================================================
 # Build Configuration Options
@@ -234,13 +249,14 @@ option(TRT_RTX_EP_PRODUCTION_BUILD "Enable production build with signature verif
 # Platform-Specific Configuration
 # =============================================================================
 if(WIN32)
-    # Use generator expressions for multi-config generators (e.g., Visual Studio)
-    # where CMAKE_BUILD_TYPE is empty at configure time
-    set(DEPS_LIBS
-        "${DEPS_PATH}/onnx-build/$<CONFIG>/onnx.lib"
-        "${DEPS_PATH}/onnx-build/$<CONFIG>/onnx_proto.lib"
-    )
-
+    if(USE_VCPKG MATCHES "OFF")
+        # # Use generator expressions for multi-config generators (e.g., Visual Studio)
+        # # where CMAKE_BUILD_TYPE is empty at configure time
+        set(DEPS_LIBS
+            "${DEPS_PATH}/onnx-build/$<CONFIG>/onnx.lib"
+            "${DEPS_PATH}/onnx-build/$<CONFIG>/onnx_proto.lib"
+        )
+    endif()
     set(TRT_EP_LIB_LINK_FLAG "-DEF:${CMAKE_SOURCE_DIR}/src/tensorrt_rtx_execution_provider.def")
 
     # =============================================================================
@@ -261,11 +277,13 @@ if(WIN32)
     # Add delay load linker flags
     set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${TRT_RTX_DLL_NAME} /DELAYLOAD:${TRT_ONNX_PARSER_DLL_NAME}")
 else()
-    # Linux
-    set(DEPS_LIBS
-        "${DEPS_PATH}/onnx-build/libonnx.a"
-        "${DEPS_PATH}/onnx-build/libonnx_proto.a"
-    )
+    if(USE_VCPKG MATCHES "OFF")
+        # # Linux
+        set(DEPS_LIBS
+            "${DEPS_PATH}/onnx-build/libonnx.a"
+            "${DEPS_PATH}/onnx-build/libonnx_proto.a"
+        )
+    endif()
 endif()
 
 # =============================================================================
@@ -275,6 +293,20 @@ if(WIN32)
     add_library(TensorRTRtxEp SHARED ${TRT_RTX_EP_SOURCES} ${TRT_RTX_EP_HEADERS} ${TRT_RTX_EP_VERSION_RC})
 else()
     add_library(TensorRTRtxEp SHARED ${TRT_RTX_EP_SOURCES} ${TRT_RTX_EP_HEADERS})
+endif()
+
+# LTCG (Link-Time Code Generation) for whole-program optimization, scoped to
+# TensorRTRtxEp only so FetchContent dependencies (protobuf, onnx, ...) are not
+# affected. /GL at compile time must be paired with /LTCG at link time.
+if(MSVC)
+    target_compile_options(TensorRTRtxEp PRIVATE
+        $<$<CONFIG:Release>:/GL>
+        $<$<CONFIG:RelWithDebInfo>:/GL>
+    )
+    target_link_options(TensorRTRtxEp PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+        $<$<CONFIG:RelWithDebInfo>:/LTCG>
+    )
 endif()
 
 # Target compile definitions (modern CMake - replaces add_definitions)
@@ -316,12 +348,17 @@ target_include_directories(TensorRTRtxEp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    "${DEPS_PATH}/onnx-src"
-    "${DEPS_PATH}/onnx-build"
-    "${DEPS_PATH}/protobuf-src/src"
-    "${DEPS_PATH}/abseil-src"
+    ${CMAKE_CURRENT_SOURCE_DIR}   
 )
+
+if (USE_VCPKG MATCHES "OFF")
+    target_include_directories(TensorRTRtxEp PRIVATE
+        "${DEPS_PATH}/onnx-src"
+        "${DEPS_PATH}/onnx-build"
+        "${DEPS_PATH}/protobuf-src/src"
+        "${DEPS_PATH}/abseil-src"
+    )
+endif()
 
 # Link libraries
 target_link_libraries(TensorRTRtxEp PRIVATE
@@ -363,4 +400,15 @@ if(WIN32)
     set_target_properties(TensorRTRtxEp PROPERTIES
         LINK_FLAGS ${TRT_EP_LIB_LINK_FLAG}
     )
+endif()
+
+# =============================================================================
+# Tests
+# =============================================================================
+# enable_testing() must be called unconditionally at the root level so CMake
+# always generates CTestTestfile.cmake here (required for `ctest` to find tests).
+enable_testing()
+option(BUILD_TESTS "Build tests" ON)
+if(BUILD_TESTS)
+    add_subdirectory(tests)
 endif()

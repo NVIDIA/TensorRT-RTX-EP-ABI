@@ -34,6 +34,8 @@
 //! - `kMultiProfileEnable`: Enables or disables multi-profile support.
 //! - `kUseExternalDataInitializer`: Enables or disables use of external data initializers.
 //! - `kRuntimeCacheFile`: Specifies the path to the runtime cache file.
+//! - `kOpTypesToExclude`: Specifies a comma-separated list of op types that the
+//!   TRT RTX EP should leave to other EPs during partitioning.
 //!
 //! \namespace onnxruntime::tensorrt_rtx::run_option_names
 //! \brief Contains run option name constants for TensorRT RTX EP runtime configuration.
@@ -62,6 +64,7 @@ constexpr const char* kCudaGraphEnable = "enable_cuda_graph";
 constexpr const char* kMultiProfileEnable = "nv_multi_profile_enable";
 constexpr const char* kUseExternalDataInitializer = "nv_use_external_data_initializer";
 constexpr const char* kRuntimeCacheFile = "nv_runtime_cache_path";
+constexpr const char* kOpTypesToExclude = "nv_op_types_to_exclude";
 
 }  // namespace provider_option_names
 
