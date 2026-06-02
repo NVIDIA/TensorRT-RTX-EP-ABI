@@ -19,7 +19,9 @@
 #include "tensorrt_rtx_execution_provider.h"
 #include "utils/cuda/cuda_call.h"
 #include "utils/cuda/cuda_common.h"
+#include "utils/ort_api_init.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <memory>
@@ -51,7 +53,7 @@ TensorrtRtxSyncNotificationImpl::TensorrtRtxSyncNotificationImpl(cudaStream_t st
       stream_{stream},
       event_{nullptr}
 {
-    ort_version_supported = ORT_API_VERSION;
+    ort_version_supported = NegotiatedOrtApiVersion();
     Activate = ActivateImpl;
     WaitOnDevice = WaitOnDeviceImpl;
     WaitOnHost = WaitOnHostImpl;
@@ -171,9 +173,42 @@ OrtStatus* TensorrtRtxSyncStreamImpl::Create(TensorrtRtxExecutionProviderFactory
     }
     else
     {
-        RETURN_IF_ERROR(CUDA_CALL(cudaSetDevice(static_cast<int>(device_id))));
         cudaStream_t stream = nullptr;
-        RETURN_IF_ERROR(CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)));
+
+#if ORT_API_VERSION >= 25
+        // CIG graphics-interop was added in ORT API v25. The factory's
+        // GetCigContext only exists when built against 1.25+ headers.
+        // At runtime, on hosts older than 1.25 the CIG map stays empty
+        // (host never calls InitGraphicsInterop), so this returns nullptr
+        // and we fall through to the non-CIG path.
+        CUcontext cig_context = factory.GetCigContext(static_cast<int32_t>(device_id));
+        if (cig_context != nullptr)
+        {
+            // Push CIG context so the stream is created on it; pop on scope exit.
+            CUresult cu_result = cuCtxPushCurrent(cig_context);
+            if (cu_result != CUDA_SUCCESS)
+            {
+                const char* error_str = nullptr;
+                cuGetErrorString(cu_result, &error_str);
+                std::string error_msg = "[NvTensorRTRTX EP] Failed to push CIG context: ";
+                error_msg += error_str ? error_str : "unknown error";
+                return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
+            }
+
+            cudaError_t cuda_err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+            // Always pop the CIG context to restore the thread's prior context
+            cuCtxPopCurrent(nullptr);
+
+            RETURN_IF_ERROR(CUDA_CALL(cuda_err));
+        }
+        else
+#endif
+        {
+            RETURN_IF_ERROR(CUDA_CALL(cudaSetDevice(static_cast<int>(device_id))));
+            RETURN_IF_ERROR(CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)));
+        }
+
         stream_impl->stream_ = stream;
         stream_impl->own_stream_ = true;
     }
@@ -191,7 +226,7 @@ TensorrtRtxSyncStreamImpl::TensorrtRtxSyncStreamImpl(TensorrtRtxExecutionProvide
       ep_{ep},
       device_id_{device_id}
 {
-    ort_version_supported = ORT_API_VERSION;
+    ort_version_supported = NegotiatedOrtApiVersion();
     GetHandle = GetHandleImpl;
     CreateNotification = CreateNotificationImpl;
     Flush = FlushImpl;

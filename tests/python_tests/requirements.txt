@@ -1,0 +1,11 @@
+pytest>=8.0
+numpy>=1.26
+onnx>=1.16
+
+# Use an ONNX Runtime build that exposes the plugin EP Python APIs used here:
+# register_execution_provider_library, get_ep_devices, add_provider_for_devices,
+# and, for compile tests, ModelCompiler.
+# onnxruntime>=1.24.1
+
+# Install the ABI wheel separately if it is not available from your package index:
+# pip install path/to/onnxruntime_ep_nv_tensorrt_rtx-*.whl

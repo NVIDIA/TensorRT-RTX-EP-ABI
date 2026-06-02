@@ -7,10 +7,12 @@
 
 #include <onnx/onnx_pb.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 

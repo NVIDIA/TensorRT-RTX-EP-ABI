@@ -22,7 +22,6 @@ include(onnxruntimesetup)
 
 add_executable(syncstreams_cuda
     main.cpp
-    utils.cpp
 )
 
 set_target_properties(syncstreams_cuda PROPERTIES
@@ -31,7 +30,7 @@ set_target_properties(syncstreams_cuda PROPERTIES
 )
 target_link_libraries(syncstreams_cuda PRIVATE
     onnxruntime_interface
-    lodepng_lib
+        example_utils
     CUDA::cudart_static
 )
 
@@ -56,4 +55,16 @@ set_target_properties(syncstreams_cuda
     ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
+)
+
+copy_ep_dll_post_build(syncstreams_cuda)
+
+add_test(
+    NAME    examples/30_syncstreams-cuda
+    COMMAND $<TARGET_FILE:syncstreams_cuda>
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:syncstreams_cuda>
+)
+set_tests_properties(examples/30_syncstreams-cuda PROPERTIES
+    LABELS  "examples"
+    TIMEOUT 300
 )

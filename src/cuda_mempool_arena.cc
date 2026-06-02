@@ -16,6 +16,9 @@
 #include "cuda_mempool_arena.h"
 
 #include "utils/cuda/cuda_call.h"
+#include "utils/ort_api_init.h"
+
+#include <cuda.h>  // driver API: CUcontext, cuCtxGetCurrent/cuCtxSetCurrent (probe context save/restore)
 
 #include <algorithm>
 #include <sstream>
@@ -38,7 +41,7 @@ CudaMempoolAllocator::CudaMempoolAllocator(
       api_(api),
       logger_(logger)
 {
-    OrtAllocator::version = ORT_API_VERSION;
+    OrtAllocator::version = NegotiatedOrtApiVersion();
     OrtAllocator::Alloc = AllocImpl;
     OrtAllocator::Free = FreeImpl;
     OrtAllocator::Info = InfoImpl;
@@ -63,7 +66,21 @@ OrtStatus* CudaMempoolAllocator::Create(
     props.location.type = cudaMemLocationTypeDevice;
     props.location.id = static_cast<int>(device_id);
 
-    RETURN_IF_ERROR(CUDA_CALL(cudaMemPoolCreate(&out->pool_, &props)));
+    // OOM here means the pool is unusable on this system: an expected fallback,
+    // not an error. Other errors propagate.
+    cudaError_t pool_create_err = cudaMemPoolCreate(&out->pool_, &props);
+    if (pool_create_err == cudaErrorMemoryAllocation)
+    {
+        (void)cudaGetLastError();  // clear the sticky error
+        std::ostringstream ss;
+        ss << "CudaMempoolAllocator: cudaMemPoolCreate out-of-memory on device " << device_id
+           << " (likely exhausted/fragmented GPU virtual-address space). Falling back to the "
+              "synchronous cudaMalloc allocator (higher VRAM use; CUDA graph capture unavailable).";
+        out->LogMessage(ORT_LOGGING_LEVEL_WARNING, ss.str().c_str());
+        out.reset();     // signal "unsupported" to the caller
+        return nullptr;  // not an error: caller falls back to the BFC arena
+    }
+    RETURN_IF_ERROR(CUDA_CALL(pool_create_err));
 
     {
         uint64_t max_threshold = UINT64_MAX;
@@ -71,6 +88,64 @@ OrtStatus* CudaMempoolAllocator::Create(
             cudaMemPoolSetAttribute(out->pool_,
                                     cudaMemPoolAttrReleaseThreshold,
                                     &max_threshold)));
+    }
+
+    // Some configurations only report an unusable pool on the first allocation
+    // rather than at create. Probe with a 1-byte alloc to surface that here and
+    // fall back now (physical memory is still free) instead of at first inference.
+    // The freed probe is retained (release threshold UINT64_MAX) for real allocs.
+    {
+        // Save/restore the current CUDA context: under graphics interop (CIG) the
+        // app's context is current and must stay so; cudaSetDevice would switch it.
+        CUcontext prev_ctx = nullptr;
+        (void)cuCtxGetCurrent(&prev_ctx);
+
+        // Inability to select the device is a genuine error, not a fallback.
+        cudaError_t set_err = cudaSetDevice(static_cast<int>(device_id));
+        if (set_err != cudaSuccess)
+        {
+            (void)cuCtxSetCurrent(prev_ctx);
+            (void)cudaMemPoolDestroy(out->pool_);
+            out->pool_ = nullptr;
+            out.reset();
+            return CUDA_CALL(set_err);
+        }
+
+        constexpr cudaStream_t kDefaultStream = static_cast<cudaStream_t>(0);
+        void* probe = nullptr;
+        cudaError_t probe_err = cudaMallocFromPoolAsync(&probe, 1, out->pool_, kDefaultStream);
+        if (probe_err == cudaSuccess)
+        {
+            (void)cudaStreamSynchronize(kDefaultStream);
+            (void)cudaFreeAsync(probe, kDefaultStream);
+            (void)cudaStreamSynchronize(kDefaultStream);
+        }
+
+        (void)cuCtxSetCurrent(prev_ctx);  // restore exactly what was current before
+
+        if (probe_err != cudaSuccess)
+        {
+            (void)cudaGetLastError();  // clear the sticky error
+            (void)cudaMemPoolDestroy(out->pool_);
+            out->pool_ = nullptr;
+
+            // Only OOM (the fragmented-VA failure) is an expected fallback; any
+            // other error is a genuine bug and must propagate.
+            if (probe_err != cudaErrorMemoryAllocation)
+            {
+                out.reset();
+                return CUDA_CALL(probe_err);
+            }
+
+            std::ostringstream ss;
+            ss << "CudaMempoolAllocator: probe allocation out-of-memory on device " << device_id
+               << " (likely fragmented GPU virtual-address space). Falling back to the "
+                  "synchronous cudaMalloc allocator (higher VRAM use; CUDA graph capture unavailable).";
+            out->LogMessage(ORT_LOGGING_LEVEL_WARNING, ss.str().c_str());
+
+            out.reset();     // signal "unsupported" to the caller
+            return nullptr;  // not an error: caller falls back to the BFC arena
+        }
     }
 
     {
@@ -187,16 +262,22 @@ void* CudaMempoolAllocator::DoAlloc(size_t size, cudaStream_t cuda_stream)
     cudaError_t err = cudaMallocFromPoolAsync(&p, size, pool_, cuda_stream);
     if (err != cudaSuccess)
     {
-        // Retry one more time as there is an intermittent issue with cudaMallocFromPoolAsync
+        (void)cudaGetLastError();  // clear sticky error before retry
+        // Retry once: cudaMallocFromPoolAsync has an intermittent failure mode.
         cudaError_t retry_err = cudaMallocFromPoolAsync(&p, size, pool_, cuda_stream);
         if (retry_err != cudaSuccess)
         {
+            // Return nullptr (don't throw) so the caller falls back to the sync
+            // arena -- the pool can fragment at run time, after the create probe.
+            (void)cudaGetLastError();
             std::ostringstream ss;
             ss << "CudaMempoolAllocator::DoAlloc: cudaMallocFromPoolAsync failed after retry: "
                << cudaGetErrorString(retry_err) << " (" << static_cast<int>(retry_err)
                << "), size=" << size
-               << ", stream=" << reinterpret_cast<uintptr_t>(cuda_stream);
-            throw std::runtime_error(ss.str());
+               << ", stream=" << reinterpret_cast<uintptr_t>(cuda_stream)
+               << ". Returning nullptr; caller should fall back to a synchronous allocator.";
+            LogMessage(ORT_LOGGING_LEVEL_ERROR, ss.str().c_str());
+            return nullptr;
         }
     }
 

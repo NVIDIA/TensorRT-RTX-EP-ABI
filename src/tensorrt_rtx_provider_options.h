@@ -34,6 +34,16 @@
 //! - `kMultiProfileEnable`: Enables or disables multi-profile support.
 //! - `kUseExternalDataInitializer`: Enables or disables use of external data initializers.
 //! - `kRuntimeCacheFile`: Specifies the path to the runtime cache file.
+//! - `kWeightStreamingBudget`: Sets TensorRT RTX weight streaming budget. Bare `0` disables weight
+//!   streaming and does not request a weight-streaming engine build. All other accepted forms enable
+//!   weight streaming:
+//!   - `-1` uses TensorRT's automatic budget.
+//!   - `1` requests minimum VRAM mode, which resolves to a TensorRT weight streaming budget of 0 bytes.
+//!   - Bare values greater than `1` specify an explicit byte budget.
+//!   - Values with base-2 suffixes `B|K|M|G` specify resident bytes; for example, `1B` means exactly
+//!     1 resident byte. `0B` is accepted and enables minimum VRAM mode instead of disabling streaming.
+//!   - Values from `0%` to `100%` specify the percentage of streamable weights to keep resident in
+//!     VRAM. `0%` is accepted and enables minimum VRAM mode instead of disabling streaming.
 //! - `kOpTypesToExclude`: Specifies a comma-separated list of op types that the
 //!   TRT RTX EP should leave to other EPs during partitioning.
 //!
@@ -64,6 +74,7 @@ constexpr const char* kCudaGraphEnable = "enable_cuda_graph";
 constexpr const char* kMultiProfileEnable = "nv_multi_profile_enable";
 constexpr const char* kUseExternalDataInitializer = "nv_use_external_data_initializer";
 constexpr const char* kRuntimeCacheFile = "nv_runtime_cache_path";
+constexpr const char* kWeightStreamingBudget = "nv_weight_streaming_budget";
 constexpr const char* kOpTypesToExclude = "nv_op_types_to_exclude";
 
 }  // namespace provider_option_names

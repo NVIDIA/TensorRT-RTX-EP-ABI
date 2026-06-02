@@ -101,7 +101,7 @@ std::vector<uint8_t> HexStringToBinary(const std::string& hex)
 }
 
 // Forward declaration
-std::string GetWeightRefittedEnginePath(std::string stripped_engine_cache);
+std::filesystem::path GetWeightRefittedEnginePath(const std::filesystem::path& stripped_engine_cache_path);
 
 bool IsAbsolutePath(const std::string& path_string)
 {
@@ -162,23 +162,23 @@ bool IsRelativePathToParentPath(const std::string& path_string)
 //!    pre-exist on disk from earlier runs, which would otherwise flip the
 //!    interpretation in a state-dependent way.
 //!
-std::filesystem::path GetPathOrParentPathOfCtxModel(const std::string& ep_context_file_path)
+std::filesystem::path GetPathOrParentPathOfCtxModel(const std::filesystem::path& ep_context_file_path)
 {
     if (ep_context_file_path.empty())
     {
         return std::filesystem::path();
     }
-    std::filesystem::path ctx_path(ep_context_file_path);
-    const char back = ep_context_file_path.back();
+    const auto& native = ep_context_file_path.native();
+    const PathChar back = native.back();
     // A trailing path separator alone implies directory semantics. We deliberately
     // do not probe the filesystem here so that interpretation is stable regardless
     // of whether a same-named directory happens to exist from a previous run.
-    const bool has_trailing_sep = (back == '/' || back == '\\');
+    const bool has_trailing_sep = (back == PathChar('/') || back == PathChar('\\'));
     if (has_trailing_sep)
     {
-        return ctx_path;
+        return ep_context_file_path;
     }
-    return ctx_path.parent_path();
+    return ep_context_file_path.parent_path();
 }
 
 bool IsWeightStrippedEngineCache(std::filesystem::path& engine_cache_path)
@@ -190,12 +190,12 @@ bool IsWeightStrippedEngineCache(std::filesystem::path& engine_cache_path)
 //!
 //! \brief Create an EPContext OrtNode from a fused_node.
 //!
-OrtStatus* EPContextNodeHelper::CreateEPContextNode(const std::string& engine_cache_path,
+OrtStatus* EPContextNodeHelper::CreateEPContextNode(const std::filesystem::path& engine_cache_path,
                                                     char* engine_data,
                                                     size_t size,
                                                     const int64_t embed_mode,
                                                     const std::string& compute_capability,
-                                                    const std::string& onnx_model_path,
+                                                    const std::filesystem::path& onnx_model_path,
                                                     OrtNode** ep_context_node)
 {
     // Helper to collect input or output names from an array of OrtValueInfo instances.
@@ -283,41 +283,48 @@ OrtStatus* EPContextNodeHelper::CreateEPContextNode(const std::string& engine_ca
         if (!engine_cache_file.is_open())
         {
             return ort_api.CreateStatus(ORT_FAIL,
-                                        ("Failed to open engine cache file for writing: " + engine_cache_path).c_str());
+                                        ("Failed to open engine cache file for writing: " + PathToUTF8String(engine_cache_path.native())).c_str());
         }
         engine_cache_file.write(engine_data, size);
         if (engine_cache_file.fail())
         {
             engine_cache_file.close();
             return ort_api.CreateStatus(ORT_FAIL,
-                                        ("Failed to write engine data to cache file: " + engine_cache_path).c_str());
+                                        ("Failed to write engine data to cache file: " + PathToUTF8String(engine_cache_path.native())).c_str());
         }
         engine_cache_file.close();
 
-        std::string attr_path = engine_cache_path;
-        if (IsAbsolutePath(attr_path))
+        std::filesystem::path attr_path = engine_cache_path;
+        if (IsAbsolutePath(PathToUTF8String(attr_path.native())))
         {
-            std::filesystem::path ctx_model_dir = GetPathOrParentPathOfCtxModel(ep_.GetEpContextFilePath());
+            std::filesystem::path ctx_model_dir =
+                GetPathOrParentPathOfCtxModel(std::filesystem::path(ToPathString(ep_.GetEpContextFilePath())));
             if (!ctx_model_dir.empty())
             {
                 std::error_code ec;
                 std::filesystem::path rel_path =
-                    std::filesystem::relative(std::filesystem::path(engine_cache_path), ctx_model_dir, ec);
+                    std::filesystem::relative(engine_cache_path, ctx_model_dir, ec);
                 if (!ec && !rel_path.empty())
                 {
-                    attr_path = rel_path.string();
+                    attr_path = rel_path;
                 }
             }
         }
-        if (IsAbsolutePath(attr_path) || IsRelativePathToParentPath(attr_path))
         {
-            attr_path = std::filesystem::path(engine_cache_path).filename().string();
+            std::string attr_path_utf8 = PathToUTF8String(attr_path.native());
+            if (IsAbsolutePath(attr_path_utf8) || IsRelativePathToParentPath(attr_path_utf8))
+            {
+                attr_path = engine_cache_path.filename();
+            }
         }
-        RETURN_IF_ERROR(ort_api.CreateOpAttr(EP_CACHE_CONTEXT.c_str(), attr_path.c_str(),
-                                             static_cast<int>(attr_path.size()), ORT_OP_ATTR_STRING, &attributes[1]));
+        // The EP_CACHE_CONTEXT attribute is stored as text inside the ONNX EPContext node and
+        // read back via GetAttributeByName<std::string>; encode as UTF-8 for portable round-trip.
+        std::string attr_path_utf8 = PathToUTF8String(attr_path.native());
+        RETURN_IF_ERROR(ort_api.CreateOpAttr(EP_CACHE_CONTEXT.c_str(), attr_path_utf8.c_str(),
+                                             static_cast<int>(attr_path_utf8.size()), ORT_OP_ATTR_STRING, &attributes[1]));
     }
 
-    std::string onnx_model_filename = std::filesystem::path(onnx_model_path).filename().string();
+    std::string onnx_model_filename = PathToUTF8String(onnx_model_path.filename().native());
     RETURN_IF_ERROR(ort_api.CreateOpAttr(COMPUTE_CAPABILITY.c_str(), compute_capability.c_str(), static_cast<int>(compute_capability.size()), ORT_OP_ATTR_STRING, &attributes[2]));
     RETURN_IF_ERROR(ort_api.CreateOpAttr(ONNX_MODEL_FILENAME.c_str(), onnx_model_filename.c_str(), static_cast<int>(onnx_model_filename.size()),
                                          ORT_OP_ATTR_STRING, &attributes[3]));
@@ -456,8 +463,8 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
             RETURN_IF_ORT_STATUS_ERROR(node.GetAttributeByName("onnx_model_filename", node_attr));
             std::string onnx_model_filename;
             RETURN_IF_ORT_STATUS_ERROR(node_attr.GetValue<std::string>(onnx_model_filename));
-            auto status = ep_.RefitEngineImpl(onnx_model_filename,
-                                              onnx_model_folder_path_,
+            auto status = ep_.RefitEngineImpl(std::filesystem::path(ToPathString(onnx_model_filename)),
+                                              std::filesystem::path(ToPathString(onnx_model_folder_path_)),
                                               make_secure_path_checks,
                                               onnx_model_bytestream_,
                                               onnx_model_bytestream_size_,
@@ -500,10 +507,12 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
         // locate external engine binaries in that scenario (matches the QNN EP pattern).
         const std::string& effective_ctx_path =
             !ep_context_model_path_.empty() ? ep_context_model_path_ : ep_.GetEpContextFilePath();
-        std::filesystem::path ctx_model_dir(GetPathOrParentPathOfCtxModel(effective_ctx_path));
-        auto engine_cache_path = ctx_model_dir.append(cache_path);
+        std::filesystem::path ctx_model_dir =
+            GetPathOrParentPathOfCtxModel(std::filesystem::path(ToPathString(effective_ctx_path)));
+        std::filesystem::path engine_cache_path = ctx_model_dir;
+        engine_cache_path /= std::filesystem::path(ToPathString(cache_path));
 
-        std::string message = "[TensorRT EP] GetEpContextFromGraph engine_cache_path: " + engine_cache_path.string();
+        std::string message = "[TensorRT EP] GetEpContextFromGraph engine_cache_path: " + PathToUTF8String(engine_cache_path.native());
         Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_,
                                                     OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
                                                     message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
@@ -514,17 +523,20 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
             weight_stripped_engine_refit_ = IsWeightStrippedEngineCache(engine_cache_path);
         }
 
-        // If the serialized refitted engine is present, use it directly without refitting the engine again
+        // If the serialized refitted engine is present, use it directly without refitting the engine again.
+        // GetWeightRefittedEnginePath returns a basename (e.g. "TRTKernel_XXXXX.engine"); root it under
+        // engine_cache_path.parent_path() so the existence probe is relative to the cache dir, not CWD.
         if (weight_stripped_engine_refit_)
         {
-            const std::filesystem::path refitted_engine_cache_path = GetWeightRefittedEnginePath(engine_cache_path.string());
+            const std::filesystem::path refit_name = GetWeightRefittedEnginePath(engine_cache_path).filename();
+            const std::filesystem::path refitted_engine_cache_path = engine_cache_path.parent_path() / refit_name;
             if (std::filesystem::exists(refitted_engine_cache_path))
             {
-                std::string refit_message = "[TensorRT EP] " + refitted_engine_cache_path.string() + " exists.";
+                std::string refit_message = "[TensorRT EP] " + PathToUTF8String(refitted_engine_cache_path.native()) + " exists.";
                 Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_,
                                                             OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
                                                             refit_message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
-                engine_cache_path = refitted_engine_cache_path.string();
+                engine_cache_path = refitted_engine_cache_path;
                 weight_stripped_engine_refit_ = false;
             }
         }
@@ -532,7 +544,7 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
         if (!std::filesystem::exists(engine_cache_path))
         {
             std::string error_msg =
-                "TensorRT EP can't find engine cache: " + engine_cache_path.string() +
+                "TensorRT EP can't find engine cache: " + PathToUTF8String(engine_cache_path.native()) +
                 ". Please make sure engine cache is in the same directory or sub-directory of context model.";
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
@@ -543,14 +555,14 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
                                          OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (file_handle == INVALID_HANDLE_VALUE)
         {
-            std::string error_msg = "TensorRT EP failed to open engine cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP failed to open engine cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
         LARGE_INTEGER file_size_li{};
         if (!GetFileSizeEx(file_handle, &file_size_li))
         {
             CloseHandle(file_handle);
-            std::string error_msg = "TensorRT EP failed to get size of engine cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP failed to get size of engine cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
         const size_t engine_size = static_cast<size_t>(file_size_li.QuadPart);
@@ -562,7 +574,7 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
         {
             if (mapping_handle) CloseHandle(mapping_handle);
             CloseHandle(file_handle);
-            std::string error_msg = "TensorRT EP failed to map engine cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP failed to map engine cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
         *(trt_rtx_engine_) = std::unique_ptr<nvinfer1::ICudaEngine>(
@@ -574,14 +586,14 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
         const int fd = ::open(engine_cache_path.c_str(), O_RDONLY);
         if (fd == -1)
         {
-            std::string error_msg = "TensorRT EP failed to open engine cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP failed to open engine cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
         struct stat st{};
         if (::fstat(fd, &st) == -1)
         {
             ::close(fd);
-            std::string error_msg = "TensorRT EP failed to fstat engine cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP failed to fstat engine cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
         const size_t engine_size = static_cast<size_t>(st.st_size);
@@ -589,7 +601,7 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
         ::close(fd);
         if (mapped_data == MAP_FAILED)
         {
-            std::string error_msg = "TensorRT EP failed to map engine cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP failed to map engine cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
         *(trt_rtx_engine_) = std::unique_ptr<nvinfer1::ICudaEngine>(
@@ -598,11 +610,11 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
 #endif
         if (!(*trt_rtx_engine_))
         {
-            std::string error_msg = "TensorRT EP could not deserialize engine from cache: " + engine_cache_path.string();
+            std::string error_msg = "TensorRT EP could not deserialize engine from cache: " + PathToUTF8String(engine_cache_path.native());
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
 
-        message = "[TensorRT EP] DeSerialized " + engine_cache_path.string();
+        message = "[TensorRT EP] DeSerialized " + PathToUTF8String(engine_cache_path.native());
         Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_,
                                                     OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
                                                     message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
@@ -612,8 +624,8 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
             RETURN_IF_ORT_STATUS_ERROR(node.GetAttributeByName("onnx_model_filename", node_attr));
             std::string onnx_model_filename;
             RETURN_IF_ORT_STATUS_ERROR(node_attr.GetValue<std::string>(onnx_model_filename));
-            auto status = ep_.RefitEngineImpl(onnx_model_filename,
-                                              onnx_model_folder_path_,
+            auto status = ep_.RefitEngineImpl(std::filesystem::path(ToPathString(onnx_model_filename)),
+                                              std::filesystem::path(ToPathString(onnx_model_folder_path_)),
                                               make_secure_path_checks,
                                               onnx_model_bytestream_,
                                               onnx_model_bytestream_size_,
@@ -641,11 +653,16 @@ OrtStatus* EPContextNodeReader::GetEpContextFromGraph(const OrtGraph& graph)
 //! An engine that its weights have been refitted and it's simply a regular engine.
 //! The cache name of weight-refitted engine is TensorrtExecutionProvider_TRTKernel_XXXXX.engine
 //!
-std::string GetWeightRefittedEnginePath(std::string stripped_engine_cache)
+std::filesystem::path GetWeightRefittedEnginePath(const std::filesystem::path& stripped_engine_cache_path)
 {
-    std::filesystem::path stripped_engine_cache_path(stripped_engine_cache);
-    std::string refitted_engine_cache_path = stripped_engine_cache_path.stem().stem().string() + ".engine";
-    return refitted_engine_cache_path;
+    // Preserve the original (43b03293) semantics: return only the basename of the refitted
+    // engine cache (e.g. "TRTKernel_XXXXX.engine"), not the full path. The caller probes
+    // for that name relative to its own working directory. Whether CWD-relative is the
+    // right resolution is a separate question; this fix does not change that behavior.
+    std::filesystem::path filename = stripped_engine_cache_path.filename();
+    filename.replace_extension();                    // drop ".engine"
+    filename.replace_extension(ToPathString(".engine"));  // drop ".stripped", append ".engine"
+    return filename;
 }
 
 //!
@@ -677,10 +694,10 @@ std::string GetWeightRefittedEnginePath(std::string stripped_engine_cache)
 //! original_model_path = "model.onnx"
 //! => return "/home/user2/ep_context_model_directory/my_ctx_model.onnx"
 //!
-std::string GetCtxModelPath(const std::string& ep_context_file_path,
-                            const std::string& original_model_path)
+std::filesystem::path GetCtxModelPath(const std::filesystem::path& ep_context_file_path,
+                                      const std::filesystem::path& original_model_path)
 {
-    std::string ctx_model_path;
+    std::filesystem::path ctx_model_path;
 
     if (!ep_context_file_path.empty() && !std::filesystem::is_directory(ep_context_file_path))
     {
@@ -688,14 +705,13 @@ std::string GetCtxModelPath(const std::string& ep_context_file_path,
     }
     else
     {
-        std::filesystem::path model_path = original_model_path;
-        std::filesystem::path model_name_stem = model_path.stem();  // model_name.onnx -> model_name
-        std::string ctx_model_name = model_name_stem.string() + "_ctx.onnx";
+        // model_name.onnx -> model_name -> model_name + "_ctx.onnx"
+        std::filesystem::path ctx_model_name = original_model_path.stem();
+        ctx_model_name += ToPathString("_ctx.onnx");
 
         if (std::filesystem::is_directory(ep_context_file_path))
         {
-            std::filesystem::path model_directory = ep_context_file_path;
-            ctx_model_path = model_directory.append(ctx_model_name).string();
+            ctx_model_path = ep_context_file_path / ctx_model_name;
         }
         else
         {

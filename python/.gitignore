@@ -1,0 +1,13 @@
+# Staged DLLs (copied at build time by scripts/stage_windows_dlls.py)
+onnxruntime_ep_nv_tensorrt_rtx/*.dll
+
+# Generated version files (written at build time by build.bat / build.sh)
+onnxruntime_ep_nv_tensorrt_rtx/_version.py
+meta/_version.txt
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+**/*.pyc

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.20)
 project(trt-rtx-ep LANGUAGES CXX)
 
 # =============================================================================
@@ -44,9 +44,9 @@ endif()
 # =============================================================================
 # C++ Standard Configuration
 # =============================================================================
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)  # Disable compiler-specific extensions for strict C++17 compliance
+set(CMAKE_CXX_EXTENSIONS OFF)  # Disable compiler-specific extensions for strict C++20 compliance
 
 # Generate compile_commands.json for IDE integration and clang-tidy
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -81,6 +81,9 @@ if(MSVC)
     # /guard:cf - Control Flow Guard
     # /sdl - Security Development Lifecycle checks
     add_compile_options(/GS /Qspectre /guard:cf /sdl)
+    # /sdl can promote deprecation diagnostics after the earlier /wd4996.
+    # Repeat it here so MSVC keeps third-party deprecated API uses as warnings. Added due to protobuf
+    add_compile_options(/wd4996)
     
     # Enable Control Flow Guard for linker as well
     add_link_options(/guard:cf)
@@ -94,35 +97,10 @@ if(MSVC)
 endif()
 
 # Find CUDA Toolkit (required)
-find_package(CUDAToolkit 12.9 REQUIRED)
+find_package(CUDAToolkit 12.9 REQUIRED CUDA::cudart CUDA::cuda_driver CUDA::nvml)
 
-set(ONNXRUNTIME_ROOT "" CACHE PATH "Path to ONNX Runtime SDK root directory (must contain include/ and lib/)")
-if(NOT ONNXRUNTIME_ROOT)
-    message(FATAL_ERROR "ONNXRUNTIME_ROOT must be set. "
-                        "Example: cmake -DONNXRUNTIME_ROOT=/path/to/onnxruntime -B build")
-endif()
-message(STATUS "Using ONNXRUNTIME_ROOT: ${ONNXRUNTIME_ROOT}")
-
-set(TRT_RTX_ROOT "" CACHE PATH "Path to TensorRT RTX SDK root directory (must contain include/ and lib/)")
-if(NOT TRT_RTX_ROOT)
-    message(FATAL_ERROR "TRT_RTX_ROOT must be set. "
-                        "Example: cmake -DTRT_RTX_ROOT=/path/to/tensorrt-rtx -B build")
-endif()
-message(STATUS "Using TRT_RTX_ROOT: ${TRT_RTX_ROOT}")
-
-# =============================================================================
-# ONNX Runtime Configuration
-# =============================================================================
-set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include")
-set(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_ROOT}/lib")
-
-# Find ONNX Runtime library
-find_library(ONNXRUNTIME_LIB
-    NAMES onnxruntime
-    PATHS ${ONNXRUNTIME_LIB_DIR}
-    NO_DEFAULT_PATH
-    REQUIRED
-)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/tensorrt_rtx.cmake")
 
 # =============================================================================
 # Source Files
@@ -147,92 +125,113 @@ if(NOT WIN32)
 endif()
 
 # =============================================================================
-# TensorRT RTX Configuration
-# =============================================================================
-set(TRT_RTX_INCLUDE_DIR "${TRT_RTX_ROOT}/include")
-set(TRT_RTX_LIB_DIR "${TRT_RTX_ROOT}/lib")
-
-# Detect TensorRT RTX version from NvInferVersion.h
-find_path(TENSORRT_RTX_INCLUDE_DIR NvInfer.h
-    HINTS ${TRT_RTX_ROOT}
-    PATH_SUFFIXES include
-)
-
-if(TENSORRT_RTX_INCLUDE_DIR)
-    file(READ ${TENSORRT_RTX_INCLUDE_DIR}/NvInferVersion.h NVINFER_VER_CONTENT)
-    string(REGEX MATCH "define TRT_MAJOR_RTX * +([0-9]+)" NV_TRT_MAJOR_RTX "${NVINFER_VER_CONTENT}")
-    string(REGEX REPLACE "define TRT_MAJOR_RTX * +([0-9]+)" "\\1" NV_TRT_MAJOR_RTX "${NV_TRT_MAJOR_RTX}")
-    string(REGEX MATCH "define TRT_MINOR_RTX * +([0-9]+)" NV_TRT_MINOR_RTX "${NVINFER_VER_CONTENT}")
-    string(REGEX REPLACE "define TRT_MINOR_RTX * +([0-9]+)" "\\1" NV_TRT_MINOR_RTX "${NV_TRT_MINOR_RTX}")
-
-    if(NV_TRT_MAJOR_RTX)
-        message(STATUS "NV_TRT_MAJOR_RTX is ${NV_TRT_MAJOR_RTX}")
-        message(STATUS "NV_TRT_MINOR_RTX is ${NV_TRT_MINOR_RTX}")
-    else()
-        message(STATUS "Can't find NV_TRT_MAJOR_RTX macro")
-    endif()
-
-    # Construct versioned library names (Windows style)
-    if(WIN32 AND NV_TRT_MAJOR_RTX)
-        set(TRT_RTX_LIB_NAME "tensorrt_rtx_${NV_TRT_MAJOR_RTX}_${NV_TRT_MINOR_RTX}")
-        set(TRT_ONNX_PARSER_LIB_NAME "tensorrt_onnxparser_rtx_${NV_TRT_MAJOR_RTX}_${NV_TRT_MINOR_RTX}")
-    endif()
-endif()
-
-# Fallback to default library names if version detection failed
-if(NOT TRT_RTX_LIB_NAME)
-    set(TRT_RTX_LIB_NAME "tensorrt_rtx")
-endif()
-
-if(NOT TRT_ONNX_PARSER_LIB_NAME)
-    set(TRT_ONNX_PARSER_LIB_NAME "tensorrt_onnxparser_rtx")
-endif()
-
-message(STATUS "Looking for ${TRT_RTX_LIB_NAME}")
-message(STATUS "Looking for ${TRT_ONNX_PARSER_LIB_NAME}")
-
-# Find TensorRT RTX libraries
-find_library(TRT_RTX_LIB
-    NAMES ${TRT_RTX_LIB_NAME}
-    PATHS ${TRT_RTX_LIB_DIR}
-    NO_DEFAULT_PATH
-    REQUIRED
-)
-
-find_library(TRT_ONNX_PARSER_LIB
-    NAMES ${TRT_ONNX_PARSER_LIB_NAME}
-    PATHS ${TRT_RTX_LIB_DIR}
-    NO_DEFAULT_PATH
-    REQUIRED
-)
-
-if(NOT TRT_RTX_LIB)
-    message(STATUS "Can't find ${TRT_RTX_LIB_NAME}")
-endif()
-
-if(NOT TRT_ONNX_PARSER_LIB)
-    message(STATUS "Can't find ${TRT_ONNX_PARSER_LIB_NAME}")
-endif()
-
-message(STATUS "TensorRT RTX library: ${TRT_RTX_LIB}")
-message(STATUS "TensorRT ONNX Parser library: ${TRT_ONNX_PARSER_LIB}")
-
-# =============================================================================
 # External Dependencies (FetchContent)
 # =============================================================================
 option(USE_VCPKG "use vcpkg package manager" OFF)
+option(USE_PRECOMPILED_HOST_PROTOC "Use a precompiled win-x64 host protoc when building protobuf/ONNX" OFF)
 
 if(USE_VCPKG MATCHES "OFF")
     include(FetchContent)
+
+    function(fetch_content_make_available_exclude_from_all)
+        foreach(_name IN LISTS ARGN)
+            string(TOLOWER "${_name}" _name_lower)
+            FetchContent_GetProperties(${_name})
+            if(NOT ${_name_lower}_POPULATED)
+                FetchContent_Populate(${_name})
+                if(EXISTS "${${_name_lower}_SOURCE_DIR}/CMakeLists.txt")
+                    add_subdirectory("${${_name_lower}_SOURCE_DIR}" "${${_name_lower}_BINARY_DIR}" EXCLUDE_FROM_ALL)
+                endif()
+            endif()
+        endforeach()
+    endfunction()
+
+    set(_ORTTRTRTX_HOST_PROTOC "")
+    if(USE_PRECOMPILED_HOST_PROTOC)
+        if(NOT CMAKE_HOST_WIN32)
+            message(FATAL_ERROR
+                "USE_PRECOMPILED_HOST_PROTOC currently downloads a Windows x64 protoc "
+                "binary and is only supported when CMake is running on a Windows host."
+            )
+        endif()
+
+        set(_PROTOC_VERSION "31.1")
+        set(_PROTOC_HOST_DIR "${CMAKE_BINARY_DIR}/_protoc_host")
+        set(_HOST_PROTOC_EXE "${_PROTOC_HOST_DIR}/bin/protoc.exe")
+        if(NOT EXISTS "${_HOST_PROTOC_EXE}")
+            message(STATUS "Downloading host protoc v${_PROTOC_VERSION}...")
+            file(MAKE_DIRECTORY "${_PROTOC_HOST_DIR}")
+            file(DOWNLOAD
+                "https://github.com/protocolbuffers/protobuf/releases/download/v${_PROTOC_VERSION}/protoc-${_PROTOC_VERSION}-win64.zip"
+                "${_PROTOC_HOST_DIR}/protoc-${_PROTOC_VERSION}-win64.zip"
+                SHOW_PROGRESS STATUS _PROTOC_DL_STATUS TLS_VERIFY ON
+            )
+            list(GET _PROTOC_DL_STATUS 0 _PROTOC_DL_ERR)
+            if(NOT _PROTOC_DL_ERR EQUAL 0)
+                list(GET _PROTOC_DL_STATUS 1 _PROTOC_DL_MSG)
+                message(FATAL_ERROR
+                    "Failed to download protoc: ${_PROTOC_DL_MSG}\n"
+                    "For offline builds, place protoc.exe at: ${_HOST_PROTOC_EXE}"
+                )
+            endif()
+            file(ARCHIVE_EXTRACT
+                INPUT "${_PROTOC_HOST_DIR}/protoc-${_PROTOC_VERSION}-win64.zip"
+                DESTINATION "${_PROTOC_HOST_DIR}"
+            )
+        endif()
+        if(NOT EXISTS "${_HOST_PROTOC_EXE}")
+            message(FATAL_ERROR "protoc not found after extraction: ${_HOST_PROTOC_EXE}")
+        endif()
+        set(_ORTTRTRTX_HOST_PROTOC "${_HOST_PROTOC_EXE}")
+        message(STATUS "Using host protoc: ${_ORTTRTRTX_HOST_PROTOC}")
+    endif()
+    if(WIN32)
+        set(BUILD_SHARED_LIBS OFF)
+    endif()
+
+    if(_ORTTRTRTX_HOST_PROTOC)
+        # protobuf
+        FetchContent_Declare(
+            protobuf
+            GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
+            GIT_TAG        v31.1
+        )
+        set(protobuf_BUILD_TESTS         OFF CACHE INTERNAL "")
+        set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE INTERNAL "")
+        set(protobuf_BUILD_PROTOC_BINARIES OFF CACHE BOOL "" FORCE)
+        fetch_content_make_available_exclude_from_all(protobuf)
+    endif()
 
     # Add ONNX
     FetchContent_Declare(
         onnx
         GIT_REPOSITORY https://github.com/onnx/onnx.git
-#        GIT_TAG        v1.21.0
-        GIT_TAG        v1.18.0
+        GIT_TAG        v1.21.0
     )
-    FetchContent_MakeAvailable(onnx)
+
+    if(_ORTTRTRTX_HOST_PROTOC)
+        set(ONNX_CUSTOM_PROTOC_EXECUTABLE "${_ORTTRTRTX_HOST_PROTOC}" CACHE INTERNAL "")
+        set(Protobuf_PROTOC_EXECUTABLE    "${_ORTTRTRTX_HOST_PROTOC}" CACHE FILEPATH "" FORCE)
+    endif()
+
+    fetch_content_make_available_exclude_from_all(onnx)
+
+    if(MSVC)
+        # Protobuf builds as third-party code under our MSVC flags. Disable /sdl
+        # and warnings target-locally so promoted protobuf diagnostics do not
+        # fail our build.
+        foreach(_protobuf_target
+            libprotobuf
+            libprotobuf-lite
+            libprotoc
+            protoc
+            protoc-gen-upb
+            protoc-gen-upbdefs)
+            if(TARGET ${_protobuf_target})
+                target_compile_options(${_protobuf_target} PRIVATE /sdl- /w /wd4146 /wd4996)
+            endif()
+        endforeach()
+    endif()
 
     set(DEPS_PATH "${CMAKE_BINARY_DIR}/_deps")
 else()
@@ -259,23 +258,11 @@ if(WIN32)
     endif()
     set(TRT_EP_LIB_LINK_FLAG "-DEF:${CMAKE_SOURCE_DIR}/src/tensorrt_rtx_execution_provider.def")
 
-    # =============================================================================
-    # Delay Load Configuration for TensorRT RTX DLLs
-    # =============================================================================
-    # Construct DLL names for delay loading
-    if(NV_TRT_MAJOR_RTX AND NV_TRT_MINOR_RTX)
-        set(TRT_RTX_DLL_NAME "tensorrt_rtx_${NV_TRT_MAJOR_RTX}_${NV_TRT_MINOR_RTX}.dll")
-        set(TRT_ONNX_PARSER_DLL_NAME "tensorrt_onnxparser_rtx_${NV_TRT_MAJOR_RTX}_${NV_TRT_MINOR_RTX}.dll")
-    else()
-        set(TRT_RTX_DLL_NAME "tensorrt_rtx.dll")
-        set(TRT_ONNX_PARSER_DLL_NAME "tensorrt_onnxparser_rtx.dll")
-    endif()
-
     message(STATUS "Delay load DLL: ${TRT_RTX_DLL_NAME}")
     message(STATUS "Delay load DLL: ${TRT_ONNX_PARSER_DLL_NAME}")
 
     # Add delay load linker flags
-    set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${TRT_RTX_DLL_NAME} /DELAYLOAD:${TRT_ONNX_PARSER_DLL_NAME}")
+    set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${TRT_RTX_DLL_NAME} /DELAYLOAD:${TRT_ONNX_PARSER_DLL_NAME} /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll")
 else()
     if(USE_VCPKG MATCHES "OFF")
         # # Linux
@@ -314,6 +301,12 @@ target_compile_definitions(TensorRTRtxEp PRIVATE
     ONNX_NAMESPACE=onnx
     ONNX_ML
     TRT_RTX_EP_VERSION="${TRT_RTX_EP_VERSION}"
+    # Force the Ort:: C++ wrapper into manual-init mode across all TUs in this
+    # target. We negotiate the ORT API version with the host at load time (see
+    # src/utils/ort_api_init.h) and route the wrapper through it via
+    # Ort::InitApi(). Mixing manual and default init across TUs is rejected by
+    # ORT's #pragma detect_mismatch, so the definition must be consistent.
+    ORT_API_MANUAL_INIT
 )
 
 if(NV_TRT_MAJOR_RTX)
@@ -342,9 +335,6 @@ endif()
 
 # Include directories
 target_include_directories(TensorRTRtxEp PRIVATE
-    ${ONNXRUNTIME_INCLUDE_DIR}
-    ${TENSORRT_RTX_INCLUDE_DIR}
-    ${CUDAToolkit_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
@@ -362,27 +352,18 @@ endif()
 
 # Link libraries
 target_link_libraries(TensorRTRtxEp PRIVATE
-    ${ONNXRUNTIME_LIB}
-    ${TRT_RTX_LIB}
-    ${TRT_ONNX_PARSER_LIB}
+    onnxruntime::onnxruntime
+    tensorrt_rtx::tensorrt_rtx
     protobuf::libprotobuf
     onnx
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::nvml
 )
-
-# Link CUDA runtime and NVML using standardized namespaced targets
-if(CUDAToolkit_FOUND)
-    target_link_libraries(TensorRTRtxEp PRIVATE 
-        CUDA::cudart 
-        CUDA::nvml
-    )
-    message(STATUS "CUDA found - linking cudart and nvml")
-else()
-    message(STATUS "CUDA not found - building without CUDA support")
-endif()
 
 # Link delay load support library (Windows only)
 if(WIN32)
-    target_link_libraries(TensorRTRtxEp PRIVATE delayimp)
+    target_link_libraries(TensorRTRtxEp PRIVATE delayimp d3d12 dxgi)
 endif()
 
 # =============================================================================
@@ -390,7 +371,7 @@ endif()
 # =============================================================================
 set_target_properties(TensorRTRtxEp PROPERTIES
     OUTPUT_NAME "onnxruntime_providers_nv_tensorrt_rtx"
-    CXX_STANDARD 17
+    CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF
 )
@@ -411,4 +392,48 @@ enable_testing()
 option(BUILD_TESTS "Build tests" ON)
 if(BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+# =============================================================================
+# Examples
+# =============================================================================
+option(BUILD_EXAMPLES "Build examples" OFF)
+if(BUILD_EXAMPLES)
+    # onnxruntimesetup.cmake (included by every example subdirectory) checks for
+    # this interface target first. Pre-creating it here lets the examples piggy-back
+    # on the SDK already located by the root project instead of requiring a
+    # separate ONNX_RUNTIME_PATH variable.
+    if(NOT TARGET onnxruntime_interface)
+        find_library(ONNXRUNTIME_PROVIDERS_SHARED_LIB
+            NAMES onnxruntime_providers_shared
+            PATHS ${ONNXRUNTIME_LIB_DIR}
+            NO_DEFAULT_PATH
+        )
+        add_library(onnxruntime_interface INTERFACE)
+        target_include_directories(onnxruntime_interface SYSTEM INTERFACE
+            ${ONNXRUNTIME_INCLUDE_DIR})
+        target_link_libraries(onnxruntime_interface INTERFACE
+            ${ONNXRUNTIME_LIB}
+            $<$<BOOL:${ONNXRUNTIME_PROVIDERS_SHARED_LIB}>:${ONNXRUNTIME_PROVIDERS_SHARED_LIB}>)
+    endif()
+    add_subdirectory(examples/cxx)
+
+    foreach(_example_target
+        ep-device-selection
+        devicetensors-datatransfer
+        devicetensors-datatransfer-async
+        syncstreams_cuda
+        sample
+        sample_buffer
+    )
+        if(TARGET ${_example_target})
+            add_dependencies(${_example_target} TensorRTRtxEp)
+            add_custom_command(TARGET ${_example_target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:TensorRTRtxEp>
+                    $<TARGET_FILE_DIR:${_example_target}>
+                COMMENT "Copying TRT RTX EP DLL to ${_example_target} directory"
+            )
+        endif()
+    endforeach()
 endif()

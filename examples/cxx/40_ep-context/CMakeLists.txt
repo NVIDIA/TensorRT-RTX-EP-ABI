@@ -23,11 +23,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(sample sample.cpp utils.cpp)
-target_link_libraries(sample PRIVATE onnxruntime_interface)
+add_executable(sample sample.cpp)
+target_link_libraries(sample PRIVATE onnxruntime_interface example_utils)
 
-add_executable(sample_buffer sample_buffer.cpp utils.cpp)
-target_link_libraries(sample_buffer PRIVATE onnxruntime_interface)
+add_executable(sample_buffer sample_buffer.cpp)
+target_link_libraries(sample_buffer PRIVATE onnxruntime_interface example_utils)
 
 set(ONNX "candy.onnx")
 set(CANDY_ONNX_PATH "${CMAKE_CURRENT_BINARY_DIR}/../candy.onnx")
@@ -45,4 +45,17 @@ set_target_properties(sample sample_buffer
     ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
+)
+
+copy_ep_dll_post_build(sample)
+
+# sample: no required args, defaults to candy.onnx -> candy_compiled.onnx in the exe dir.
+add_test(
+    NAME    examples/40_ep-context/sample
+    COMMAND $<TARGET_FILE:sample>
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:sample>
+)
+set_tests_properties(examples/40_ep-context/sample PROPERTIES
+    LABELS  "examples"
+    TIMEOUT 300
 )

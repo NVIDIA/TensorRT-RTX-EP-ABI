@@ -28,11 +28,13 @@ onnxruntime-linux-*/
 *.obj
 *.o
 
+# Python wheel — _version.py is stamped at build time by build.bat/build.sh; keep repo copy at "0.0.0"
+python/onnxruntime_ep_nv_tensorrt_rtx/_version.py
+
 # CMake
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
-*.cmake
 !CMakeLists.txt
 !examples/cxx/cmake/*.cmake

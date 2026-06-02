@@ -37,7 +37,7 @@ The TensorRT RTX Execution Provider C++ Coding Guidelines are derived from sever
 
 ## Language Standard
 
-1. This project uses **C++17** as the language standard.
+1. This project uses **C++20** as the language standard.
 2. Use modern C++ features where appropriate (smart pointers, range-based for loops, auto keyword, etc.).
 3. Ensure compatibility with MSVC (Windows), GCC (Linux), and Clang compilers.
 

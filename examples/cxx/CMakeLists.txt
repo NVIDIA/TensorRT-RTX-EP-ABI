@@ -33,6 +33,24 @@ FetchContent_MakeAvailable(lodepng)
 add_library(lodepng_lib STATIC ${lodepng_SOURCE_DIR}/lodepng.cpp ${lodepng_SOURCE_DIR}/lodepng.h)
 target_include_directories(lodepng_lib PUBLIC ${lodepng_SOURCE_DIR})
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(onnxruntimesetup)
+
+add_library(example_utils STATIC
+        common/utils.cpp
+)
+target_include_directories(example_utils PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/common"
+)
+target_link_libraries(example_utils PUBLIC
+        onnxruntime_interface
+        lodepng_lib
+)
+target_compile_features(example_utils PUBLIC cxx_std_20)
+set_target_properties(example_utils PROPERTIES
+        CXX_EXTENSIONS OFF
+)
+
 # Download candy.onnx (neural style transfer) used by all samples.
 set(CANDY_ONNX_URL "https://huggingface.co/onnxmodelzoo/candy-9/resolve/main/candy-9.onnx")
 set(CANDY_ONNX_PATH "${CMAKE_CURRENT_BINARY_DIR}/candy.onnx")
@@ -54,6 +72,7 @@ set(ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
 
 add_subdirectory(10_ep-device-selection)
 add_subdirectory(20_devicetensors-datatransfer)
+add_subdirectory(21_devicetensors-datatransfer-async)
 
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
@@ -63,3 +82,9 @@ else()
 endif()
 
 add_subdirectory(40_ep-context)
+
+# Allow `ctest` to discover example tests when the examples are built standalone
+# (when built via the root CMakeLists.txt the root's enable_testing() already covers this).
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+endif()

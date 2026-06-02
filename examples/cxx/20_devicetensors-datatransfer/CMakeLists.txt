@@ -21,7 +21,6 @@ include(onnxruntimesetup)
 
 add_executable(devicetensors-datatransfer
     main.cpp
-    utils.cpp
 )
 
 set_target_properties(devicetensors-datatransfer PROPERTIES
@@ -30,7 +29,7 @@ set_target_properties(devicetensors-datatransfer PROPERTIES
 )
 target_link_libraries(devicetensors-datatransfer PRIVATE
     onnxruntime_interface
-    lodepng_lib
+    example_utils
 )
 
 set(ONNX "candy.onnx")
@@ -54,4 +53,16 @@ set_target_properties(devicetensors-datatransfer
     ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
+)
+
+copy_ep_dll_post_build(devicetensors-datatransfer)
+
+add_test(
+    NAME    examples/20_devicetensors-datatransfer
+    COMMAND $<TARGET_FILE:devicetensors-datatransfer>
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:devicetensors-datatransfer>
+)
+set_tests_properties(examples/20_devicetensors-datatransfer PROPERTIES
+    LABELS  "examples"
+    TIMEOUT 300
 )

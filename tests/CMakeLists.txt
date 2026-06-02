@@ -153,13 +153,12 @@ set(PROTO_PREPROCESSING_TEST_SOURCES
 add_executable(unittests ${UNITTEST_SOURCES} ${PROTO_PREPROCESSING_TEST_SOURCES})
 
 set_target_properties(unittests PROPERTIES
-    CXX_STANDARD 17
+    CXX_STANDARD 20
     CXX_EXTENSIONS OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
 target_include_directories(unittests PRIVATE
-    ${ONNXRUNTIME_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/utils
     ${CMAKE_SOURCE_DIR}
@@ -176,7 +175,7 @@ endif()
 
 # GTest::gtest (not gtest_main) — test_main.cpp provides main()
 target_link_libraries(unittests PRIVATE
-    ${ONNXRUNTIME_LIB}
+    onnxruntime::onnxruntime
     GTest::gtest
     CUDA::cudart
     CUDA::cuda_driver
@@ -201,3 +200,4 @@ add_custom_command(TARGET unittests POST_BUILD
 
 # Registers each TEST()/TEST_F() as a separate CTest test case
 gtest_discover_tests(unittests)
+

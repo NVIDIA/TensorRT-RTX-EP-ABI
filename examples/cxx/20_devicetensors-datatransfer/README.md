@@ -18,21 +18,22 @@ limitations under the License.
 # EP-Agnostic IO Binding and Device Tensors
 
 This sample demonstrates hardware-agnostic memory allocation and IO binding using
-ONNX Runtime's V2 APIs (`CreateMemoryInfo_V2`, `CopyTensors`, `GetSharedAllocator`).
+ONNX Runtime's V2 C++ APIs (`GetEpDeviceForInputs`, `GetMemoryInfo`, `CopyTensors`,
+`GetSharedAllocator`).
 
 ## Key Concepts
 
-- **EP-agnostic device memory**: Allocate GPU tensors without knowing which EP is active,
-  using `CreateMemoryInfo_V2` with a runtime-discovered vendor ID.
-- **CopyTensors**: Transfer data between CPU and GPU without vendor-specific APIs.
+- **EP-agnostic device memory**: Allocate GPU tensors from the EP device selected
+  for the session inputs.
+- **CopyTensor**: Transfer data between CPU and GPU without vendor-specific APIs.
 - **IO Binding**: Bind device tensors once, run inference multiple times without repeated transfers.
 
 ## How It Works
 
 1. Register available EPs and set `PREFER_GPU` policy.
 2. Create a session and discover which EP device handles the inputs.
-3. Allocate device tensors using `CreateMemoryInfo_V2` with the discovered vendor ID.
-4. Use `CopyTensors` to upload input data to GPU once.
+3. Allocate device tensors using the selected EP device's default memory info.
+4. Use `CopyTensor` to upload input data to GPU once.
 5. Bind device tensors via `IoBinding` and run inference in a loop.
 6. Copy output back to CPU after the loop.
 

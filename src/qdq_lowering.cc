@@ -1978,8 +1978,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             std::string lowered_scale_name = node.input(1);
             std::string lowered_zero_name = zero_point_tensor != nullptr ? node.input(2) : std::string();
 
+            ++unique_id;
             if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
-                                     MakeLoweredName(node_base, "scale", ++unique_id), index.FindTensorRank(node.input(0)),
+                                     MakeLoweredName(node_base, "scale", unique_id), index.FindTensorRank(node.input(0)),
                                      axis_attr, *scale_tensor, block_size, unique_id, lowered_scale_name))
             {
                 *lowered_nodes.Add() = node;
@@ -1998,8 +1999,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                         continue;
                     }
                 }
+                ++unique_id;
                 if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_zero_name,
-                                         MakeLoweredName(node_base, "zero", ++unique_id), index.FindTensorRank(node.input(0)),
+                                         MakeLoweredName(node_base, "zero", unique_id), index.FindTensorRank(node.input(0)),
                                          axis_attr, *index.FindInitializer(lowered_zero_name), block_size, unique_id, lowered_zero_name))
                 {
                     *lowered_nodes.Add() = node;
@@ -2101,8 +2103,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
 
                 std::string lowered_scale_name = node.input(1);
                 std::string lowered_zero_name = zero_point_tensor != nullptr ? node.input(2) : std::string();
+                ++unique_id;
                 if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
-                                         MakeLoweredName(node_base, "scale", ++unique_id), index.FindTensorRank(node.input(0)),
+                                         MakeLoweredName(node_base, "scale", unique_id), index.FindTensorRank(node.input(0)),
                                          axis_attr, *scale_tensor, block_size, unique_id, lowered_scale_name))
                 {
                     *lowered_nodes.Add() = node;
@@ -2135,8 +2138,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                             continue;
                         }
                     }
+                    ++unique_id;
                     if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_zero_name,
-                                             MakeLoweredName(node_base, "zero", ++unique_id), index.FindTensorRank(node.input(0)),
+                                             MakeLoweredName(node_base, "zero", unique_id), index.FindTensorRank(node.input(0)),
                                              axis_attr, *index.FindInitializer(lowered_zero_name), block_size, unique_id, lowered_zero_name))
                     {
                         *lowered_nodes.Add() = node;

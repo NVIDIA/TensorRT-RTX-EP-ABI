@@ -198,7 +198,7 @@ inline bool ValidateProfileShapes(std::unordered_map<std::string, std::vector<st
     std::unordered_map<std::string, std::vector<std::vector<int64_t>>>::iterator it;
     for (it = profile_min_shapes.begin(); it != profile_min_shapes.end(); it++)
     {
-        auto input_name = it->first;
+        const auto& input_name = it->first;
         auto num_profile = it->second.size();
 
         // input_name must also be in max/opt profile
@@ -222,19 +222,17 @@ inline bool ValidateProfileShapes(std::unordered_map<std::string, std::vector<st
 //!
 //! \brief Get cache by name.
 //!
-inline std::string GetCachePath(const std::string& root, const std::string& name)
+inline std::filesystem::path GetCachePath(const std::filesystem::path& root, const std::string& name)
 {
     if (root.empty())
     {
-        return name;
+        return std::filesystem::path(ToPathString(name));
     }
-    else
-    {
-        std::filesystem::path path = root;
-        path.append(name);
-        return path.string();
-    }
+    std::filesystem::path result = root;
+    result /= ToPathString(name);
+    return result;
 }
+inline std::string GetCachePath(const std::string&, const std::string&) = delete;
 
 //!
 //! \brief Helper class to generate engine id via model name/model content/env metadata.
@@ -309,26 +307,45 @@ inline HashValue TRTGenerateId(const OrtGraph* graph, const std::string& trt_ver
                                                        "Model path is empty", ORT_FILE, __LINE__, __FUNCTION__));
     }
 
-    // fingerprint current graph by hashing graph inputs
+    // fingerprint current graph by hashing graph inputs.
+    // Some ORT graph wrappers can be empty for optional values/nodes; skip
+    // them before calling methods like GetName().
     for (auto input : main_graph.GetInputs())
     {
+        const OrtValueInfo* input_ptr = static_cast<const OrtValueInfo*>(input);
+        if (input_ptr == nullptr)
+        {
+            continue;
+        }
         hash_str(input.GetName());
     }
 
     // hashing initializers
     for (auto initializer : main_graph.GetInitializers())
     {
+        const OrtValueInfo* initializer_ptr = static_cast<const OrtValueInfo*>(initializer);
+        if (initializer_ptr == nullptr)
+        {
+            continue;
+        }
         hash_str(initializer.GetName());
     }
 
     // hashing outputs of each node
     for (auto node : main_graph.GetNodes())
     {
+        const OrtNode* node_ptr = static_cast<const OrtNode*>(node);
+        if (node_ptr == nullptr)
+        {
+            continue;
+        }
         for (auto output : node.GetOutputs())
         {
             const OrtValueInfo* out_ptr = (const OrtValueInfo*)(output);
             if (out_ptr == nullptr)
+            {
                 continue;  // skip unconnected optional outputs (e.g., LSTM Y sequence output)
+            }
             hash_str(output.GetName());
         }
     }

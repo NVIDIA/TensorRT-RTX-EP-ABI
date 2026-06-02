@@ -28,6 +28,7 @@
 #include <system_error>
 #include <cctype>
 #include "onnxruntime_cxx_api.h"
+#include "path_string.h"
 
 
 namespace trt_rtx_ep {
@@ -38,146 +39,90 @@ namespace utils {
 /// </summary>
 class FileSystemUtils {
  public:
-  /// <summary>
-  /// Creates a directory and all necessary parent directories
-  /// </summary>
-  /// <param name="path">Directory path to create</param>
-  /// <returns>True if successful or directory already exists, false otherwise</returns>
-  static bool CreateDirectoryRecursive(const std::string& path) {
+  // Path-typed APIs. The const std::string& overloads are intentionally = deleted to force
+  // callers to convert UTF-8 std::string options at the boundary via ToPathString (path_string.h)
+  // instead of relying on std::filesystem::path's implicit ANSI-decoding ctor on Windows.
+
+  static bool CreateDirectoryRecursive(const std::filesystem::path& path) {
     std::error_code ec;
-    std::filesystem::path dir_path(path);
-    
-    // Check if directory already exists
-    if (std::filesystem::exists(dir_path, ec)) {
-      return std::filesystem::is_directory(dir_path, ec);
+    if (std::filesystem::exists(path, ec)) {
+      return std::filesystem::is_directory(path, ec);
     }
-    
-    // Create directory with all parent directories
-    std::filesystem::create_directories(dir_path, ec);
+    std::filesystem::create_directories(path, ec);
     return !ec;
   }
+  static bool CreateDirectoryRecursive(const std::string&) = delete;
 
-  /// <summary>
-  /// Creates a directory and all necessary parent directories with error message
-  /// </summary>
-  /// <param name="path">Directory path to create</param>
-  /// <param name="error_msg">Output error message if creation fails</param>
-  /// <returns>True if successful or directory already exists, false otherwise</returns>
-  static bool CreateDirectoryRecursive(const std::string& path, std::string& error_msg) {
+  static bool CreateDirectoryRecursive(const std::filesystem::path& path, std::string& error_msg) {
     std::error_code ec;
-    std::filesystem::path dir_path(path);
-    
-    // Check if directory already exists
-    if (std::filesystem::exists(dir_path, ec)) {
+    if (std::filesystem::exists(path, ec)) {
       if (ec) {
         error_msg = "Failed to check directory existence: " + ec.message();
         return false;
       }
-      
-      if (!std::filesystem::is_directory(dir_path, ec)) {
-        error_msg = "Path exists but is not a directory: " + path;
+      if (!std::filesystem::is_directory(path, ec)) {
+        error_msg = "Path exists but is not a directory: " + PathToUTF8String(path.native());
         return false;
       }
-      
       return true;
     }
-    
-    // Create directory with all parent directories
-    bool success = std::filesystem::create_directories(dir_path, ec);
-    
+    std::filesystem::create_directories(path, ec);
     if (ec) {
-      error_msg = "Failed to create directory '" + path + "': " + ec.message();
+      error_msg = "Failed to create directory '" + PathToUTF8String(path.native()) + "': " + ec.message();
       return false;
     }
-    
     return true;
   }
+  static bool CreateDirectoryRecursive(const std::string&, std::string&) = delete;
 
-  /// <summary>
-  /// Checks if a path exists
-  /// </summary>
-  /// <param name="path">Path to check</param>
-  /// <returns>True if path exists, false otherwise</returns>
-  static bool PathExists(const std::string& path) {
+  static bool PathExists(const std::filesystem::path& path) {
     std::error_code ec;
     return std::filesystem::exists(path, ec);
   }
+  static bool PathExists(const std::string&) = delete;
 
-  /// <summary>
-  /// Checks if a path is a directory
-  /// </summary>
-  /// <param name="path">Path to check</param>
-  /// <returns>True if path is a directory, false otherwise</returns>
-  static bool IsDirectory(const std::string& path) {
+  static bool IsDirectory(const std::filesystem::path& path) {
     std::error_code ec;
     return std::filesystem::is_directory(path, ec);
   }
+  static bool IsDirectory(const std::string&) = delete;
 
-  /// <summary>
-  /// Checks if a path is a regular file
-  /// </summary>
-  /// <param name="path">Path to check</param>
-  /// <returns>True if path is a regular file, false otherwise</returns>
-  static bool IsFile(const std::string& path) {
+  static bool IsFile(const std::filesystem::path& path) {
     std::error_code ec;
     return std::filesystem::is_regular_file(path, ec);
   }
+  static bool IsFile(const std::string&) = delete;
 
-  /// <summary>
-  /// Gets the absolute path from a relative or absolute path
-  /// </summary>
-  /// <param name="path">Input path</param>
-  /// <returns>Absolute path as string</returns>
-  static std::string GetAbsolutePath(const std::string& path) {
+  static std::filesystem::path GetAbsolutePath(const std::filesystem::path& path) {
     std::error_code ec;
     auto abs_path = std::filesystem::absolute(path, ec);
     if (ec) {
-      return path;  // Return original path if conversion fails
+      return path;
     }
-    return abs_path.string();
+    return abs_path;
   }
+  static std::filesystem::path GetAbsolutePath(const std::string&) = delete;
 
-  /// <summary>
-  /// Gets the parent directory of a path
-  /// </summary>
-  /// <param name="path">Input path</param>
-  /// <returns>Parent directory path</returns>
-  static std::string GetParentPath(const std::string& path) {
-    std::filesystem::path p(path);
-    return p.parent_path().string();
+  static std::filesystem::path GetParentPath(const std::filesystem::path& path) {
+    return path.parent_path();
   }
+  static std::filesystem::path GetParentPath(const std::string&) = delete;
 
-  /// <summary>
-  /// Gets the filename from a path
-  /// </summary>
-  /// <param name="path">Input path</param>
-  /// <returns>Filename</returns>
-  static std::string GetFilename(const std::string& path) {
-    std::filesystem::path p(path);
-    return p.filename().string();
+  static std::filesystem::path GetFilename(const std::filesystem::path& path) {
+    return path.filename();
   }
+  static std::filesystem::path GetFilename(const std::string&) = delete;
 
-  /// <summary>
-  /// Joins two paths together
-  /// </summary>
-  /// <param name="path1">First path component</param>
-  /// <param name="path2">Second path component</param>
-  /// <returns>Joined path</returns>
-  static std::string JoinPath(const std::string& path1, const std::string& path2) {
-    std::filesystem::path p1(path1);
-    std::filesystem::path p2(path2);
-    return (p1 / p2).string();
+  static std::filesystem::path JoinPath(const std::filesystem::path& path1,
+                                        const std::filesystem::path& path2) {
+    return path1 / path2;
   }
+  static std::filesystem::path JoinPath(const std::string&, const std::string&) = delete;
 
-  /// <summary>
-  /// Normalizes a path (removes .. and . components)
-  /// </summary>
-  /// <param name="path">Input path</param>
-  /// <returns>Normalized path</returns>
-  static std::string NormalizePath(const std::string& path) {
-    std::filesystem::path p(path);
-    return p.lexically_normal().string();
+  static std::filesystem::path NormalizePath(const std::filesystem::path& path) {
+    return path.lexically_normal();
   }
+  static std::filesystem::path NormalizePath(const std::string&) = delete;
 
   /// <summary>
   /// Sanitizes a file path to help eliminate possible malicious code or path traversal attacks.
@@ -289,19 +234,18 @@ class FileSystemUtils {
   
 };
 
-inline std::vector<char> ReadFile(const std::string& path, const OrtLogger& logger, const OrtApi& ort_api) {
+inline std::vector<char> ReadFile(const std::filesystem::path& path, const OrtLogger& logger, const OrtApi& ort_api) {
   if (!std::filesystem::exists(path)) {
-
-    std::string message = "TensorRT RTX could not find the file and will create a new one " + path;
-
-    Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger,
-                                                  ORT_LOGGING_LEVEL_INFO,
-                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+    // Cache miss: return empty so the caller proceeds. No log here — this
+    // path can be reached from EP destructor context after the logger has
+    // been torn down.
+    (void)logger;
+    (void)ort_api;
     return {};
   }
   std::ifstream file(path, std::ios::in | std::ios::binary);
   if (!file) {
-    std::string message = "Failed to open file: " + path;
+    std::string message = "Failed to open file: " + PathToUTF8String(path.native());
     Ort::ThrowOnError(ort_api.CreateStatus(ORT_EP_FAIL, message.c_str()));
   }
   file.seekg(0, std::ios::end);
@@ -310,7 +254,7 @@ inline std::vector<char> ReadFile(const std::string& path, const OrtLogger& logg
 
   // Check if file size determination failed
   if (size < 0) {
-    std::string message = "Failed to determine file size: " + path;
+    std::string message = "Failed to determine file size: " + PathToUTF8String(path.native());
     Ort::ThrowOnError(ort_api.CreateStatus(ORT_EP_FAIL, message.c_str()));
   }
 
@@ -322,42 +266,46 @@ inline std::vector<char> ReadFile(const std::string& path, const OrtLogger& logg
   try {
     buffer.resize(usize);
   } catch (const std::bad_alloc&) {
-    std::string message = "Failed to allocate memory for file read (" + 
-                          std::to_string(usize) + " bytes): " + path;
+    std::string message = "Failed to allocate memory for file read (" +
+                          std::to_string(usize) + " bytes): " + PathToUTF8String(path.native());
     Ort::ThrowOnError(ort_api.CreateStatus(ORT_EP_FAIL, message.c_str()));
   }
 
   if (usize > 0 && !file.read(buffer.data(), static_cast<std::streamsize>(usize))) {
-    std::string message = "Failed to read file: " + path;
+    std::string message = "Failed to read file: " + PathToUTF8String(path.native());
     Ort::ThrowOnError(ort_api.CreateStatus(ORT_EP_FAIL, message.c_str()));
   }
   return buffer;
 }
+inline std::vector<char> ReadFile(const std::string&, const OrtLogger&, const OrtApi&) = delete;
 
-inline void WriteFile(const std::string& path, const void* data, size_t size, const OrtLogger& logger, const OrtApi& ort_api) {
+inline void WriteFile(const std::filesystem::path& path, const void* data, size_t size, const OrtLogger& logger, const OrtApi& ort_api) {
   if (std::filesystem::exists(path)) {
     std::ofstream file(path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!file) {
-      std::string message = "Failed to open file for writing: " + path;
+      std::string message = "Failed to open file for writing: " + PathToUTF8String(path.native());
       Ort::ThrowOnError(ort_api.CreateStatus(ORT_EP_FAIL, message.c_str()));
     }
     file.write(static_cast<const char*>(data), size);
   } else {
-    std::string log_message = "TensorRT RTX a new file cache was written to " + path;
-    Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger,
-                                                  ORT_LOGGING_LEVEL_INFO,
-                                                  log_message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+    // First-time cache write. No log here — this path is reached from the
+    // EP destructor (IExecutionContextDeleter -> WriteFile), where the
+    // logger may already have been torn down.
+    (void)logger;
+    (void)ort_api;
     // Create new file
     std::ofstream file(path, std::ios::out | std::ios::binary);
     if (!file) {
-      std::string error_message = "Failed to create file: " + path;
+      std::string error_message = "Failed to create file: " + PathToUTF8String(path.native());
       Ort::ThrowOnError(ort_api.CreateStatus(ORT_EP_FAIL, error_message.c_str()));
     }
     file.write(static_cast<const char*>(data), size);
   }
 }
+inline void WriteFile(const std::string&, const void*, size_t, const OrtLogger&, const OrtApi&) = delete;
 
-inline void WriteFile(const std::string& path, const std::vector<char>& data, const OrtLogger& logger, const OrtApi& ort_api) { WriteFile(path, data.data(), data.size(), logger, ort_api); }
+inline void WriteFile(const std::filesystem::path& path, const std::vector<char>& data, const OrtLogger& logger, const OrtApi& ort_api) { WriteFile(path, data.data(), data.size(), logger, ort_api); }
+inline void WriteFile(const std::string&, const std::vector<char>&, const OrtLogger&, const OrtApi&) = delete;
 
 }  // namespace utils
 }  // namespace trt_rtx_ep

@@ -39,10 +39,12 @@ static const std::string EPCONTEXT_OP_DOMAIN = "com.microsoft";
 
 bool IsAbsolutePath(const std::string& path_string);
 bool IsRelativePathToParentPath(const std::string& path_string);
-std::filesystem::path GetPathOrParentPathOfCtxModel(const std::string& ep_context_file_path);
+std::filesystem::path GetPathOrParentPathOfCtxModel(const std::filesystem::path& ep_context_file_path);
+std::filesystem::path GetPathOrParentPathOfCtxModel(const std::string&) = delete;
 
-std::string GetCtxModelPath(const std::string& ep_context_file_path,
-                            const std::string& original_model_path);
+std::filesystem::path GetCtxModelPath(const std::filesystem::path& ep_context_file_path,
+                                      const std::filesystem::path& original_model_path);
+std::filesystem::path GetCtxModelPath(const std::string&, const std::string&) = delete;
 
 //!
 //! \brief Class to create an EPContext node from an ORT's fused_node.
@@ -60,13 +62,15 @@ public:
     {
     }
 
-    OrtStatus* CreateEPContextNode(const std::string& engine_cache_path,
+    OrtStatus* CreateEPContextNode(const std::filesystem::path& engine_cache_path,
                                    char* engine_data,
                                    size_t size,
                                    const int64_t embed_mode,
                                    const std::string& compute_capability,
-                                   const std::string& onnx_model_path,
+                                   const std::filesystem::path& onnx_model_path,
                                    OrtNode** ep_context_node);
+    OrtStatus* CreateEPContextNode(const std::string&, char*, size_t, const int64_t,
+                                   const std::string&, const std::string&, OrtNode**) = delete;
 
 private:
     TensorrtRtxExecutionProvider& ep_;

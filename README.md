@@ -40,7 +40,7 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 |------------|-----------------|----------|-------|
 | CMake | 3.15 | All | |
 | Visual Studio | 2019 or 2022 (Desktop C++ workload) | Windows | |
-| GCC / Clang | C++17-capable | Linux | |
+| GCC / Clang | C++20-capable | Linux | |
 | CUDA Toolkit | 12.9+ | All | |
 | ONNX Runtime SDK | 1.24.0+ | All | |
 | TensorRT RTX SDK | 1.1.1+ | All | |
@@ -107,6 +107,27 @@ The output library is at:
 - Windows: `build\Release\onnxruntime_providers_nv_tensorrt_rtx.dll`
 - Linux: `build/libonnxruntime_providers_nv_tensorrt_rtx.so`
 
+**Building with Unit Tests**
+
+Unit tests are built by default (`BUILD_TESTS=ON`). D3D12 graphics interop is compiled in automatically on Windows.
+
+```powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64 `
+      -DONNXRUNTIME_ROOT="C:\SDK\onnxruntime-win-x64-1.25.0" `
+      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.1.1.36"
+cmake --build build --config Release
+```
+
+Run the tests:
+
+```powershell
+build\tests\Release\unittests.exe
+```
+
+Note: CIG interop test cases require ORT SDK 1.25+ (`ORT_API_VERSION >= 25`). With ORT 1.24, only the EP registration smoke test compiles.
+
+See [doc/BUILD_GUIDE.md](doc/BUILD_GUIDE.md) for the full build guide with troubleshooting and integration instructions.
+
 ## Usage
 
 The TensorRT RTX EP uses the **V2 device-based EP API** introduced in ORT 1.23.0. The EP library is registered dynamically at runtime, then devices are enumerated and appended to the session.
@@ -116,35 +137,35 @@ The TensorRT RTX EP uses the **V2 device-based EP API** introduced in ORT 1.23.0
 ```cpp
 #include <onnxruntime_cxx_api.h>
 
-OrtApi const& ortApi = Ort::GetApi();
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "MyApp");
 Ort::SessionOptions session_options;
 
 // 1. Register the EP plugin library
-ortApi.RegisterExecutionProviderLibrary(
-    env, "NvTensorRTRTXExecutionProvider",
+env.RegisterExecutionProviderLibrary(
+    "NvTensorRTRTXExecutionProvider",
     ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
 
 // 2. Enumerate available EP devices and find TensorRT RTX
-const OrtEpDevice* const* ep_devices = nullptr;
-size_t num_ep_devices;
-ortApi.GetEpDevices(env, &ep_devices, &num_ep_devices);
-
-const OrtEpDevice* trt_device = nullptr;
-for (size_t i = 0; i < num_ep_devices; i++) {
-    if (strcmp(ortApi.EpDevice_EpName(ep_devices[i]),
-              "NvTensorRTRTXExecutionProvider") == 0) {
-        trt_device = ep_devices[i];
+Ort::ConstEpDevice trt_device = {};
+for (auto& ep_device : env.GetEpDevices()) {
+    if (std::strcmp(ep_device.EpName(), "NvTensorRTRTXExecutionProvider") == 0) {
+        trt_device = ep_device;
         break;
     }
 }
+if (!trt_device) {
+    throw std::runtime_error("TensorRT RTX EP device not found");
+}
 
 // 3. Append the EP with provider options
-const char* keys[]   = {"enable_cuda_graph"};
-const char* values[] = {"1"};
-ortApi.SessionOptionsAppendExecutionProvider_V2(
-    session_options, env, &trt_device, 1,
-    keys, values, 1);
+Ort::KeyValuePairs ep_options;
+ep_options.Add("enable_cuda_graph", "1");
+std::vector<Ort::ConstEpDevice> devices = {trt_device};
+session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 
 // 4. Create session
 Ort::Session session(env, ORT_TSTR("model.onnx"), session_options);
@@ -174,7 +195,7 @@ for ep_device in ep_devices:
 session_options = ort.SessionOptions()
 session_options.add_provider_for_devices(
     [trt_device],
-    {"nv_runtime_cache_path": "./cache"})
+    {"enable_cuda_graph": "1", "nv_runtime_cache_path": "./cache"})
 
 # 4. Create session and run inference
 session = ort.InferenceSession("model.onnx", sess_options=session_options)
@@ -184,12 +205,7 @@ result = session.run([], {"input": input_data})
 del session
 ort.unregister_execution_provider_library("NvTensorRTRTXExecutionProvider")
 ```
-
 ## Documentation
-
-For detailed documentation on features, execution provider options, and API usage, see the official ONNX Runtime documentation:
-
-- [NVIDIA TensorRT RTX Execution Provider](https://onnxruntime.ai/docs/execution-providers/TensorRTRTX-ExecutionProvider.html)
 
 | Document | Description |
 |----------|-------------|
@@ -197,7 +213,7 @@ For detailed documentation on features, execution provider options, and API usag
 
 ## Examples
 
-See [examples/cxx/README.md](examples/cxx/README.md) for build instructions and the full list of C++ samples demonstrating EP device selection, device tensors, CUDA stream interop, and EP context model workflows.
+See [examples/cxx/README.md](examples/cxx/README.md) for build instructions and the full list of C++ samples.
 
 ## Contributing
 

@@ -28,6 +28,7 @@
 //!
 
 #include "tensorrt_rtx_allocator.h"
+#include "utils/ort_api_init.h"
 
 #include <cuda_runtime_api.h>
 
@@ -74,7 +75,7 @@ TensorrtRtxAllocator::TensorrtRtxAllocator(const OrtMemoryInfo* mem_info, Device
     : mem_info_(mem_info), device_id_(device_id)
 {
     // Initialize OrtAllocator interface with current API version
-    OrtAllocator::version = ORT_API_VERSION;
+    OrtAllocator::version = NegotiatedOrtApiVersion();
 
     // Set up function pointers to dispatch to member functions
     // Security checks are included in lambdas for defense in depth
@@ -268,7 +269,7 @@ TensorrtRtxPinnedAllocator::TensorrtRtxPinnedAllocator(const OrtMemoryInfo* mem_
     : mem_info_(mem_info)
 {
     // Initialize OrtAllocator interface with current API version
-    OrtAllocator::version = ORT_API_VERSION;
+    OrtAllocator::version = NegotiatedOrtApiVersion();
 
     // Set up function pointers to dispatch to member functions
     // Security checks are included in lambdas for defense in depth

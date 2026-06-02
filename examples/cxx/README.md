@@ -30,6 +30,7 @@ and [TensorRT RTX 1.4.0](https://developer.nvidia.com/tensorrt-rtx).
 |---|--------|-------------|-------|
 | 10 | [EP Device Selection](10_ep-device-selection/) | Register EPs, enumerate devices, select by vendor/policy | `candy.onnx` |
 | 20 | [Device Tensors & Data Transfer](20_devicetensors-datatransfer/) | EP-agnostic GPU memory, `CopyTensors`, IO binding | `candy.onnx` |
+| 21 | [Async Device Tensor Transfers](21_devicetensors-datatransfer-async/) | EP-provided pinned memory, async `CopyTensors`, disable-sync runs | `candy.onnx` |
 | 30 | [SyncStreams (CUDA)](30_syncstreams-cuda/) | Async upload + inference with `SyncStream`/`SyncNotification` | `candy.onnx` |
 | 40 | [EP Context](40_ep-context/) | Pre-compile models for fast loading (file & buffer modes) | `candy.onnx` (default) |
 
@@ -41,14 +42,14 @@ env.RegisterExecutionProviderLibrary("nv_tensorrt_rtx",
     ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
 
 // 2. Enumerate and select EP devices
-const OrtEpDevice* const* ep_devices = nullptr;
-size_t num_ep_devices;
-ortApi.GetEpDevices(env, &ep_devices, &num_ep_devices);
+auto ep_devices = env.GetEpDevices();
+Ort::ConstEpDevice selected_device = ep_devices.front();
 
 // 3. Append selected devices to session options
-ortApi.SessionOptionsAppendExecutionProvider_V2(
-    session_options, env, &selected_device, 1,
-    option_keys, option_values, num_options);
+Ort::KeyValuePairs ep_options;
+ep_options.Add("key", "value");
+std::vector<Ort::ConstEpDevice> devices = {selected_device};
+session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 ```
 
 ## Prerequisites
@@ -93,7 +94,7 @@ examples/cxx/
 ├── CMakeLists.txt                      # Root build (fetches lodepng, downloads candy.onnx)
 ├── README.md                           # This file
 ├── assets/
-│   └── Input.png                       # Shared test image (240x240)
+│   └── Input.png                       # Shared test image
 ├── cmake/
 │   └── onnxruntimesetup.cmake          # Shared CMake setup
 ├── 10_ep-device-selection/
@@ -102,6 +103,10 @@ examples/cxx/
 │   └── README.md
 ├── 20_devicetensors-datatransfer/
 │   ├── main.cpp                        # CopyTensors & IO binding
+│   ├── utils.cpp/h                     # Image I/O helpers
+│   └── README.md
+├── 21_devicetensors-datatransfer-async/
+│   ├── main.cpp                        # Async CopyTensors with EP pinned allocator
 │   ├── utils.cpp/h                     # Image I/O helpers
 │   └── README.md
 ├── 30_syncstreams-cuda/
@@ -117,10 +122,10 @@ examples/cxx/
 
 ## Models and Assets
 
-- **`candy.onnx`** (samples 10, 20, 30): Neural style transfer model from the
+- **`candy.onnx`** (samples 10, 20, 21, 30): Neural style transfer model from the
   [ONNX Model Zoo](https://huggingface.co/onnxmodelzoo/candy-9) (opset 9).
   **Downloaded automatically** during CMake configure. Input: `[batch_size, 3, H, W]` float32 RGB.
-- **`Input.png`** (samples 10, 20, 30): A 240x240 test image included in the `assets/` directory
+- **`Input.png`** (samples 10, 20, 21, 30): A test image included in the `assets/` directory
   and copied to output directories at configure time.
 - **Sample 40**: Defaults to `candy.onnx`; can also use any user-provided ONNX model via command-line args.
 

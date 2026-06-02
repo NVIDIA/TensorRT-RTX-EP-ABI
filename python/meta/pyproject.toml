@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Meta-package: depends on the default CUDA variant (cu13).
+# End users run:  pip install onnxruntime-ep-nv-tensorrt-rtx
+# CUDA 12 users:  pip install onnxruntime-ep-nv-tensorrt-rtx-cu12
+#
+# _version.txt is written by build.bat / build.sh at release time (gitignored).
+
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onnxruntime-ep-nv-tensorrt-rtx"
+description = "Meta-package: installs the NVIDIA TensorRT RTX Execution Provider for ONNX Runtime (CUDA 13 default)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+authors = [{ name = "NVIDIA Corporation" }]
+keywords = ["onnxruntime", "tensorrt", "execution-provider", "nvidia"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version", "dependencies"]
+# dependencies (install_requires) is set in setup.py to pin the exact matching cu13 version.
+
+[project.urls]
+Homepage = "https://github.com/NVIDIA/trt-rtx-ep-abi"
+
+[tool.setuptools]
+packages = []
+
+[tool.setuptools.dynamic]
+version = { file = "_version.txt" }

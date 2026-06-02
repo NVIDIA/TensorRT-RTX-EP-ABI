@@ -14,6 +14,39 @@
 # limitations under the License.
 
 if(TARGET onnxruntime_interface)
+    # -----------------------------------------------------------------------
+    # Building as part of the root project.
+    # onnxruntime_interface was pre-created by the root; skip SDK discovery.
+    # Populate the DLL / SO path variables used by the copy block below.
+    # -----------------------------------------------------------------------
+    if(WIN32 AND DEFINED ONNXRUNTIME_LIB_DIR)
+        set(ONNXRUNTIME_DLL             "${ONNXRUNTIME_LIB_DIR}/onnxruntime.dll")
+        set(ONNXRUNTIME_PROVIDERS_SHARED_DLL
+                                        "${ONNXRUNTIME_LIB_DIR}/onnxruntime_providers_shared.dll")
+        # TRT RTX DLLs may sit in lib/ or a sibling bin/ directory.
+        if(DEFINED TRT_RTX_DLL_NAME AND DEFINED TRT_RTX_LIB_DIR)
+            foreach(_dir
+                    "${TRT_RTX_LIB_DIR}"
+                    "${TRT_RTX_ROOT}/bin"
+                    "${TRT_RTX_ROOT}/../bin")
+                if(NOT TRTRTX_DLL AND EXISTS "${_dir}/${TRT_RTX_DLL_NAME}")
+                    set(TRTRTX_DLL "${_dir}/${TRT_RTX_DLL_NAME}")
+                endif()
+                if(NOT TRTRTX_PARSER_DLL AND EXISTS "${_dir}/${TRT_ONNX_PARSER_DLL_NAME}")
+                    set(TRTRTX_PARSER_DLL "${_dir}/${TRT_ONNX_PARSER_DLL_NAME}")
+                endif()
+            endforeach()
+        endif()
+    elseif(NOT WIN32 AND DEFINED ONNXRUNTIME_LIB_DIR)
+        set(ONNXRUNTIME_PROVIDERS_SHARED_LIB
+                                        "${ONNXRUNTIME_LIB_DIR}/libonnxruntime_providers_shared.so")
+        if(DEFINED TRT_RTX_LIB AND EXISTS "${TRT_RTX_LIB}")
+            set(TRTRTX_LIB "${TRT_RTX_LIB}")
+        endif()
+        if(DEFINED TRT_ONNX_PARSER_LIB AND EXISTS "${TRT_ONNX_PARSER_LIB}")
+            set(TRTRTX_PARSER_LIB "${TRT_ONNX_PARSER_LIB}")
+        endif()
+    endif()
 else()
   set(ONNX_RUNTIME_PATH "$ENV{ONNX_RUNTIME_PATH}" CACHE PATH "Where to find ONNX runtime")
   if("${ONNX_RUNTIME_PATH}" STREQUAL "")
@@ -100,6 +133,26 @@ else()
     message(STATUS "TRT RTX EP lib not found (will be loaded at runtime)")
   endif()
 endif()
+
+# =============================================================================
+# copy_ep_dll_post_build(<target>)
+#
+# When the samples are built from the root CMakeLists.txt the TensorRTRtxEp
+# target is available. Call this macro after defining each sample executable
+# to add a POST_BUILD step that copies the freshly-built EP DLL next to the
+# executable so the sample can load it via RegisterExecutionProviderLibrary.
+# The macro is a no-op when building the examples standalone.
+# =============================================================================
+macro(copy_ep_dll_post_build _target)
+    if(TARGET TensorRTRtxEp)
+        add_custom_command(TARGET ${_target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:TensorRTRtxEp>
+                $<TARGET_FILE_DIR:${_target}>
+            COMMENT "Copying TRT RTX EP to ${_target} output directory"
+        )
+    endif()
+endmacro()
 
 set(RUNTIME_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 

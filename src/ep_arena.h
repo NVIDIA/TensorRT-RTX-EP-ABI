@@ -25,10 +25,10 @@ limitations under the License.
 #include <set>
 #include <sstream>
 #include "utils/ep_utils.h"
+#include "utils/ort_api_init.h"
 
-#define ORT_API_MANUAL_INIT
+// ORT_API_MANUAL_INIT is defined globally for this target (see CMakeLists.txt).
 #include "onnxruntime_cxx_api.h"
-#undef ORT_API_MANUAL_INIT
 
 
 #if defined(PLATFORM_WINDOWS)
@@ -645,7 +645,9 @@ struct ArenaAllocator : OrtAllocator {
   ArenaAllocator(std::unique_ptr<ArenaImpl> implementation, const OrtMemoryInfo& memory_info)
       : impl_{std::move(implementation)},
         memory_info_{memory_info} {
-    version = ORT_API_VERSION;
+    // Use the negotiated ORT API version, not the compile-time one, so a single
+    // DLL can declare itself to whatever host loaded it.
+    version = trt_rtx_ep::NegotiatedOrtApiVersion();
     Alloc = AllocImpl;
     Reserve = ReserveImpl;
     Free = FreeImpl;
@@ -654,9 +656,9 @@ struct ArenaAllocator : OrtAllocator {
     AllocOnStream = nullptr;
 #if defined(ORT_API_VERSION) && ORT_API_VERSION >= 25
     // OrtAllocator::Shrink was added in ORT 1.25 (ORT_API_VERSION 25).
-    // When building against older headers the field does not exist, so the
-    // assignment is compiled out. Callers on older runtimes never invoke
-    // arena shrinkage via this path.
+    // Compile-time guard: when building against pre-1.25 headers the field
+    // does not exist in the struct. At runtime, ORT 1.24 hosts ignore the
+    // populated field because they gate by ort_version_supported < 25.
     Shrink = ShrinkImpl;
 #endif
   }

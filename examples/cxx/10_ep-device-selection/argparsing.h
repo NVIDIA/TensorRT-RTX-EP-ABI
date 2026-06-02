@@ -15,38 +15,39 @@
 
 #pragma once
 
-#include "utils.h"
-
-#include <onnxruntime_cxx_api.h>
-
 #include <filesystem>
 #include <functional>
 #include <string>
 #include <string_view>
 
-struct Opts {
-  std::string input_image;
-  std::string output_image;
-  std::string select_vendor;
-  std::string select_ep;
-  bool enableEpContext{true};
-  OrtExecutionProviderDevicePolicy ep_device_policy =
-      OrtExecutionProviderDevicePolicy_PREFER_GPU;
+#include "utils.h"
+#include <onnxruntime_cxx_api.h>
+
+struct Opts
+{
+    std::string input_image;
+    std::string output_image;
+    std::string select_vendor;
+    std::string select_ep;
+    bool enableEpContext{true};
+    OrtExecutionProviderDevicePolicy ep_device_policy = OrtExecutionProviderDevicePolicy_PREFER_GPU;
 };
 
-struct ArgumentSpec {
-  const char *name;
-  const char *short_name;
-  const char *help;
-  int num_args;
-  std::function<bool(int)> lambda;
+struct ArgumentSpec
+{
+    const char* name;
+    const char* short_name;
+    const char* help;
+    int num_args;
+    std::function<bool(int)> lambda;
 };
 
-static Opts parse_args(int argc, char **argv) {
-  using namespace std::string_view_literals;
-  Opts opts;
-  auto arg_specs = std::array{
-      // clang-format off
+static Opts parse_args(int argc, char** argv)
+{
+    using namespace std::string_view_literals;
+    Opts opts;
+    auto arg_specs = std::array{
+        // clang-format off
     ArgumentSpec{
       "--input", "-i", "Path to input image (*.png)", 1, [&](int i) {
         opts.input_image = argv[i + 1];
@@ -109,66 +110,85 @@ static Opts parse_args(int argc, char **argv) {
         }
         return true;
       }}
-      // clang-format on
-  };
-  auto print_usage = [&] {
-    LOG("");
-    LOG("Usage:");
-    LOG("{} <options>", argv[0]);
-    for (auto &spec : arg_specs) {
-      if (spec.short_name) {
-        LOG("\t{} {}    {}", spec.name, spec.short_name, spec.help);
-      } else {
-        LOG("\t{}    {}", spec.name, spec.help);
-      }
-    }
-  };
-  for (int i = 1; i < argc; i++) {
-    bool arg_found = false;
-    for (auto &spec : arg_specs) {
-      if (std::strcmp(spec.name, argv[i]) == 0 ||
-          (spec.short_name && std::strcmp(spec.short_name, argv[i]) == 0)) {
-        if (i + spec.num_args < argc) {
-          bool ok = spec.lambda(i);
-          if (!ok) {
-            LOG("Failed to parse arguments for {}!", spec.name);
-            exit(EXIT_FAILURE);
-          }
-          arg_found = true;
-          i += spec.num_args;
-          break;
-        } else {
-          LOG("Not enough arguments for {} specified!", spec.name);
-          exit(EXIT_FAILURE);
+        // clang-format on
+    };
+    auto print_usage = [&]
+    {
+        LOG("");
+        LOG("Usage:");
+        LOG("{} <options>", argv[0]);
+        for (auto& spec : arg_specs)
+        {
+            if (spec.short_name)
+            {
+                LOG("\t{} {}    {}", spec.name, spec.short_name, spec.help);
+            }
+            else
+            {
+                LOG("\t{}    {}", spec.name, spec.help);
+            }
         }
-      }
+    };
+    for (int i = 1; i < argc; i++)
+    {
+        bool arg_found = false;
+        for (auto& spec : arg_specs)
+        {
+            if (std::strcmp(spec.name, argv[i]) == 0 || (spec.short_name && std::strcmp(spec.short_name, argv[i]) == 0))
+            {
+                if (i + spec.num_args < argc)
+                {
+                    bool ok = spec.lambda(i);
+                    if (!ok)
+                    {
+                        LOG("Failed to parse arguments for {}!", spec.name);
+                        exit(EXIT_FAILURE);
+                    }
+                    arg_found = true;
+                    i += spec.num_args;
+                    break;
+                }
+                else
+                {
+                    LOG("Not enough arguments for {} specified!", spec.name);
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+        if (!arg_found)
+        {
+            auto arg = argv[i];
+            LOG("Unknown argument: {}", arg);
+            print_usage();
+            exit(EXIT_FAILURE);
+        }
     }
-    if (!arg_found) {
-      auto arg = argv[i];
-      LOG("Unknown argument: {}", arg);
-      print_usage();
-      exit(EXIT_FAILURE);
+    if (opts.input_image.empty())
+    {
+        opts.input_image = (get_executable_path().parent_path() / "Input.png").string();
     }
-  }
-  if (opts.input_image.empty()) {
-    opts.input_image = (get_executable_path().parent_path() / "Input.png").string();
-  }
-  if (opts.output_image.empty()) {
-    opts.output_image = (get_executable_path().parent_path() / "output.png").string();
-  }
-  if (!std::filesystem::is_regular_file(opts.input_image)) {
-    LOG("Please make sure that provided input image path exists: \"{}\"!",
-        opts.input_image.c_str());
-    print_usage();
-    exit(EXIT_FAILURE);
-  }
-  if (!std::filesystem::is_directory(
-          std::filesystem::path(opts.output_image).parent_path())) {
-    LOG("Please make sure that the parent directory of the provided output "
-        "path exists: \"{}\"!",
-        opts.output_image.c_str());
-    print_usage();
-    exit(EXIT_FAILURE);
-  }
-  return opts;
+    if (opts.output_image.empty())
+    {
+        opts.output_image = (get_executable_path().parent_path() / "output.png").string();
+    }
+    if (!std::filesystem::is_regular_file(opts.input_image))
+    {
+        LOG("Please make sure that provided input image path exists: \"{}\"!", opts.input_image.c_str());
+        print_usage();
+        exit(EXIT_FAILURE);
+    }
+    auto output_parent = std::filesystem::path(opts.output_image).parent_path();
+    if (output_parent.empty())
+    {
+        output_parent = std::filesystem::current_path();
+    }
+    if (!std::filesystem::is_directory(output_parent))
+    {
+        LOG("Please make sure that the parent directory of the provided output "
+            "path exists: \"{}\"!",
+            opts.output_image.c_str());
+        print_usage();
+        exit(EXIT_FAILURE);
+    }
+    return opts;
 }

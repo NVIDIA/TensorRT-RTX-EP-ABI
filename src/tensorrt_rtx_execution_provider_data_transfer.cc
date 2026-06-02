@@ -17,6 +17,7 @@
 
 #include "utils/cuda/cuda_call.h"
 #include "utils/cuda/cuda_common.h"
+#include "utils/ort_api_init.h"
 
 #include <cuda_runtime_api.h>
 
@@ -37,7 +38,7 @@ TensorrtRtxDataTransfer::TensorrtRtxDataTransfer(const ApiPtrs& api_ptrs,
       nvidia_vendor_id_{nvidia_vendor_id}
 {
     // Initialize OrtDataTransferImpl interface function pointers
-    ort_version_supported = ORT_API_VERSION;
+    ort_version_supported = NegotiatedOrtApiVersion();
     CanCopy = CanCopyImpl;
     CopyTensors = CopyTensorsImpl;
     Release = ReleaseImpl;

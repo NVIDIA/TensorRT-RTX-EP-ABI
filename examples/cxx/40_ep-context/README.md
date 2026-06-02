@@ -44,13 +44,25 @@ env.RegisterExecutionProviderLibrary("nv_tensorrt_rtx",
     ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
 
 // 2. Enumerate and select EP devices
-auto ep_devices = env.GetEpDevices();
-// Select the TensorRT RTX device...
+Ort::ConstEpDevice trt_device = {};
+for (auto& device : env.GetEpDevices())
+{
+    if (std::strcmp(device.EpName(), "nv_tensorrt_rtx") == 0)
+    {
+        trt_device = device;
+        break;
+    }
+}
+if (!trt_device)
+{
+    throw std::runtime_error("TensorRT RTX EP device not found");
+}
 
 // 3. Append EP to session options using V2 API
-ortApi.SessionOptionsAppendExecutionProvider_V2(
-    session_options, env, &trt_device, 1,
-    option_keys, option_values, num_options);
+Ort::KeyValuePairs ep_options;
+ep_options.Add("key", "value");
+std::vector<Ort::ConstEpDevice> devices = {trt_device};
+session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 ```
 
 ## Samples Included

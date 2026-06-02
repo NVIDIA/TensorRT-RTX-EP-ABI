@@ -15,8 +15,9 @@
 
 #pragma once
 
-#include "utils/provider_options.h"
+#include "utils/provider_options_utils.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 
@@ -35,6 +36,7 @@ struct TensorrtRtxExecutionProviderInfo
     bool dump_subgraphs{false};
     std::string engine_cache_path{""};
     bool weight_stripped_engine_enable{false};
+    TensorrtRtxWeightStreamingBudget weight_streaming_budget{};
     std::string onnx_model_folder_path{""};
     const void* onnx_bytestream{nullptr};
     size_t onnx_bytestream_size{0};

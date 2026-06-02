@@ -246,8 +246,12 @@ Ort::Session make_session_from_result(const CompileResult& result)
     // anchor the relative path lookup to the correct directory.
     if (result.is_buffer() && !result.intended_ctx_path.empty())
     {
+        // kOrtSessionOptionEpContextFilePath is a UTF-8 narrow string per the
+        // WS5 fix (decoded via MultiByteToWideChar(CP_UTF8, ...) inside the
+        // EP). path::string() returns CP_ACP on Windows, which mis-decodes
+        // for any non-ASCII char. Use u8string() to feed UTF-8 bytes.
         so.AddConfigEntry(kOrtSessionOptionEpContextFilePath,
-                          result.intended_ctx_path.string().c_str());
+                          reinterpret_cast<const char*>(result.intended_ctx_path.u8string().c_str()));
     }
 
     if (result.is_file())
@@ -476,23 +480,82 @@ INSTANTIATE_TEST_SUITE_P(
 namespace
 {
 
-// Returns a subdirectory under the model directory whose name exercises:
-//   - spaces
-//   - parentheses
-//   - the Unicode character é (U+00E9), common in European user paths
-//
-// On Windows the path is constructed from a wide-string literal so that
-// std::filesystem::path carries the correct wchar_t encoding regardless
-// of the system codepage.
-inline std::filesystem::path special_chars_base_dir()
+// Test-case descriptor for the parameterized path tests below.
+//   subdir_name -- folder name exercising a specific character class. Stored
+//                  as std::filesystem::path so the wide-native form on Windows
+//                  carries the right code points regardless of source-file
+//                  encoding. Literals below use \uXXXX / \UXXXXXXXX escapes
+//                  exclusively so the source stays ASCII-portable and does
+//                  not depend on the /utf-8 compile flag.
+//   label       -- ASCII-safe identifier used by GoogleTest to name the
+//                  parameterized instance (test output, --gtest_filter, etc.).
+struct SpecialCharsCase
 {
+    std::filesystem::path subdir_name;
+    const char*           label;
+};
+
+// Returns the subdirectory under the model directory rooted at the supplied
+// subdir name. Used by the parameterized special-chars tests below.
+inline std::filesystem::path special_chars_base_dir(
+    const std::filesystem::path& subdir)
+{
+    return kModelPath.parent_path() / subdir;
+}
+
+// CP1252-mappable character classes -- safe to exercise via path-load (the
+// existing test architecture). These characters all have CP_ACP byte
+// mappings on Western-Windows runners, so the wide -> narrow conversion
+// inside framework code (model_metadef_id_generator.cc:43) succeeds.
+//
+// All Windows wide literals use \uXXXX escapes so the source file stays
+// ASCII-portable; no /utf-8 compile flag is required.
+inline std::vector<SpecialCharsCase> cp1252_mappable_cases()
+{
+    return {
 #ifdef _WIN32
-    return kModelPath.parent_path()
-        / std::filesystem::path{L"special (chars) r\u00e9sum\u00e9"};
+        // The original case carried through from the pre-MR test.
+        { std::filesystem::path{L"special (chars) r\u00e9sum\u00e9"},   "EAcuteResume" },
+        { std::filesystem::path{L"Verd\u00fa2"},                        "VerduTwo"     },  // u-acute U+00FA
+        { std::filesystem::path{L"M\u00fcnchen"},                       "Muenchen"     },  // u-umlaut U+00FC
+        { std::filesystem::path{L"Caf\u00e9_Gr\u00f6\u00dfe"},          "CafeGroesse"  },  // e-acute, o-umlaut, sharp-s
 #else
-    return kModelPath.parent_path()
-        / std::filesystem::path{u8"special (chars) r\u00e9sum\u00e9"};
+        { std::filesystem::path{u8"special (chars) r\u00e9sum\u00e9"},  "EAcuteResume" },
+        { std::filesystem::path{u8"Verd\u00fa2"},                       "VerduTwo"     },
+        { std::filesystem::path{u8"M\u00fcnchen"},                      "Muenchen"     },
+        { std::filesystem::path{u8"Caf\u00e9_Gr\u00f6\u00dfe"},         "CafeGroesse"  },
 #endif
+    };
+}
+
+// Full character-class matrix: CP1252-mappable PLUS classes outside the
+// system ANSI code page (non-CP1252 Latin, CJK, Cyrillic, emoji, mixed-
+// script). The non-CP1252 entries are NOT safe to exercise via path-load --
+// Microsoft framework code at model_metadef_id_generator.cc:43 stringifies
+// the held wide path via CP_ACP and throws on any char without a CP1252
+// mapping. They MUST be exercised via buffer-load (Ort::Session with bytes,
+// not a wchar_t* path) -- see TensorRTRTXEpTest_BufferLoadPathTest.
+inline std::vector<SpecialCharsCase> all_special_chars_cases()
+{
+    auto v = cp1252_mappable_cases();
+#ifdef _WIN32
+    v.push_back({ std::filesystem::path{L"\u0141ukasz"},                                  "Lukasz"          });
+    v.push_back({ std::filesystem::path{L"\u0141\u00f3d\u017a"},                          "Lodz"            });
+    v.push_back({ std::filesystem::path{L"\u017dlu\u0165ou\u010dk\u00fd"},                "Zlutoucky"       });
+    v.push_back({ std::filesystem::path{L"\u5c71\u7530"},                                 "Yamada_CJK"      });
+    v.push_back({ std::filesystem::path{L"\u041c\u043e\u0441\u043a\u0432\u0430"},         "Moskva_Cyrillic" });
+    v.push_back({ std::filesystem::path{L"test_\U0001F389_party"},                        "Party_Emoji"     });
+    v.push_back({ std::filesystem::path{L"\u00e9_\u6f22_\u03b1_\u03a9"},                  "MultiScript"     });
+#else
+    v.push_back({ std::filesystem::path{u8"\u0141ukasz"},                                 "Lukasz"          });
+    v.push_back({ std::filesystem::path{u8"\u0141\u00f3d\u017a"},                         "Lodz"            });
+    v.push_back({ std::filesystem::path{u8"\u017dlu\u0165ou\u010dk\u00fd"},               "Zlutoucky"       });
+    v.push_back({ std::filesystem::path{u8"\u5c71\u7530"},                                "Yamada_CJK"      });
+    v.push_back({ std::filesystem::path{u8"\u041c\u043e\u0441\u043a\u0432\u0430"},        "Moskva_Cyrillic" });
+    v.push_back({ std::filesystem::path{u8"test_\U0001F389_party"},                       "Party_Emoji"     });
+    v.push_back({ std::filesystem::path{u8"\u00e9_\u6f22_\u03b1_\u03a9"},                 "MultiScript"     });
+#endif
+    return v;
 }
 
 // Compile input_path ? output_path (embed_mode=true, file-to-file) and point
@@ -508,7 +571,12 @@ void compile_with_cache(
     ep_opts.Add("enable_cuda_graph", "1");
     if (!cache_dir.empty())
     {
-        ep_opts.Add("nv_runtime_cache_path", cache_dir.string().c_str());
+        // The EP's nv_runtime_cache_path option expects a UTF-8 narrow string
+        // (the WS5 patch decodes it via MultiByteToWideChar(CP_UTF8, ...)).
+        // path::string() on Windows would produce CP_ACP-encoded bytes, which
+        // mis-decode under UTF-8 once any non-ASCII char appears. C++17's
+        // path::u8string() returns std::string encoded in UTF-8.
+        ep_opts.Add("nv_runtime_cache_path", reinterpret_cast<const char*>(cache_dir.u8string().c_str()));
     }
     so.AppendExecutionProvider_V2(*ort_env, get_trt_rtx_devices(*ort_env), ep_opts);
 
@@ -529,7 +597,9 @@ Ort::Session make_session_with_cache(
     Ort::SessionOptions so;
     Ort::KeyValuePairs  ep_opts;
     ep_opts.Add("enable_cuda_graph", "1");
-    ep_opts.Add("nv_runtime_cache_path", cache_dir.string().c_str());
+    // See note in compile_with_cache: the EP expects UTF-8 narrow on
+    // nv_runtime_cache_path; path::string() returns CP_ACP on Windows.
+    ep_opts.Add("nv_runtime_cache_path", reinterpret_cast<const char*>(cache_dir.u8string().c_str()));
     so.AppendExecutionProvider_V2(*ort_env, get_trt_rtx_devices(*ort_env), ep_opts);
     return Ort::Session(*ort_env, toOrtString(ctx_path).c_str(), so);
 }
@@ -548,13 +618,31 @@ bool dir_has_files(const std::filesystem::path& dir)
 
 class TensorRTRTXEpTest_PathTest : public CompileModelTest {};
 
+// Parameterized fixture for special-chars tests that go through path-load
+// (Ort::Session(env, wchar_t* path, opts)). Limited to CP1252-mappable cases
+// to stay inside the EP scope -- non-CP1252 chars trip the Microsoft
+// framework throw at model_metadef_id_generator.cc:43 which is upstream of
+// the NVIDIA EP. The full character matrix is exercised via buffer-load
+// in TensorRTRTXEpTest_BufferLoadPathTest below.
+class TensorRTRTXEpTest_PathTestP
+    : public CompileModelTest,
+      public ::testing::WithParamInterface<SpecialCharsCase>
+{};
+
 // -- Context input path: source ONNX lives on a path with special characters -
 
-TEST_F(TensorRTRTXEpTest_PathTest, ContextInputPathSpecialChars)
+TEST_P(TensorRTRTXEpTest_PathTestP, ContextInputPathSpecialChars)
 {
-    const auto src_dir  = special_chars_base_dir() / "input";
+    const auto base     = special_chars_base_dir(GetParam().subdir_name);
+    const auto src_dir  = base / "input";
     const auto src_copy = src_dir / kModelPath.filename();
-    const auto ctx_path = special_chars_base_dir() / "ctx_from_special" / "context.onnx";
+    const auto ctx_path = base / "ctx_from_special" / "context.onnx";
+
+    // Clear any artifacts from prior runs so subsequent assertions reflect the
+    // CURRENT run's behavior, not stale files.
+    std::error_code ec;
+    std::filesystem::remove_all(src_dir, ec);
+    std::filesystem::remove_all(ctx_path.parent_path(), ec);
 
     std::filesystem::create_directories(src_dir);
     std::filesystem::create_directories(ctx_path.parent_path());
@@ -574,9 +662,15 @@ TEST_F(TensorRTRTXEpTest_PathTest, ContextInputPathSpecialChars)
 
 // -- Context output path: compiled context model written to a special-chars path
 
-TEST_F(TensorRTRTXEpTest_PathTest, ContextOutputPathSpecialChars)
+TEST_P(TensorRTRTXEpTest_PathTestP, ContextOutputPathSpecialChars)
 {
-    const auto ctx_path = special_chars_base_dir() / "ctx_to_special" / "context.onnx";
+    const auto base     = special_chars_base_dir(GetParam().subdir_name);
+    const auto ctx_path = base / "ctx_to_special" / "context.onnx";
+
+    // Clear any artifacts from prior runs.
+    std::error_code ec;
+    std::filesystem::remove_all(ctx_path.parent_path(), ec);
+
     std::filesystem::create_directories(ctx_path.parent_path());
 
     CompileResult result;
@@ -596,6 +690,13 @@ TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheNormalPath)
 {
     const auto cache_dir = kModelPath.parent_path() / "rt_cache_normal_test";
     const auto ctx_path  = kModelPath.parent_path() / "rt_cache_normal_ctx" / "context.onnx";
+
+    // Clear any artifacts from prior runs so dir_has_files(cache_dir) below
+    // reflects the current run's cache write, not stale files.
+    std::error_code ec;
+    std::filesystem::remove_all(cache_dir, ec);
+    std::filesystem::remove_all(ctx_path.parent_path(), ec);
+
     std::filesystem::create_directories(ctx_path.parent_path());
 
     ASSERT_NO_THROW(compile_with_cache(kModelPath, ctx_path, cache_dir));
@@ -622,10 +723,18 @@ TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheNormalPath)
 
 // -- nv_runtime_cache_path: directory with special characters ----------------
 
-TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheSpecialCharsPath)
+TEST_P(TensorRTRTXEpTest_PathTestP, RuntimeCacheSpecialCharsPath)
 {
-    const auto cache_dir = special_chars_base_dir() / "rt_cache";
-    const auto ctx_path  = special_chars_base_dir() / "rt_cache_ctx" / "context.onnx";
+    const auto base      = special_chars_base_dir(GetParam().subdir_name);
+    const auto cache_dir = base / "rt_cache";
+    const auto ctx_path  = base / "rt_cache_ctx" / "context.onnx";
+
+    // Clear any artifacts from prior runs so dir_has_files(cache_dir) below
+    // reflects the current run's cache write, not stale files.
+    std::error_code ec;
+    std::filesystem::remove_all(cache_dir, ec);
+    std::filesystem::remove_all(ctx_path.parent_path(), ec);
+
     std::filesystem::create_directories(ctx_path.parent_path());
 
     ASSERT_NO_THROW(compile_with_cache(kModelPath, ctx_path, cache_dir));
@@ -649,4 +758,112 @@ TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheSpecialCharsPath)
         EXPECT_EQ(s.GetOutputCount(), 1u);
     });
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    CP1252Mappable,
+    TensorRTRTXEpTest_PathTestP,
+    ::testing::ValuesIn(cp1252_mappable_cases()),
+    [](const ::testing::TestParamInfo<SpecialCharsCase>& info) {
+        return std::string(info.param.label);
+    });
+
+// ===========================================================================
+// Buffer-load coverage: exercises the SAME EP code paths as the path-load
+// tests above, but reads the ctx-model bytes into memory via wide-aware
+// std::ifstream and constructs Ort::Session(env, bytes, size, opts). This
+// bypasses the Microsoft framework throw at model_metadef_id_generator.cc:43
+// (which fires for any character not representable in the system ANSI code
+// page when the session is created from a wchar_t* path).
+//
+// Result: the EP plugin's own load code is verified across CP1252-mappable
+// Latin, non-CP1252 Latin, CJK, Cyrillic, emoji, and mixed-script paths.
+// ===========================================================================
+
+namespace
+{
+
+// Wide-aware file read -- std::ifstream(std::filesystem::path) preserves
+// non-ACP chars in the underlying handle.
+inline std::vector<uint8_t> read_all_bytes(const std::filesystem::path& p)
+{
+    std::ifstream f(p, std::ios::binary);
+    if (!f)
+        throw std::runtime_error("read_all_bytes: failed to open file");
+    return { std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
+}
+
+// Buffer-load counterpart of make_session_with_cache. Reads ctx bytes via
+// wide I/O (no narrow conversion of the model path), then opens the session
+// from those bytes.
+Ort::Session make_session_from_buffer_with_cache(
+    const std::filesystem::path& ctx_path,
+    const std::filesystem::path& cache_dir)
+{
+    auto bytes = read_all_bytes(ctx_path);
+    Ort::SessionOptions so;
+    Ort::KeyValuePairs  ep_opts;
+    ep_opts.Add("enable_cuda_graph", "1");
+    // UTF-8 narrow for the EP option (see compile_with_cache for why).
+    ep_opts.Add("nv_runtime_cache_path", reinterpret_cast<const char*>(cache_dir.u8string().c_str()));
+    so.AppendExecutionProvider_V2(*ort_env, get_trt_rtx_devices(*ort_env), ep_opts);
+    return Ort::Session(*ort_env, bytes.data(), bytes.size(), so);
+}
+
+} // anonymous namespace
+
+class TensorRTRTXEpTest_BufferLoadPathTest
+    : public CompileModelTest,
+      public ::testing::WithParamInterface<SpecialCharsCase>
+{};
+
+// -- Buffer-load: nv_runtime_cache_path with full character-class coverage ---
+
+TEST_P(TensorRTRTXEpTest_BufferLoadPathTest, RuntimeCacheBufferLoad)
+{
+    const auto base      = special_chars_base_dir(GetParam().subdir_name);
+    const auto cache_dir = base / "rt_cache_buf";
+    const auto ctx_path  = base / "rt_cache_buf_ctx" / "context.onnx";
+
+    // Clear any artifacts from prior runs so dir_has_files(cache_dir) below
+    // reflects the current run's cache write, not stale files.
+    std::error_code ec;
+    std::filesystem::remove_all(cache_dir, ec);
+    std::filesystem::remove_all(ctx_path.parent_path(), ec);
+
+    std::filesystem::create_directories(ctx_path.parent_path());
+
+    // Compile step: input model is at kModelPath (ASCII), so the framework's
+    // model-path stringification (GenerateId:43) sees only ASCII bytes and
+    // does not throw even when the OUTPUT path or cache_dir is non-CP1252.
+    ASSERT_NO_THROW(compile_with_cache(kModelPath, ctx_path, cache_dir));
+    ASSERT_TRUE(std::filesystem::is_regular_file(ctx_path));
+
+    // First session via buffer-load -- avoids the framework GenerateId:43
+    // throw entirely (no wchar_t* path enters the session ctor).
+    {
+        Ort::Session s = make_session_from_buffer_with_cache(ctx_path, cache_dir);
+        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetOutputCount(), 1u);
+        ASSERT_NO_THROW(run_with_cpu_bindings(s, 1));
+    } // IExecutionContextDeleter fires here ? cache serialized
+
+    EXPECT_TRUE(dir_has_files(cache_dir))
+        << "Expected runtime cache files in: " << cache_dir;
+
+    // Second session: EP should deserialize from the special-chars cache
+    // path (cache_dir is UTF-8-narrow on the EP option boundary).
+    ASSERT_NO_THROW({
+        Ort::Session s = make_session_from_buffer_with_cache(ctx_path, cache_dir);
+        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetOutputCount(), 1u);
+    });
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllCharClasses,
+    TensorRTRTXEpTest_BufferLoadPathTest,
+    ::testing::ValuesIn(all_special_chars_cases()),
+    [](const ::testing::TestParamInfo<SpecialCharsCase>& info) {
+        return std::string(info.param.label);
+    });
 

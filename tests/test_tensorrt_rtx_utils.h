@@ -54,8 +54,24 @@ inline auto toOrtString(const std::filesystem::path& p) {
 #endif
 }
 
-// MODEL_FILE is injected as a compile definition by CMake.
-inline const std::filesystem::path kModelPath{MODEL_FILE};
+// MODEL_FILE is injected as a compile definition by CMake and points at the
+// download location used at configure time. To make tests portable across
+// machines (e.g. CI artifacts unzipped next to the test binary) we prefer a
+// copy of the model that sits in the executable's current working directory
+// when the tests run, and only fall back to the baked-in download path if
+// that local copy is not present.
+inline std::filesystem::path resolveModelPath() {
+    namespace fs = std::filesystem;
+    const fs::path injected_path{MODEL_FILE};
+    std::error_code ec;
+    const fs::path local_path = fs::current_path(ec) / injected_path.filename();
+    if (!ec && fs::is_regular_file(local_path, ec)) {
+        return local_path;
+    }
+    return injected_path;
+}
+
+inline const std::filesystem::path kModelPath = resolveModelPath();
 constexpr const char* kEpName = "NvTensorRTRTXExecutionProvider";
 
 // =============================================================================
@@ -91,6 +107,29 @@ inline bool ort_runtime_at_least(int min_major, int min_minor,
 inline bool ort_runtime_at_least(int min_major, int min_minor) {
     std::string unused;
     return ort_runtime_at_least(min_major, min_minor, unused);
+}
+
+// =============================================================================
+// EP-side ORT API version check (read from EpDevice metadata)
+// =============================================================================
+//
+// The TRT RTX EP publishes its negotiated ORT API version into EpDevice
+// metadata under the key "nv_ep_ort_api_version" (set in
+// src/tensorrt_rtx_provider_factory.cc::GetSupportedDevicesImpl). Tests that
+// exercise version-gated EP features (graphics interop, mempool Shrink, ...)
+// should read this value and skip when the EP was negotiated below the
+// version that introduced the feature.
+//
+// Returns the negotiated EP API version (e.g. 24, 25, 26), or -1 if the EP is
+// older and does not publish the key — callers should treat -1 as "unknown".
+inline int ep_negotiated_ort_api_version(const OrtEpDevice* ep_device) {
+    if (ep_device == nullptr) return -1;
+    const OrtApi& api = Ort::GetApi();
+    const OrtKeyValuePairs* md = api.EpDevice_EpMetadata(ep_device);
+    if (md == nullptr) return -1;
+    const char* v = api.GetKeyValue(md, "nv_ep_ort_api_version");
+    if (v == nullptr) return -1;
+    return std::atoi(v);
 }
 
 // Returns the subset of EP devices that belong to the TRT RTX EP.

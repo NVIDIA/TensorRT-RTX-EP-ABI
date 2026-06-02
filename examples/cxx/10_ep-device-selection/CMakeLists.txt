@@ -21,7 +21,6 @@ include(onnxruntimesetup)
 
 add_executable(ep-device-selection
     main.cpp
-    utils.cpp
 )
 
 set_target_properties(ep-device-selection PROPERTIES
@@ -30,7 +29,7 @@ set_target_properties(ep-device-selection PROPERTIES
 )
 target_link_libraries(ep-device-selection PRIVATE
     onnxruntime_interface
-    lodepng_lib
+    example_utils
 )
 
 set(MODEL_ONNX "candy.onnx")
@@ -56,4 +55,16 @@ set_target_properties(ep-device-selection
     ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
+)
+
+copy_ep_dll_post_build(ep-device-selection)
+
+add_test(
+    NAME    examples/10_ep-device-selection
+    COMMAND $<TARGET_FILE:ep-device-selection>
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:ep-device-selection>
+)
+set_tests_properties(examples/10_ep-device-selection PROPERTIES
+    LABELS  "examples"
+    TIMEOUT 300
 )

@@ -867,6 +867,14 @@ static Ort::Status OrtOpAttrToProto(Ort::ConstOpAttr attr, onnx::AttributeProto&
             tensor_proto.set_data_type(onnx::TensorProto_DataType_UINT64);
             break;
           }
+          case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: {
+            tensor_proto.set_data_type(onnx::TensorProto_DataType_FLOAT16);
+            break;
+          }
+          case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16: {
+            tensor_proto.set_data_type(onnx::TensorProto_DataType_BFLOAT16);
+            break;
+          }
           default: {
             std::string err_msg = "Unexpected ONNXTensorElementDataType with value " + std::to_string(static_cast<int>(element_type));
             return Ort::Status(err_msg.c_str(), ORT_FAIL);

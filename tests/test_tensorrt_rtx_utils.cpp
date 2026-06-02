@@ -45,7 +45,8 @@ void describe_session(Ort::Session& session) {
     std::cout << "Input count: " << input_count << "\n";
     for (size_t i = 0; i < input_count; ++i) {
         auto name  = session.GetInputNameAllocated(i, cpu_alloc);
-        auto info  = session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        auto type_info = session.GetInputTypeInfo(i);
+        auto info = type_info.GetTensorTypeAndShapeInfo();
         std::cout << "  [" << i << "] " << name.get()
                   << "  dtype=" << info.GetElementType() << "  shape=[ ";
         for (auto s : info.GetShape()) std::cout << s << " ";
@@ -56,7 +57,8 @@ void describe_session(Ort::Session& session) {
     std::cout << "Output count: " << output_count << "\n";
     for (size_t i = 0; i < output_count; ++i) {
         auto name  = session.GetOutputNameAllocated(i, cpu_alloc);
-        auto info  = session.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        auto type_info = session.GetOutputTypeInfo(i);
+        auto info = type_info.GetTensorTypeAndShapeInfo();
         std::cout << "  [" << i << "] " << name.get()
                   << "  dtype=" << info.GetElementType() << "  shape=[ ";
         for (auto s : info.GetShape()) std::cout << s << " ";
@@ -206,7 +208,8 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
 
     for (size_t i = 0; i < input_count; ++i) {
         auto name = session.GetInputNameAllocated(i, cpu_alloc);
-        auto info = session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        auto type_info = session.GetInputTypeInfo(i);
+        auto info = type_info.GetTensorTypeAndShapeInfo();
         in_gpu.emplace_back(Ort::Value::CreateTensor(
             gpu, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
         in_cpu.emplace_back(Ort::Value::CreateTensor(
@@ -215,7 +218,8 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
     }
     for (size_t i = 0; i < output_count; ++i) {
         auto name = session.GetOutputNameAllocated(i, cpu_alloc);
-        auto info = session.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        auto type_info = session.GetOutputTypeInfo(i);
+        auto info = type_info.GetTensorTypeAndShapeInfo();
         out_cpu.emplace_back(Ort::Value::CreateTensor(
             cpu_alloc, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
     }
@@ -312,7 +316,10 @@ Ort::IoBinding generate_io_binding(
 
     for (size_t i = 0; i < session.GetInputCount(); ++i) {
         auto name = session.GetInputNameAllocated(i, Ort::AllocatorWithDefaultOptions());
-        auto tensor_info = session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        // session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo(); has lifetime issues
+        // https://github.com/microsoft/onnxruntime/issues/24300
+        auto type_info = session.GetInputTypeInfo(i);
+        auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
         auto shape = tensor_info.GetShape();
         auto type = tensor_info.GetElementType();
 

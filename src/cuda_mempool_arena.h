@@ -55,8 +55,11 @@ struct CudaMempoolAllocator : OrtAllocator
     //! \param device_id CUDA device on which to create the mempool.
     //! \param api ORT C API table.
     //! \param logger ORT logger instance.
-    //! \param out Receives the newly created allocator on success.
-    //! \return nullptr on success, or an OrtStatus describing the error.
+    //! \param out Receives the allocator on success; left null when a creation-time
+    //!        probe finds the pool unusable (fragmented VA) -- an expected fallback,
+    //!        not an error, so the caller can use a synchronous arena instead.
+    //! \return nullptr on success (including the probe-fallback case), or an
+    //!         OrtStatus for an unexpected error.
     //!
     static OrtStatus* Create(
         const OrtMemoryInfo* memory_info,

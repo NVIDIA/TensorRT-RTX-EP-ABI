@@ -224,11 +224,13 @@ namespace tensorrt_ptr
 struct IExecutionContextDeleter
 {
     IExecutionContextDeleter() = default;
-    IExecutionContextDeleter(const std::string& runtime_cache_path, std::unique_ptr<nvinfer1::IRuntimeCache>&& runtime_cache,
+    IExecutionContextDeleter(const std::filesystem::path& runtime_cache_path, std::unique_ptr<nvinfer1::IRuntimeCache>&& runtime_cache,
                              const OrtLogger& logger, const OrtApi& ort_api)
         : runtime_cache_path_(runtime_cache_path), runtime_cache_(std::move(runtime_cache)), logger_(logger), ort_api_(ort_api)
     {
     }
+    IExecutionContextDeleter(const std::string&, std::unique_ptr<nvinfer1::IRuntimeCache>&&,
+                             const OrtLogger&, const OrtApi&) = delete;
 
     void operator()(nvinfer1::IExecutionContext* context)
     {
@@ -244,7 +246,7 @@ struct IExecutionContextDeleter
     }
 
 private:
-    std::string runtime_cache_path_;
+    std::filesystem::path runtime_cache_path_;
     std::unique_ptr<nvinfer1::IRuntimeCache> runtime_cache_;
     const OrtLogger& logger_;
     const OrtApi& ort_api_;
@@ -461,8 +463,8 @@ struct TensorrtRtxExecutionProvider : public OrtEp, public ApiPtrs
     std::unordered_map<std::string, DDSOutputAllocatorMap> dds_output_allocator_maps_;
 
     // Refit engine with new weights from ONNX model
-    OrtStatus* RefitEngineImpl(_In_ std::string onnx_model_filename,
-                               _In_ std::string onnx_model_folder_path,
+    OrtStatus* RefitEngineImpl(_In_ const std::filesystem::path& onnx_model_filename,
+                               _In_ const std::filesystem::path& onnx_model_folder_path,
                                _In_ bool path_check,
                                _In_ const void* onnx_model_bytestream,
                                _In_ size_t onnx_model_bytestream_size,
@@ -470,6 +472,9 @@ struct TensorrtRtxExecutionProvider : public OrtEp, public ApiPtrs
                                _In_ size_t onnx_external_data_bytestream_size,
                                _In_ nvinfer1::ICudaEngine* trt_engine,
                                _In_ bool detailed_build_log) noexcept;
+    OrtStatus* RefitEngineImpl(std::string, std::string, bool,
+                               const void*, size_t, const void*, size_t,
+                               nvinfer1::ICudaEngine*, bool) = delete;
 
 private:
     // ========================================
@@ -522,6 +527,7 @@ private:
     bool dump_subgraphs_ = false;
     bool engine_cache_enable_ = false;
     bool weight_stripped_engine_enable_ = false;
+    TensorrtRtxWeightStreamingBudget weight_streaming_budget_{};
     std::string onnx_model_folder_path_;
     const void* onnx_model_bytestream_;
     size_t onnx_model_bytestream_size_;
@@ -529,7 +535,8 @@ private:
     size_t onnx_external_data_bytestream_size_ = 0;
     bool sparsity_enable_ = false;
     int auxiliary_streams_ = -1;
-    std::string cache_path_, engine_decryption_lib_path_;
+    std::filesystem::path cache_path_;
+    std::string engine_decryption_lib_path_;
     std::unique_ptr<nvinfer1::IRuntime> trt_rtx_runtime_ = nullptr;
     std::mutex tensorrt_rtx_mu_;
 
@@ -539,6 +546,7 @@ private:
     bool engine_decryption_enable_ = false;
     int (*engine_decryption_)(const char*, char*, size_t*) = nullptr;
     int (*engine_encryption_)(const char*, char*, size_t) = nullptr;
+    void* engine_decryption_lib_handle_ = nullptr;  //!< Decryption library handle; freed in dtor
     bool detailed_build_log_ = false;
     bool cuda_graph_enable_ = false;
     bool multi_profile_enable_ = false;
@@ -591,7 +599,7 @@ private:
 
     // For create/dump EP context node model
     std::string ep_context_file_path_;
-    std::string ctx_model_path_;
+    std::filesystem::path ctx_model_path_;
     std::string engine_cache_relative_path_to_context_model_dir_;
 
     std::unordered_set<std::string> control_flow_op_set_ = {"If", "Loop", "Scan"};

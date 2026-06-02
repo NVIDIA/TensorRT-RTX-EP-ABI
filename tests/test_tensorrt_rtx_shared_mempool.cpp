@@ -181,7 +181,10 @@ void run_iterations(Ort::Session& session,
     for (size_t i = 0; i < session.GetInputCount(); ++i)
     {
         auto name  = session.GetInputNameAllocated(i, alloc);
-        auto info  = session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        // Keep TypeInfo alive while retrieving tensor shape info.
+        // See https://github.com/microsoft/onnxruntime/issues/24300.
+        auto type_info = session.GetInputTypeInfo(i);
+        auto info = type_info.GetTensorTypeAndShapeInfo();
         auto shape = info.GetShape();
         for (auto& d : shape) { if (d == -1) d = 1; }
         auto val = Ort::Value::CreateTensor(
@@ -528,8 +531,15 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Descending)
 }
 
 // =============================================================================
-// 6. Shrink via RunOption: memory returned to OS
+// 6. Shrink via RunOption: memory returned to OS  (REQUIRES ORT API >= 25)
 // =============================================================================
+//
+// OrtAllocator::Shrink is populated by the EP only when built against ORT
+// >= 1.25 (see src/ep_arena.h). Compile-time guarded so the test does not
+// exist in 1.24-built binaries; the per-test runtime guard further skips
+// when this 1.25+-built binary is paired with a 1.24-built EP DLL.
+#if ORT_API_VERSION >= 25
+
 //
 // Runs one session, captures the GPU used bytes, then runs once more with
 // `memory.enable_memory_arena_shrinkage = "gpu:0"`. The EP's OnRunEnd hook
@@ -539,6 +549,16 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Descending)
 // Exercises: Shrink() + MaybeRehashLocked().
 TEST_F(TensorRTRTXEpTest_SharedMempool, ShrinkViaRunOption_ReturnsMemory)
 {
+    // EP-side gate: Shrink requires EP DLL built with ORT >= 1.25.
+    const auto devices = get_trt_rtx_devices(*ort_env);
+    const int ep_api_version = ep_negotiated_ort_api_version(
+        static_cast<const OrtEpDevice*>(devices[0]));
+    if (ep_api_version >= 0 && ep_api_version < 25) {
+        GTEST_SKIP() << "Skipping: EP DLL negotiated ORT API version "
+                     << ep_api_version
+                     << "; OrtAllocator::Shrink requires EP built against ORT >= 1.25.";
+    }
+
     const auto path = make_scratch_model(kMDimMedium, "medium");
     auto session = create_session_for_model(path);
 
@@ -589,6 +609,8 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ShrinkViaRunOption_ReturnsMemory)
         << (kToleranceBytes / kMB) << " MB above baseline; scratch block was "
         << "not released.";
 }
+
+#endif  // ORT_API_VERSION >= 25 (Shrink-via-RunOption test)
 
 // =============================================================================
 // 7. Multi-stream: two sessions on two threads, overlapping lifetimes
@@ -724,8 +746,13 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, MultiStream_SequentialSessions_PoolReuse
 }
 
 // =============================================================================
-// 9. Arena-shrinkage comparison (real-world model, CUDA graph on)
+// 9. Arena-shrinkage comparison (real-world model, CUDA graph on)  (REQUIRES ORT API >= 25)
 // =============================================================================
+//
+// Same Shrink dependency as test 6 — compile-time guarded and per-test
+// runtime-guarded on the EP's negotiated API version.
+#if ORT_API_VERSION >= 25
+
 //
 // End-to-end sanity check using the real ResNet-18 model (kModelPath) with
 // `enable_cuda_graph=1`. Compares device-wide `cudaMemGetInfo` usage with
@@ -737,6 +764,16 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, MultiStream_SequentialSessions_PoolReuse
 // are noisy. The explicit scratch-size assertions live in tests 1-8 above.
 TEST_F(TensorRTRTXEpTest_SharedMempool, ArenaShrinkageComparison)
 {
+    // EP-side gate: Shrink requires EP DLL built with ORT >= 1.25.
+    const auto devices = get_trt_rtx_devices(*ort_env);
+    const int ep_api_version = ep_negotiated_ort_api_version(
+        static_cast<const OrtEpDevice*>(devices[0]));
+    if (ep_api_version >= 0 && ep_api_version < 25) {
+        GTEST_SKIP() << "Skipping: EP DLL negotiated ORT API version "
+                     << ep_api_version
+                     << "; OrtAllocator::Shrink requires EP built against ORT >= 1.25.";
+    }
+
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath))
         << "Model not found at: " << kModelPath;
 
@@ -793,3 +830,5 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ArenaShrinkageComparison)
     }
     log_used("after session destruction (B)", gpu_used_bytes(), baseline_);
 }
+
+#endif  // ORT_API_VERSION >= 25 (ArenaShrinkageComparison)

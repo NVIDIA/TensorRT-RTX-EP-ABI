@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onnxruntime-ep-nv-tensorrt-rtx"
+description = "ONNX Runtime plugin package for the NVIDIA TensorRT RTX execution provider (EP ABI)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+authors = [{ name = "NVIDIA Corporation" }]
+keywords = ["onnxruntime", "tensorrt", "execution-provider", "nvidia"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Version stamped at build time by build.bat/build.sh into _version.py
+# Name suffix (e.g. -cu13) injected by BinaryDistribution.parse_config_files() in setup.py
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["onnx>=1.14", "numpy>=1.21"]
+
+[project.urls]
+Homepage = "https://github.com/NVIDIA/trt-rtx-ep-abi"
+
+[tool.setuptools]
+packages = ["onnxruntime_ep_nv_tensorrt_rtx"]
+
+[tool.setuptools.package-data]
+onnxruntime_ep_nv_tensorrt_rtx = ["*.dll", "*.so", "*.so.*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "onnxruntime_ep_nv_tensorrt_rtx._version.__version__" }

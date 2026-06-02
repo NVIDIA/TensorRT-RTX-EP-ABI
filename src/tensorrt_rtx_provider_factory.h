@@ -22,10 +22,14 @@
 
 #include "onnxruntime_c_api.h"
 
+#include <cuda.h>
+
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Forward declarations for ORT types
@@ -86,6 +90,35 @@ public:
     //! \return nullptr on success, or an OrtStatus describing the error.
     OrtStatus* ShrinkCudaMempoolAllocators(uint32_t device_id);
 
+    //! \brief Whether the async CUDA mempool is currently usable for the device:
+    //! created+probed and not latched off by a runtime failure. Used by the compute
+    //! path and CUDA graph capture to pick async vs synchronous behavior.
+    //! Thread-safe: device_mempool_allocators is immutable after session setup; the
+    //! disabled set is guarded by mempool_state_mutex_.
+    //! \param[in]  device_id  GPU device ID.
+    bool IsAsyncMempoolEnabledForDevice(uint32_t device_id) const;
+
+    //! \brief The active async mempool allocator for the device, or nullptr if the
+    //! pool is absent or latched off (caller then uses the BFC arena).
+    //! \param[in]  device_id  GPU device ID.
+    CudaMempoolAllocator* GetActiveMempoolForDevice(uint32_t device_id);
+
+    //! \brief Latch the device's async mempool off after a runtime allocation
+    //! failure, so subsequent runs use the synchronous cudaMalloc arena. Idempotent;
+    //! logs one WARNING per device. The pool object is kept alive but unused.
+    //! \param[in]  device_id  GPU device ID.
+    void NoteAsyncMempoolFailure(uint32_t device_id);
+
+#if ORT_API_VERSION >= 25
+    //! \brief Get the CIG CUDA context for a device (for use in stream creation).
+    //! \param[in]  device_id  GPU device ID.
+    //! \return CIG CUcontext if one was created via InitGraphicsInterop, nullptr otherwise.
+    //! \note CIG (added in ORT API v25). On older hosts no CIG context is ever
+    //!       set (host won't call InitGraphicsInterop), so this returns nullptr
+    //!       and the non-CIG stream path is used.
+    CUcontext GetCigContext(int32_t device_id) const;
+#endif
+
     // Called by child OrtEp instances to retrieve the cached kernel registry for that EP.
     OrtStatus* GetKernelRegistryForEp(/*out*/ const OrtKernelRegistry** kernel_registry);
 
@@ -137,7 +170,19 @@ private:
         const OrtHardwareDevice* hw,
         OrtDeviceEpIncompatibilityDetails* details) noexcept;
 
-    
+#if ORT_API_VERSION >= 25
+    // CIG graphics-interop callbacks (added in ORT API v25). Populated
+    // on the factory v-table when built against 1.25+ headers; hosts
+    // older than 1.25 ignore them because ort_version_supported gates
+    // host-side invocation. OrtGraphicsInteropConfig is itself 1.25+.
+    static OrtStatus* ORT_API_CALL InitGraphicsInteropImpl(OrtEpFactory* this_ptr,
+                                                           const OrtEpDevice* ep_device,
+                                                           const OrtGraphicsInteropConfig* config) noexcept;
+
+    static OrtStatus* ORT_API_CALL DeinitGraphicsInteropImpl(OrtEpFactory* this_ptr,
+                                                             const OrtEpDevice* ep_device) noexcept;
+#endif
+
     static OrtStatus* ORT_API_CALL GetNumCustomOpDomainsImpl(OrtEpFactory* this_ptr,
                                                               size_t* num_domains) noexcept;
                                                               
@@ -153,10 +198,23 @@ private:
     const uint32_t vendor_id_{0x10DE};        //!< NVIDIA PCI vendor ID
     const OrtLogger& default_logger_;         //!< Default logger instance
 
+    //! Devices whose async mempool was latched off at run time. Mutated from the
+    //! (concurrent) compute path under mempool_state_mutex_; entries only added.
+    mutable std::mutex mempool_state_mutex_;
+    std::unordered_set<uint32_t> mempool_runtime_disabled_;
+
     // Cached kernel registry used by all OrtEp instances created by this factory.
     OrtKernelRegistry* kernel_registry_ = nullptr;
     std::vector<OrtCustomOpDomain*> custom_op_domains_;  //!< Custom op domains for TensorRT operations
 
+#if ORT_API_VERSION >= 25
+    // CIG contexts per device (keyed by device_id). The map stays empty on
+    // hosts older than ORT 1.25 (those hosts never call InitGraphicsInterop).
+    // Threading: InitGraphicsInteropImpl, DeinitGraphicsInteropImpl, and CreateSyncStreamForDeviceImpl
+    // (via GetCigContext) may be called from different threads. All access is guarded by cig_contexts_mutex_.
+    mutable std::mutex cig_contexts_mutex_;
+    std::unordered_map<int32_t, CUcontext> cig_contexts_;
+#endif
 };
 
 }  // namespace trt_rtx_ep

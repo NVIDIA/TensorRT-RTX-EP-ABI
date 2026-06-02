@@ -41,6 +41,8 @@ set "ARCH=x64"
 set "VCPKG_TARGET_TRIPLET="
 set "VCPKG_HOST_TRIPLET="
 set "VCPKG_TOOLCHAIN_FILE="
+set "DO_BUILD_WHEEL=0"
+set "WHEEL_OUTPUT_DIR="
 
 REM Parse named arguments
 :parse_args
@@ -113,6 +115,17 @@ if /i "%~1"=="--version" (
     shift
     goto :parse_args
 )
+if /i "%~1"=="--build_wheel" (
+    set "DO_BUILD_WHEEL=1"
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--wheel_dir" (
+    set "WHEEL_OUTPUT_DIR=%~2"
+    shift
+    shift
+    goto :parse_args
+)
 if /i "%~1"=="-h" goto :usage
 if /i "%~1"=="--help" goto :usage
 if /i "%~1"=="/?" goto :usage
@@ -146,11 +159,36 @@ if "%DO_PRODUCTION%"=="1" (
     )
 )
 
+REM Auto-derive version from release branch name (e.g. rel-0.1 -> 0.1.0) when not
+REM explicitly provided. This populates TRT_RTX_EP_VERSION for both the CMake build
+REM and the wheel build so the version is stamped consistently in one place.
+if "%TRT_RTX_EP_VERSION%"=="" (
+    set "_BRANCH="
+    for /f "delims=" %%B in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "_BRANCH=%%B"
+    if "!_BRANCH:~0,4!"=="rel-" (
+        set "_BRANCH_VER=!_BRANCH:rel-=!"
+        for /f "tokens=1,2 delims=." %%M in ("!_BRANCH_VER!") do (
+            if not "%%M"=="" if not "%%N"=="" set "TRT_RTX_EP_VERSION=%%M.%%N.0"
+        )
+    )
+)
+
 REM If no flags specified, do full build (clean + update + build)
 if "%FLAGS_SPECIFIED%"=="0" (
     set "DO_CLEAN=1"
     set "DO_UPDATE=1"
     set "DO_BUILD=1"
+)
+
+REM Determine platform tag for wheel filename
+set "PLATFORM_TAG=win_amd64"
+
+REM Wheel build requires the C++ DLL; auto-enable --build if caller forgot it
+if "%DO_BUILD_WHEEL%"=="1" (
+    if "%DO_BUILD%"=="0" if "%FLAGS_SPECIFIED%"=="1" (
+        echo [INFO] --build_wheel requires --build; enabling automatically.
+        set "DO_BUILD=1"
+    )
 )
 
 REM Validate build configuration
@@ -190,6 +228,9 @@ if "%DO_UPDATE%"=="1" (
 if "%DO_BUILD%"=="1" (
     if defined ACTIONS (set "ACTIONS=%ACTIONS% + build") else (set "ACTIONS=build")
 )
+if "%DO_BUILD_WHEEL%"=="1" (
+    if defined ACTIONS (set "ACTIONS=%ACTIONS% + wheel") else (set "ACTIONS=wheel")
+)
 
 echo ============================================================================
 echo Build Configuration:
@@ -212,6 +253,13 @@ echo   Version:             0.0.0 ^(default^)
 )
 )
 echo   Target Architecture: %ARCH%
+if "%DO_BUILD_WHEEL%"=="1" (
+    if "%WHEEL_OUTPUT_DIR%"=="" (
+        echo   Wheel Output:        %BUILD_DIR%\dist
+    ) else (
+        echo   Wheel Output:        %WHEEL_OUTPUT_DIR%
+    )
+)
 echo ============================================================================
 echo.
 
@@ -346,6 +394,134 @@ if "%DO_BUILD%"=="1" (
     cd /d "%SOURCE_DIR%"
 )
 
+REM ============================================================================
+REM Step 4: BUILD PYTHON WHEEL (if requested)
+REM ============================================================================
+REM Run the wheel build at top-level (not inside a giant `(...)` block) — cmd.exe's
+REM delayed expansion silently breaks inside long nested paren blocks, causing
+REM `!VAR!` to evaluate literally and `if !ERRORLEVEL! NEQ 0` to always fire.
+if not "%DO_BUILD_WHEEL%"=="1" goto :end_wheel
+    REM Locate python/ — prefer inside trt-rtx-ep-abi/ (final repo layout),
+    REM fall back to sibling directory (workspace layout during development)
+    set "PYTHON_DIR="
+    if exist "%SOURCE_DIR%\python\pyproject.toml" set "PYTHON_DIR=%SOURCE_DIR%\python"
+    if not defined PYTHON_DIR if exist "%SOURCE_DIR%\..\python\pyproject.toml" set "PYTHON_DIR=%SOURCE_DIR%\..\python"
+    if not defined PYTHON_DIR (
+        echo ERROR: Cannot find python\ directory. Expected at %SOURCE_DIR%\python or %SOURCE_DIR%\..\python
+        set "BUILD_FAILED=1"
+        goto :end
+    )
+    set "EP_DLL=%SOURCE_DIR%\%BUILD_DIR%\%BUILD_CONFIG%\onnxruntime_providers_nv_tensorrt_rtx.dll"
+    if "%TRT_RTX_EP_VERSION%"=="" (
+        set "WHEEL_VERSION=0.0.0"
+    ) else (
+        set "WHEEL_VERSION=%TRT_RTX_EP_VERSION%"
+    )
+    if "%WHEEL_OUTPUT_DIR%"=="" set "WHEEL_OUTPUT_DIR=%~dp0%BUILD_DIR%\dist"
+
+    REM Verify EP DLL was produced
+    if not exist "%EP_DLL%" (
+        echo ERROR: EP DLL not found at %EP_DLL%
+        echo Run with --build ^(or no flags for full build^) before --build_wheel.
+        set "BUILD_FAILED=1"
+        goto :end
+    )
+
+    REM Require python in PATH. Use `call` so a pyenv-style python.bat shim
+    REM returns control to this script instead of replacing it.
+    call python --version >nul 2>&1
+    set "_PY_RC=%ERRORLEVEL%"
+    if not "%_PY_RC%"=="0" (
+        echo ERROR: 'python' not found in PATH. Add Python to PATH and retry.
+        echo Note: 'python -m build' must also be available ^(pip install build^).
+        set "BUILD_FAILED=1"
+        goto :end
+    )
+
+    REM Stage DLLs into package dir
+    REM TRT RTX SDK layout: DLLs are in bin\, not lib\ (lib\ contains .lib import files)
+    REM CUDA runtime: prefer bin\x64 (CUDA 12+), fall back to bin\ (older layouts).
+    echo [WHEEL] Staging DLLs into package directory...
+    set "CUDA_BIN_ARG="
+    if exist "%CUDA_TOOLKIT_PATH%\bin\x64" (
+        set "CUDA_BIN_ARG=--cuda-bin "%CUDA_TOOLKIT_PATH%\bin\x64""
+    )
+    if not defined CUDA_BIN_ARG if exist "%CUDA_TOOLKIT_PATH%\bin" (
+        set "CUDA_BIN_ARG=--cuda-bin "%CUDA_TOOLKIT_PATH%\bin""
+    )
+    if not defined CUDA_BIN_ARG (
+        echo [WHEEL] Warning: CUDA bin directory not found under %CUDA_TOOLKIT_PATH%; cudart will not be bundled.
+    )
+    call python "%PYTHON_DIR%\scripts\stage_windows_dlls.py" ^
+        --ep-dll "%EP_DLL%" ^
+        --trt-lib-dir "%TRT_RTX_ROOT%\bin" ^
+        %CUDA_BIN_ARG%
+    set "_STAGE_RC=%ERRORLEVEL%"
+    if not "%_STAGE_RC%"=="0" (
+        echo ERROR: DLL staging failed.
+        echo If TRT RTX DLLs are not in %TRT_RTX_ROOT%\bin, set NV_TRT_RTX_LIB_DIR to the correct path.
+        set "BUILD_FAILED=1"
+        goto :end
+    )
+
+    REM Detect CUDA major version from toolkit path for package naming (e.g. v13.2 -> cu13)
+    set "NV_CUDA_MAJOR="
+    echo import re, sys > "%TEMP%\_cuda_ver.py"
+    echo p = sys.argv[1] >> "%TEMP%\_cuda_ver.py"
+    echo m = re.search^(r'[-v]^(\d+^)\.', p^) >> "%TEMP%\_cuda_ver.py"
+    echo print^(m.group^(1^) if m else '', end=''^) >> "%TEMP%\_cuda_ver.py"
+    for /f "usebackq delims=" %%m in (`python "%TEMP%\_cuda_ver.py" "%CUDA_TOOLKIT_PATH%" 2^>nul`) do set "NV_CUDA_MAJOR=%%m"
+    del "%TEMP%\_cuda_ver.py" 2>nul
+    if not "%NV_CUDA_MAJOR%"=="" (
+        echo [WHEEL] CUDA major: %NV_CUDA_MAJOR% ^(package: onnxruntime-ep-nv-tensorrt-rtx-cu%NV_CUDA_MAJOR%^)
+    ) else (
+        echo [WHEEL] Warning: Could not detect CUDA major from path; package will use base name.
+    )
+
+    REM Write _version.py ^(overwrite; gitignored^)
+    echo [WHEEL] Writing _version.py ^(version %WHEEL_VERSION%^)...
+    > "%PYTHON_DIR%\onnxruntime_ep_nv_tensorrt_rtx\_version.py" echo __version__ = "%WHEEL_VERSION%"
+
+    REM Clean stale intermediate build artefacts so DLLs from a previous staging
+    REM run do not leak into the new wheel (build_py adds files but never removes them).
+    if exist "%PYTHON_DIR%\build" (
+        echo [WHEEL] Removing stale Python build cache: %PYTHON_DIR%\build
+        rmdir /s /q "%PYTHON_DIR%\build"
+    )
+
+    REM Build wheel
+    echo [WHEEL] Building Python wheel...
+    call python -m build --wheel --no-isolation --outdir "%WHEEL_OUTPUT_DIR%" "%PYTHON_DIR%"
+    set "_WHEEL_RC=%ERRORLEVEL%"
+    if not "%_WHEEL_RC%"=="0" (
+        echo ERROR: Wheel build failed.
+        echo Ensure 'pip install build' has been run once.
+        set "BUILD_FAILED=1"
+        goto :end
+    )
+    echo [WHEEL] Done.
+    echo.
+
+    REM Build meta wheel (onnxruntime-ep-nv-tensorrt-rtx -> cu13 dependency)
+    set "META_DIR=%PYTHON_DIR%\meta"
+    if not exist "%META_DIR%\pyproject.toml" (
+        echo [META] Warning: meta\ directory not found at %META_DIR%; skipping meta wheel.
+        goto :end_wheel
+    )
+    echo [META] Writing meta\_version.txt ^(version %WHEEL_VERSION%^)...
+    > "%META_DIR%\_version.txt" echo %WHEEL_VERSION%
+    echo [META] Building meta wheel ^(onnxruntime-ep-nv-tensorrt-rtx^)...
+    call python -m build --wheel --no-isolation --outdir "%WHEEL_OUTPUT_DIR%" "%META_DIR%"
+    set "_META_RC=%ERRORLEVEL%"
+    if not "%_META_RC%"=="0" (
+        echo ERROR: Meta wheel build failed.
+        set "BUILD_FAILED=1"
+        goto :end
+    )
+    echo [META] Done.
+    echo.
+:end_wheel
+
 :end
 echo ============================================================================
 if "%BUILD_FAILED%"=="1" (
@@ -356,6 +532,14 @@ if "%BUILD_FAILED%"=="1" (
 echo Completed successfully!
 if "%DO_BUILD%"=="1" (
     echo Output: %BUILD_DIR%\%BUILD_CONFIG%\onnxruntime_providers_nv_tensorrt_rtx.dll
+)
+if "%DO_BUILD_WHEEL%"=="1" (
+    set "_wpkg=onnxruntime_ep_nv_tensorrt_rtx"
+    if not "!NV_CUDA_MAJOR!"=="" set "_wpkg=onnxruntime_ep_nv_tensorrt_rtx_cu!NV_CUDA_MAJOR!"
+    set "_wver=%TRT_RTX_EP_VERSION%"
+    if "!_wver!"=="" set "_wver=0.0.0"
+    echo Wheel:  %WHEEL_OUTPUT_DIR%\!_wpkg!-!_wver!-py3-none-%PLATFORM_TAG%.whl
+    echo Meta:   %WHEEL_OUTPUT_DIR%\onnxruntime_ep_nv_tensorrt_rtx-!_wver!-py3-none-any.whl
 )
 echo ============================================================================
 exit /b 0
@@ -379,6 +563,10 @@ echo   --build                    Compile the project
 echo   --version ^<M.m.p^>          Set EP version (e.g. 1.2.3). Required for --production
 echo   --production               Enable production build with signature verification
 echo   --use_vcpkg                Use VCPKG package manager
+
+echo   --build_wheel              Build Python wheel after C++ DLL build
+echo   --wheel_dir ^<PATH^>         Wheel output directory (default: ^<build_dir^>\dist)
+echo                              Prerequisite: pip install build
 echo   -h, --help, /?             Show this help message
 echo.
 echo Build Actions (can be combined, executed in order: clean -^> update -^> build):
@@ -418,6 +606,12 @@ echo     build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_
 echo.
 echo   Production build (with signature verification and version):
 echo     build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT" --production --version 1.2.3
+echo.
+echo   Full build + Python wheel:
+echo     build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT" --version 1.5.0 --build_wheel
+echo.
+echo   Incremental C++ build + wheel (no clean/reconfigure):
+echo     build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT" --build --build_wheel --version 1.5.0
 echo.
 echo Arguments can be provided in any order.
 echo.
