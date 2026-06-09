@@ -12,18 +12,13 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 - **Faster model compile and load times** — leverages just-in-time compilation to build RTX hardware-optimized engines on end-user devices in seconds.
 - **Portability** — seamlessly use cached models across multiple RTX GPUs.
 
-## Compatibility Matrix
-
-| EP Version | ORT Version | TRT RTX Version | Notes |
-|------------|-------------|-----------------|-------|
-| 0.1 | 1.24.0+ | 1.4.x.x | Initial Windows Support |
-
 ## Contents
 
 - [Compatibility Matrix](#compatibility-matrix)
 - [Build from Source](#build-from-source)
   - [Prerequisites](#prerequisites)
   - [Quick Build](#quick-build)
+  - [Python Wheel](#python-wheel)
 - [Usage](#usage)
   - [C/C++](#cc)
   - [Python](#python)
@@ -31,6 +26,13 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 - [Examples](#examples)
 - [Contributing](#contributing)
 - [License](#license)
+
+## Compatibility Matrix
+
+| EP Version | ORT Version | TRT RTX Version | Notes |
+|------------|-------------|-----------------|-------|
+| 0.1 | 1.24.0+ | 1.4.x.x | Initial Windows Support |
+| 0.3 | 1.25.0+ | 1.5.x.x | Linux Support, Weight Streaming, CIG Interop, ORT Version Negotiation |
 
 ## Build from Source
 
@@ -128,6 +130,41 @@ Note: CIG interop test cases require ORT SDK 1.25+ (`ORT_API_VERSION >= 25`). Wi
 
 See [doc/BUILD_GUIDE.md](doc/BUILD_GUIDE.md) for the full build guide with troubleshooting and integration instructions.
 
+<<<<<<< Updated upstream
+=======
+### Python Wheel
+
+Use the `--build_wheel` flag with the provided build scripts to produce a Python wheel after the C++ build.
+
+**Windows**
+
+```powershell
+build.bat --cuda_home "C:\CUDA\v12.9" `
+          --onnxruntime_home "C:\SDK\onnxruntime-win-x64-1.25.0" `
+          --trt_rtx_home "C:\SDK\TensorRT-RTX-1.5.0.114" `
+          --version 0.3.0 --build_wheel
+```
+
+Output:
+- `build\dist\onnxruntime_ep_nv_tensorrt_rtx_cu12-0.3.0-py3-none-win_amd64.whl`
+- `build\dist\onnxruntime_ep_nv_tensorrt_rtx-0.3.0-py3-none-any.whl` (meta wheel)
+
+**Linux**
+
+```bash
+./build.sh --cuda_home /usr/local/cuda-12.9 \
+           --onnxruntime_home /path/to/onnxruntime \
+           --trt_rtx_home /path/to/tensorrt-rtx \
+           --version 0.3.0 --build_wheel
+```
+
+Output:
+- `build/dist/onnxruntime_ep_nv_tensorrt_rtx_cu12-0.3.0-py3-none-linux_x86_64.whl`
+- `build/dist/onnxruntime_ep_nv_tensorrt_rtx-0.3.0-py3-none-any.whl` (meta wheel)
+
+The meta wheel (`onnxruntime_ep_nv_tensorrt_rtx`) is a platform-independent package that declares a dependency on the appropriate CUDA-versioned wheel.
+
+>>>>>>> Stashed changes
 ## Usage
 
 The TensorRT RTX EP uses the **V2 device-based EP API** introduced in ORT 1.23.0. The EP library is registered dynamically at runtime, then devices are enumerated and appended to the session.
