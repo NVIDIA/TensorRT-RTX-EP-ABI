@@ -130,8 +130,6 @@ Note: CIG interop test cases require ORT SDK 1.25+ (`ORT_API_VERSION >= 25`). Wi
 
 See [doc/BUILD_GUIDE.md](doc/BUILD_GUIDE.md) for the full build guide with troubleshooting and integration instructions.
 
-<<<<<<< Updated upstream
-=======
 ### Python Wheel
 
 Use the `--build_wheel` flag with the provided build scripts to produce a Python wheel after the C++ build.
@@ -164,7 +162,7 @@ Output:
 
 The meta wheel (`onnxruntime_ep_nv_tensorrt_rtx`) is a platform-independent package that declares a dependency on the appropriate CUDA-versioned wheel.
 
->>>>>>> Stashed changes
+
 ## Usage
 
 The TensorRT RTX EP uses the **V2 device-based EP API** introduced in ORT 1.23.0. The EP library is registered dynamically at runtime, then devices are enumerated and appended to the session.
