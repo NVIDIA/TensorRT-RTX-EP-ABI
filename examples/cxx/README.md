@@ -62,7 +62,7 @@ session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 | CMake | 3.20+ | [cmake.org](https://cmake.org/download/) |
 | Visual Studio | 2022+ | [visualstudio.com](https://visualstudio.microsoft.com/) |
 
-**Build the TRT RTX EP first** by following the [Build Guide](../doc/BUILD_GUIDE.md). Copy the
+**Build the TRT RTX EP first** by following the [Build Guide](../../docs/build-guide.rst). Copy the
 resulting `onnxruntime_providers_nv_tensorrt_rtx.dll` into the ONNX Runtime `lib/` directory.
 
 ## Building the Examples

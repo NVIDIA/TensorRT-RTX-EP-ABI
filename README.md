@@ -40,8 +40,8 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 
 | Dependency | Minimum Version | Platform | Notes |
 |------------|-----------------|----------|-------|
-| CMake | 3.15 | All | |
-| Visual Studio | 2019 or 2022 (Desktop C++ workload) | Windows | |
+| CMake | 3.20 | All | |
+| Visual Studio | 2022 (Desktop C++ workload) | Windows | |
 | GCC / Clang | C++20-capable | Linux | |
 | CUDA Toolkit | 12.9+ | All | |
 | ONNX Runtime SDK | 1.24.0+ | All | |
@@ -54,15 +54,16 @@ Configure and build using standard CMake commands. Three CMake cache variables c
 | CMake Variable | Description                                                                           |
 |----------------|---------------------------------------------------------------------------------------|
 | `CUDAToolkit_ROOT` | Path to the CUDA Toolkit installation (optional as it will be taken from environment) |
-| `ONNXRUNTIME_ROOT` | Path to the ONNX Runtime SDK (contains `include/` and `lib/`)                         |
-| `TRT_RTX_ROOT` | Path to the TensorRT RTX SDK (contains `include/` and `lib/`)                         |
+| `ONNXRUNTIME_ROOT` | Optional path to the ONNX Runtime SDK; version 1.26.0 is downloaded when omitted |
+| `TRT_RTX_ROOT` | Path to an extracted TensorRT RTX SDK |
+| `TRT_RTX_DOWNLOAD_URL` | Full TensorRT RTX SDK archive URL, used when `TRT_RTX_ROOT` is omitted |
 
 **Windows**
 
 ```powershell
 cmake -B build -G "Visual Studio 17 2022" -A x64 `
       -DONNXRUNTIME_ROOT="C:\SDK\onnxruntime-win-x64-1.24.0" `
-      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.1.1.36"
+      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.5.0.114"
 cmake --build build --config Release
 ```
 
@@ -75,7 +76,7 @@ vcpkg can optionally be used to manage dependencies (protobuf, ONNX, abseil) ins
 ```powershell
 cmake -B build -G "Visual Studio 17 2022" -A x64 `
       -DONNXRUNTIME_ROOT="C:\SDK\onnxruntime-win-x64-1.24.0" `
-      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.1.1.36" `
+      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.5.0.114" `
       -DUSE_VCPKG=ON `
       -DCMAKE_TOOLCHAIN_FILE="..\vcpkg\scripts\buildsystems\vcpkg.cmake" `
       -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
@@ -116,7 +117,7 @@ Unit tests are built by default (`BUILD_TESTS=ON`). D3D12 graphics interop is co
 ```powershell
 cmake -B build -G "Visual Studio 17 2022" -A x64 `
       -DONNXRUNTIME_ROOT="C:\SDK\onnxruntime-win-x64-1.25.0" `
-      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.1.1.36"
+      -DTRT_RTX_ROOT="C:\SDK\TensorRT-RTX-1.5.0.114"
 cmake --build build --config Release
 ```
 
@@ -128,7 +129,7 @@ build\tests\Release\unittests.exe
 
 Note: CIG interop test cases require ORT SDK 1.25+ (`ORT_API_VERSION >= 25`). With ORT 1.24, only the EP registration smoke test compiles.
 
-See [doc/BUILD_GUIDE.md](doc/BUILD_GUIDE.md) for the full build guide with troubleshooting and integration instructions.
+See the [build guide](docs/build-guide.rst) for complete build, CI, troubleshooting, and integration instructions. The default branch is also published as the [GitHub Pages documentation](https://gedoensmax.github.io/TensorRT-RTX-EP-ABI/).
 
 ### Python Wheel
 
@@ -244,6 +245,8 @@ ort.unregister_execution_provider_library("NvTensorRTRTXExecutionProvider")
 
 | Document | Description |
 |----------|-------------|
+| [Build Guide](docs/build-guide.rst) | Build, CI, troubleshooting, and integration instructions |
+| [Hosted Documentation](https://gedoensmax.github.io/TensorRT-RTX-EP-ABI/) | Sphinx documentation published by GitHub Pages |
 | [Coding Guidelines](CODING-GUIDELINES.md) | Code style and conventions |
 
 ## Examples

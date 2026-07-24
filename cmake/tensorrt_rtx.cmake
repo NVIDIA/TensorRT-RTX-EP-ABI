@@ -3,10 +3,65 @@
 
 include_guard(GLOBAL)
 
-set(TRT_RTX_ROOT "" CACHE PATH "Path to TensorRT RTX SDK root directory (must contain include/ and lib/)")
+set(TRT_RTX_ROOT "" CACHE PATH "Optional path to TensorRT RTX SDK root directory (must contain include/ and lib/)")
+set(TRT_RTX_DOWNLOAD_URL "" CACHE STRING "Optional full TensorRT RTX SDK archive URL to download when TRT_RTX_ROOT is empty")
 if(NOT TRT_RTX_ROOT)
-    message(FATAL_ERROR "TRT_RTX_ROOT must be set. "
-                        "Example: cmake -DTRT_RTX_ROOT=/path/to/tensorrt-rtx -B build")
+    if(NOT TRT_RTX_DOWNLOAD_URL)
+        message(FATAL_ERROR "TRT_RTX_ROOT or TRT_RTX_DOWNLOAD_URL must be set. "
+                            "Example: cmake -DTRT_RTX_ROOT=/path/to/tensorrt-rtx -B build")
+    endif()
+
+    string(REGEX REPLACE "[?#].*$" "" _trt_rtx_download_url_path "${TRT_RTX_DOWNLOAD_URL}")
+    get_filename_component(_trt_rtx_archive_name "${_trt_rtx_download_url_path}" NAME)
+    if(NOT _trt_rtx_archive_name)
+        message(FATAL_ERROR "Could not determine TensorRT RTX archive name from TRT_RTX_DOWNLOAD_URL=${TRT_RTX_DOWNLOAD_URL}")
+    endif()
+
+    string(MD5 _trt_rtx_download_id "${TRT_RTX_DOWNLOAD_URL}")
+    set(_trt_rtx_download_dir "${CMAKE_BINARY_DIR}/_deps/tensorrt_rtx/${_trt_rtx_download_id}")
+    set(_trt_rtx_archive_path "${_trt_rtx_download_dir}/${_trt_rtx_archive_name}")
+    set(_trt_rtx_extract_dir "${_trt_rtx_download_dir}/extracted")
+
+    file(GLOB_RECURSE _trt_rtx_existing_headers
+        "${_trt_rtx_extract_dir}/include/NvInfer.h"
+        "${_trt_rtx_extract_dir}/*/include/NvInfer.h"
+    )
+    if(NOT _trt_rtx_existing_headers)
+        file(MAKE_DIRECTORY "${_trt_rtx_download_dir}" "${_trt_rtx_extract_dir}")
+        if(NOT EXISTS "${_trt_rtx_archive_path}")
+            message(STATUS "Downloading TensorRT RTX from ${TRT_RTX_DOWNLOAD_URL}")
+            file(DOWNLOAD
+                "${TRT_RTX_DOWNLOAD_URL}"
+                "${_trt_rtx_archive_path}"
+                STATUS _trt_rtx_download_status
+                TLS_VERIFY ON
+            )
+            list(GET _trt_rtx_download_status 0 _trt_rtx_download_code)
+            if(NOT _trt_rtx_download_code EQUAL 0)
+                list(GET _trt_rtx_download_status 1 _trt_rtx_download_message)
+                message(FATAL_ERROR "Failed to download TensorRT RTX: ${_trt_rtx_download_message}")
+            endif()
+        endif()
+
+        message(STATUS "Extracting TensorRT RTX to ${_trt_rtx_extract_dir}")
+        file(ARCHIVE_EXTRACT
+            INPUT "${_trt_rtx_archive_path}"
+            DESTINATION "${_trt_rtx_extract_dir}"
+        )
+    endif()
+
+    file(GLOB_RECURSE _trt_rtx_header_candidates
+        "${_trt_rtx_extract_dir}/include/NvInfer.h"
+        "${_trt_rtx_extract_dir}/*/include/NvInfer.h"
+    )
+    list(LENGTH _trt_rtx_header_candidates _trt_rtx_header_count)
+    if(_trt_rtx_header_count EQUAL 0)
+        message(FATAL_ERROR "Downloaded TensorRT RTX archive did not produce an SDK root containing include/NvInfer.h: ${_trt_rtx_extract_dir}")
+    endif()
+    list(GET _trt_rtx_header_candidates 0 _trt_rtx_header)
+    get_filename_component(_trt_rtx_include_dir "${_trt_rtx_header}" DIRECTORY)
+    get_filename_component(TRT_RTX_ROOT "${_trt_rtx_include_dir}" DIRECTORY)
+    message(STATUS "Using downloaded TensorRT RTX: ${TRT_RTX_ROOT}")
 endif()
 
 message(STATUS "Using TRT_RTX_ROOT: ${TRT_RTX_ROOT}")
@@ -84,6 +139,26 @@ if(WIN32)
     )
     set(TRTRTX_DLL "${TRT_RTX_DLL}")
     set(TRTRTX_PARSER_DLL "${TRT_ONNX_PARSER_DLL}")
+
+    file(GLOB _trt_rtx_runtime_dll_candidates CONFIGURE_DEPENDS
+        "${TRT_RTX_ROOT}/*.dll"
+        "${TRT_RTX_ROOT}/bin/*.dll"
+        "${TRT_RTX_LIB_DIR}/*.dll"
+        "${TRT_RTX_ROOT}/../bin/*.dll"
+    )
+    list(APPEND _trt_rtx_runtime_dll_candidates
+        "${TRT_RTX_DLL}"
+        "${TRT_ONNX_PARSER_DLL}"
+    )
+    set(TRTRTX_RUNTIME_DLLS "")
+    foreach(_trt_rtx_runtime_dll IN LISTS _trt_rtx_runtime_dll_candidates)
+        if(EXISTS "${_trt_rtx_runtime_dll}")
+            list(APPEND TRTRTX_RUNTIME_DLLS "${_trt_rtx_runtime_dll}")
+        endif()
+    endforeach()
+    if(TRTRTX_RUNTIME_DLLS)
+        list(REMOVE_DUPLICATES TRTRTX_RUNTIME_DLLS)
+    endif()
 else()
     set(TRTRTX_LIB "${TRT_RTX_LIB}")
     set(TRTRTX_PARSER_LIB "${TRT_ONNX_PARSER_LIB}")

@@ -85,6 +85,9 @@ if(WIN32)
         REQUIRED)
     copy_to_test_bin("${TRT_RTX_DLL}")
     copy_to_test_bin("${TRT_ONNX_PARSER_DLL}")
+    foreach(_trt_rtx_runtime_dll IN LISTS TRTRTX_RUNTIME_DLLS)
+        copy_to_test_bin("${_trt_rtx_runtime_dll}")
+    endforeach()
 else()
     copy_to_test_bin("${TRT_RTX_LIB}")
     copy_to_test_bin("${TRT_ONNX_PARSER_LIB}")
@@ -198,6 +201,8 @@ add_custom_command(TARGET unittests POST_BUILD
     COMMENT "Copying TRT RTX EP DLL to test directory"
 )
 
-# Registers each TEST()/TEST_F() as a separate CTest test case
-gtest_discover_tests(unittests)
+# Discover tests when CTest runs instead of executing the GPU-linked binary as
+# a post-build step. This keeps compilation usable on CI runners without an
+# NVIDIA driver; the explicitly optional CTest step reports runtime failures.
+gtest_discover_tests(unittests DISCOVERY_MODE PRE_TEST)
 

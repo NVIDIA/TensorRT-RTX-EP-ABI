@@ -7,7 +7,7 @@ REM ============================================================================
 REM This script builds the TensorRT RTX Execution Provider library
 REM
 REM Usage:
-REM   build.bat --cuda_home <PATH> --onnxruntime_home <PATH> --trt_rtx_home <PATH> [--version <M.m.p>] [options]
+REM   build.bat --cuda_home <PATH> (--trt_rtx_home <PATH> ^| --trt_rtx_url <URL>) [options]
 REM
 REM Build Actions (can be combined, executed in order: clean -> update -> build):
 REM   (no flags)      - Full build: clean + update + build
@@ -27,6 +27,7 @@ REM Initialize variables
 set "CUDA_TOOLKIT_PATH="
 set "ONNXRUNTIME_ROOT="
 set "TRT_RTX_ROOT="
+set "TRT_RTX_DOWNLOAD_URL="
 set "BUILD_DIR=build"
 set "BUILD_CONFIG=Release"
 set "DO_CLEAN=0"
@@ -62,6 +63,12 @@ if /i "%~1"=="--onnxruntime_home" (
 )
 if /i "%~1"=="--trt_rtx_home" (
     set "TRT_RTX_ROOT=%~2"
+    shift
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--trt_rtx_url" (
+    set "TRT_RTX_DOWNLOAD_URL=%~2"
     shift
     shift
     goto :parse_args
@@ -140,13 +147,9 @@ if "%CUDA_TOOLKIT_PATH%"=="" (
     goto :usage
 )
 
-if "%ONNXRUNTIME_ROOT%"=="" (
-    echo ERROR: ONNX Runtime SDK root path is required! Use --onnxruntime_home ^<path^>
-    goto :usage
-)
-
-if "%TRT_RTX_ROOT%"=="" (
-    echo ERROR: TensorRT RTX SDK root path is required! Use --trt_rtx_home ^<path^>
+if "%TRT_RTX_ROOT%"=="" if "%TRT_RTX_DOWNLOAD_URL%"=="" (
+    echo ERROR: TensorRT RTX SDK source is required!
+    echo Use --trt_rtx_home ^<path^> or --trt_rtx_url ^<url^>
     goto :usage
 )
 
@@ -204,12 +207,12 @@ if not exist "%CUDA_TOOLKIT_PATH%" (
     exit /b 1
 )
 
-if not exist "%ONNXRUNTIME_ROOT%" (
+if not "%ONNXRUNTIME_ROOT%"=="" if not exist "%ONNXRUNTIME_ROOT%" (
     echo ERROR: ONNX Runtime SDK root path does not exist: %ONNXRUNTIME_ROOT%
     exit /b 1
 )
 
-if not exist "%TRT_RTX_ROOT%" (
+if not "%TRT_RTX_ROOT%"=="" if not exist "%TRT_RTX_ROOT%" (
     echo ERROR: TensorRT RTX SDK root path does not exist: %TRT_RTX_ROOT%
     exit /b 1
 )
@@ -235,8 +238,16 @@ if "%DO_BUILD_WHEEL%"=="1" (
 echo ============================================================================
 echo Build Configuration:
 echo   CUDA Toolkit:        %CUDA_TOOLKIT_PATH%
-echo   ONNX Runtime SDK:    %ONNXRUNTIME_ROOT%
-echo   TensorRT RTX SDK:    %TRT_RTX_ROOT%
+if "%ONNXRUNTIME_ROOT%"=="" (
+    echo   ONNX Runtime SDK:    download 1.26.0
+) else (
+    echo   ONNX Runtime SDK:    %ONNXRUNTIME_ROOT%
+)
+if "%TRT_RTX_ROOT%"=="" (
+    echo   TensorRT RTX SDK:    %TRT_RTX_DOWNLOAD_URL%
+) else (
+    echo   TensorRT RTX SDK:    %TRT_RTX_ROOT%
+)
 echo   Build Directory:     %BUILD_DIR%
 echo   Build Config:        %BUILD_CONFIG%
 echo   Source Directory:    %SOURCE_DIR%
@@ -335,6 +346,7 @@ if "%USE_VCPKG%"=="ON" (
           -DCUDAToolkit_ROOT="%CUDA_TOOLKIT_PATH%" ^
           -DONNXRUNTIME_ROOT="%ONNXRUNTIME_ROOT%" ^
           -DTRT_RTX_ROOT="%TRT_RTX_ROOT%" ^
+          -DTRT_RTX_DOWNLOAD_URL="%TRT_RTX_DOWNLOAD_URL%" ^
           -DUSE_VCPKG="%USE_VCPKG%" ^
           -DCMAKE_TOOLCHAIN_FILE=%VCPKG_TOOLCHAIN_FILE% ^
           -DVCPKG_TARGET_TRIPLET=%VCPKG_TARGET_TRIPLET% ^
@@ -546,14 +558,15 @@ exit /b 0
 
 :usage
 echo.
-echo Usage: build.bat --cuda_home ^<PATH^> --onnxruntime_home ^<PATH^> --trt_rtx_home ^<PATH^> [--version ^<M.m.p^>] [options]
+echo Usage: build.bat --cuda_home ^<PATH^> ^(--trt_rtx_home ^<PATH^> ^| --trt_rtx_url ^<URL^>^) [options]
 echo.
 echo Required Arguments:
 echo   --cuda_home ^<PATH^>         Path to CUDA Toolkit installation
-echo   --onnxruntime_home ^<PATH^>  Path to ONNX Runtime SDK root directory
-echo   --trt_rtx_home ^<PATH^>      Path to TensorRT RTX SDK root directory
+echo   --trt_rtx_home ^<PATH^>      Path to TensorRT RTX SDK root directory, or:
+echo   --trt_rtx_url ^<URL^>        Full TensorRT RTX SDK archive URL
 echo.
 echo Optional Arguments:
+echo   --onnxruntime_home ^<PATH^>  ONNX Runtime SDK root ^(downloads 1.26.0 when omitted^)
 echo   --build_dir ^<PATH^>         Build output directory (default: build)
 echo   --config ^<TYPE^>            Build configuration (default: Release)
 echo                              Options: Debug, Release, RelWithDebInfo

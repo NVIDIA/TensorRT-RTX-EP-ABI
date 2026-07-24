@@ -1,0 +1,173 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+  TRT_RTX_WINDOWS_URL: https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.5/TensorRT-RTX-1.5.0.114-Windows-amd64-cuda-13.2-Release-external.zip
+  TRT_RTX_LINUX_URL: https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.5/TensorRT-RTX-1.5.0.114-Linux-x86_64-cuda-13.2-Release-external.tar.zst
+
+jobs:
+  linux:
+    name: Ubuntu 24.04 / GCC
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:13.2.1-devel-ubuntu24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            cmake \
+            git \
+            ninja-build \
+            zstd
+          nvcc --version
+
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: linux-cmake-deps-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'tests/CMakeLists.txt') }}
+
+      - name: Configure and build
+        shell: bash
+        run: |
+          ./build.sh \
+            --cuda_home /usr/local/cuda \
+            --trt_rtx_url "$TRT_RTX_LINUX_URL" \
+            --build_dir build \
+            --config Release \
+            --update --build
+
+      - name: Run unit tests (optional without a GPU)
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          ctest \
+            --test-dir build \
+            --build-config Release \
+            --output-on-failure \
+            --output-junit "${{ github.workspace }}/build/test-results-linux.xml"
+
+      - name: Summarize optional tests
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Ubuntu 24.04 unit tests"
+            echo
+            echo "Result: **${{ steps.tests.outcome }}**"
+            echo
+            echo "The test result is informational because GitHub-hosted runners do not expose an NVIDIA GPU."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Linux artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-24.04-release
+          if-no-files-found: warn
+          path: |
+            build/libonnxruntime_providers_nv_tensorrt_rtx.so
+            build/test-results-linux.xml
+
+  windows:
+    name: Windows Server 2025 / Visual Studio 2022
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install CUDA 13.2 build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_13.2.2_windows_network.exe"
+          Invoke-WebRequest `
+            -Uri "https://developer.download.nvidia.com/compute/cuda/13.2.2/network_installers/cuda_13.2.2_windows_network.exe" `
+            -OutFile $installer
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList "-s", "nvcc_13.2", "cudart_13.2", "nvml_dev_13.2" `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA installer exited with code $($process.ExitCode)"
+          }
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
+          if (-not (Test-Path (Join-Path $cudaPath "bin\nvcc.exe"))) {
+            throw "CUDA installation was not found at $cudaPath"
+          }
+          $cudaPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          (Join-Path $cudaPath "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $cudaPath "bin\nvcc.exe") --version
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: windows-cmake-deps-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'tests/CMakeLists.txt') }}
+
+      - name: Configure and build
+        shell: cmd
+        run: >-
+          build.bat
+          --cuda_home "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
+          --trt_rtx_url "%TRT_RTX_WINDOWS_URL%"
+          --build_dir build
+          --config Release
+          --update --build
+
+      - name: Run unit tests (optional without a GPU)
+        id: tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ctest `
+            --test-dir build `
+            --build-config Release `
+            --output-on-failure `
+            --output-junit "${{ github.workspace }}\build\test-results-windows.xml"
+
+      - name: Summarize optional tests
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          ### Windows Server 2025 unit tests
+
+          Result: **${{ steps.tests.outcome }}**
+
+          The test result is informational because GitHub-hosted runners do not expose an NVIDIA GPU.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload Windows artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-server-2025-release
+          if-no-files-found: warn
+          path: |
+            build/Release/onnxruntime_providers_nv_tensorrt_rtx.dll
+            build/Release/onnxruntime_providers_nv_tensorrt_rtx.lib
+            build/Release/onnxruntime_providers_nv_tensorrt_rtx.pdb
+            build/test-results-windows.xml

@@ -8,7 +8,7 @@
 # Mirrors build.bat — same flags, same default behaviour.
 #
 # Usage:
-#   build.sh --cuda_home <PATH> --onnxruntime_home <PATH> --trt_rtx_home <PATH> [options]
+#   build.sh --cuda_home <PATH> (--trt_rtx_home <PATH> | --trt_rtx_url <URL>) [options]
 #
 # Build Actions (can be combined, executed in order: clean -> update -> build):
 #   (no flags)      - Full build: clean + update + build
@@ -30,6 +30,7 @@ set -euo pipefail
 CUDA_TOOLKIT_PATH=""
 ONNXRUNTIME_ROOT=""
 TRT_RTX_ROOT=""
+TRT_RTX_DOWNLOAD_URL=""
 BUILD_DIR="build"
 BUILD_CONFIG="Release"
 DO_CLEAN=0
@@ -49,14 +50,15 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
     cat <<EOF
 
-Usage: build.sh --cuda_home <PATH> --onnxruntime_home <PATH> --trt_rtx_home <PATH> [--version <M.m.p>] [options]
+Usage: build.sh --cuda_home <PATH> (--trt_rtx_home <PATH> | --trt_rtx_url <URL>) [options]
 
 Required Arguments:
   --cuda_home <PATH>         Path to CUDA Toolkit installation
-  --onnxruntime_home <PATH>  Path to ONNX Runtime SDK root directory
-  --trt_rtx_home <PATH>      Path to TensorRT RTX SDK root directory
+  --trt_rtx_home <PATH>      Path to TensorRT RTX SDK root directory, or:
+  --trt_rtx_url <URL>        Full TensorRT RTX SDK archive URL
 
 Optional Arguments:
+  --onnxruntime_home <PATH>  ONNX Runtime SDK root (downloads 1.26.0 when omitted)
   --build_dir <PATH>         Build output directory (default: build)
   --config <TYPE>            Build configuration (default: Release)
                              Options: Debug, Release, RelWithDebInfo
@@ -107,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --cuda_home)        CUDA_TOOLKIT_PATH="$2"; shift 2 ;;
         --onnxruntime_home) ONNXRUNTIME_ROOT="$2";  shift 2 ;;
         --trt_rtx_home)     TRT_RTX_ROOT="$2";      shift 2 ;;
+        --trt_rtx_url)      TRT_RTX_DOWNLOAD_URL="$2"; shift 2 ;;
         --build_dir)        BUILD_DIR="$2";          shift 2 ;;
         --config)           BUILD_CONFIG="$2";       shift 2 ;;
         --clean)            DO_CLEAN=1; FLAGS_SPECIFIED=1; shift ;;
@@ -128,12 +131,9 @@ if [[ -z "$CUDA_TOOLKIT_PATH" ]]; then
     echo "ERROR: CUDA Toolkit path is required! Use --cuda_home <path>"
     usage
 fi
-if [[ -z "$ONNXRUNTIME_ROOT" ]]; then
-    echo "ERROR: ONNX Runtime SDK root path is required! Use --onnxruntime_home <path>"
-    usage
-fi
-if [[ -z "$TRT_RTX_ROOT" ]]; then
-    echo "ERROR: TensorRT RTX SDK root path is required! Use --trt_rtx_home <path>"
+if [[ -z "$TRT_RTX_ROOT" && -z "$TRT_RTX_DOWNLOAD_URL" ]]; then
+    echo "ERROR: TensorRT RTX SDK source is required!"
+    echo "Use --trt_rtx_home <path> or --trt_rtx_url <url>"
     usage
 fi
 
@@ -159,11 +159,11 @@ if [[ ! -d "$CUDA_TOOLKIT_PATH" ]]; then
     echo "ERROR: CUDA Toolkit path does not exist: $CUDA_TOOLKIT_PATH"
     exit 1
 fi
-if [[ ! -d "$ONNXRUNTIME_ROOT" ]]; then
+if [[ -n "$ONNXRUNTIME_ROOT" && ! -d "$ONNXRUNTIME_ROOT" ]]; then
     echo "ERROR: ONNX Runtime SDK root path does not exist: $ONNXRUNTIME_ROOT"
     exit 1
 fi
-if [[ ! -d "$TRT_RTX_ROOT" ]]; then
+if [[ -n "$TRT_RTX_ROOT" && ! -d "$TRT_RTX_ROOT" ]]; then
     echo "ERROR: TensorRT RTX SDK root path does not exist: $TRT_RTX_ROOT"
     exit 1
 fi
@@ -201,8 +201,8 @@ WHEEL_DISPLAY="${WHEEL_OUTPUT_DIR:-$BUILD_DIR/dist}"
 echo "============================================================================"
 echo "Build Configuration:"
 echo "  CUDA Toolkit:        $CUDA_TOOLKIT_PATH"
-echo "  ONNX Runtime SDK:    $ONNXRUNTIME_ROOT"
-echo "  TensorRT RTX SDK:    $TRT_RTX_ROOT"
+echo "  ONNX Runtime SDK:    ${ONNXRUNTIME_ROOT:-download 1.26.0}"
+echo "  TensorRT RTX SDK:    ${TRT_RTX_ROOT:-$TRT_RTX_DOWNLOAD_URL}"
 echo "  Build Directory:     $BUILD_DIR"
 echo "  Build Config:        $BUILD_CONFIG"
 echo "  Source Directory:    $SOURCE_DIR"
@@ -252,6 +252,7 @@ if [[ "$DO_UPDATE" -eq 1 ]]; then
           -DCUDAToolkit_ROOT="$CUDA_TOOLKIT_PATH" \
           -DONNXRUNTIME_ROOT="$ONNXRUNTIME_ROOT" \
           -DTRT_RTX_ROOT="$TRT_RTX_ROOT" \
+          -DTRT_RTX_DOWNLOAD_URL="$TRT_RTX_DOWNLOAD_URL" \
           "$PRODUCTION_FLAG" \
           ${VERSION_FLAG:+"$VERSION_FLAG"} \
           "$SOURCE_DIR"
