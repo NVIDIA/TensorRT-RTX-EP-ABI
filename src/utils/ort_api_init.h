@@ -171,69 +171,71 @@ inline uint32_t NegotiatedOrtApiVersion()
 inline void ApiInit(const OrtApiBase* ort_api_base)
 {
     static std::once_flag init_flag;
-    std::call_once(init_flag, [&]() {
-        if (ort_api_base == nullptr)
+    std::call_once(
+        init_flag,
+        [&]()
         {
-            throw std::runtime_error("ApiInit: ort_api_base is null");
-        }
+            if (ort_api_base == nullptr)
+            {
+                throw std::runtime_error("ApiInit: ort_api_base is null");
+            }
 
-        const char* version_str = ort_api_base->GetVersionString();
-        if (version_str == nullptr)
-        {
-            version_str = "unknown";
-        }
+            const char* version_str = ort_api_base->GetVersionString();
+            if (version_str == nullptr)
+            {
+                version_str = "unknown";
+            }
 
-        uint32_t host_version = 0;
-        if (!detail::TryParseOrtApiVersion(version_str, host_version))
-        {
-            // Malformed version string. Fall back to the minimum and let the
-            // GetApi() call below reject it if the host doesn't support it.
-            host_version = kMinSupportedOrtApiVersion;
-        }
+            uint32_t host_version = 0;
+            if (!detail::TryParseOrtApiVersion(version_str, host_version))
+            {
+                // Malformed version string. Fall back to the minimum and let the
+                // GetApi() call below reject it if the host doesn't support it.
+                host_version = kMinSupportedOrtApiVersion;
+            }
 
-        if (host_version < kMinSupportedOrtApiVersion)
-        {
-            throw std::runtime_error(
-                std::string("[NvTensorRTRTX EP] Host ORT is too old. Minimum supported API version is ") +
-                std::to_string(kMinSupportedOrtApiVersion) + ", host reports \"" + version_str +
-                "\" (parsed " + std::to_string(host_version) + ").");
-        }
+            if (host_version < kMinSupportedOrtApiVersion)
+            {
+                throw std::runtime_error(
+                    std::string("[NvTensorRTRTX EP] Host ORT is too old. Minimum supported API version is ") +
+                    std::to_string(kMinSupportedOrtApiVersion) + ", host reports \"" + version_str + "\" (parsed " +
+                    std::to_string(host_version) + ").");
+            }
 
-        // Negotiate to min(compile-time, host). On a host newer than compile
-        // time we cap at our compile-time version — fields the newer host
-        // added are not in our struct definitions, so we cannot populate
-        // them anyway, and ORT will gate them off based on ort_version_supported.
-        const uint32_t negotiated =
-            host_version < static_cast<uint32_t>(ORT_API_VERSION) ? host_version
-                                                                  : static_cast<uint32_t>(ORT_API_VERSION);
+            // Negotiate to min(compile-time, host). On a host newer than compile
+            // time we cap at our compile-time version — fields the newer host
+            // added are not in our struct definitions, so we cannot populate
+            // them anyway, and ORT will gate them off based on ort_version_supported.
+            const uint32_t negotiated = host_version < static_cast<uint32_t>(ORT_API_VERSION)
+                                            ? host_version
+                                            : static_cast<uint32_t>(ORT_API_VERSION);
 
-        const OrtApi* ort_api = ort_api_base->GetApi(negotiated);
-        if (ort_api == nullptr)
-        {
-            throw std::runtime_error(
-                std::string("[NvTensorRTRTX EP] Host ORT \"") + version_str +
-                "\" did not provide an OrtApi for negotiated version " + std::to_string(negotiated));
-        }
+            const OrtApi* ort_api = ort_api_base->GetApi(negotiated);
+            if (ort_api == nullptr)
+            {
+                throw std::runtime_error(std::string("[NvTensorRTRTX EP] Host ORT \"") + version_str +
+                                         "\" did not provide an OrtApi for negotiated version " +
+                                         std::to_string(negotiated));
+            }
 
-        const OrtEpApi* ep_api = ort_api->GetEpApi();
-        const OrtModelEditorApi* model_editor_api = ort_api->GetModelEditorApi();
-        if (ep_api == nullptr || model_editor_api == nullptr)
-        {
-            throw std::runtime_error(
-                "[NvTensorRTRTX EP] Host ORT did not provide OrtEpApi or OrtModelEditorApi");
-        }
+            const OrtEpApi* ep_api = ort_api->GetEpApi();
+            const OrtModelEditorApi* model_editor_api = ort_api->GetModelEditorApi();
+            if (ep_api == nullptr || model_editor_api == nullptr)
+            {
+                throw std::runtime_error("[NvTensorRTRTX EP] Host ORT did not provide OrtEpApi or OrtModelEditorApi");
+            }
 
-        // Route the global Ort:: C++ wrapper through the negotiated table so
-        // every Ort::GetApi() / Ort::Status / etc. in the EP uses the right
-        // function-pointer slots for the host.
-        Ort::InitApi(ort_api);
+            // Route the global Ort:: C++ wrapper through the negotiated table so
+            // every Ort::GetApi() / Ort::Status / etc. in the EP uses the right
+            // function-pointer slots for the host.
+            Ort::InitApi(ort_api);
 
-        detail::g_negotiated_ort_api_version = negotiated;
-        detail::g_api_ptrs.emplace(ApiPtrs{*ort_api, *ep_api, *model_editor_api});
-        // Release-store last: any thread that acquire-loads true is guaranteed
-        // to see the two writes above.
-        detail::g_api_initialized.store(true, std::memory_order_release);
-    });
+            detail::g_negotiated_ort_api_version = negotiated;
+            detail::g_api_ptrs.emplace(ApiPtrs{*ort_api, *ep_api, *model_editor_api});
+            // Release-store last: any thread that acquire-loads true is guaranteed
+            // to see the two writes above.
+            detail::g_api_initialized.store(true, std::memory_order_release);
+        });
 }
 
 }  // namespace trt_rtx_ep

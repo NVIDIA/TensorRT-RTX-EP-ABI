@@ -32,13 +32,13 @@ dynamic = ["version"]
 dev = ["onnx>=1.14", "numpy>=1.21"]
 
 [project.urls]
-Homepage = "https://github.com/NVIDIA/trt-rtx-ep-abi"
+Homepage = "https://github.com/NVIDIA/TensorRT-RTX-EP-ABI"
 
 [tool.setuptools]
 packages = ["onnxruntime_ep_nv_tensorrt_rtx"]
 
 [tool.setuptools.package-data]
-onnxruntime_ep_nv_tensorrt_rtx = ["*.dll", "*.so", "*.so.*"]
+onnxruntime_ep_nv_tensorrt_rtx = ["*.dll", "*.so", "*.so.*", "*.txt"]
 
 [tool.setuptools.dynamic]
 version = { attr = "onnxruntime_ep_nv_tensorrt_rtx._version.__version__" }

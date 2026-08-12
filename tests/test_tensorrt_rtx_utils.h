@@ -15,7 +15,6 @@
 
 #pragma once
 
-#include <onnxruntime_cxx_api.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -26,14 +25,17 @@
 #include <string>
 #include <vector>
 
+#include <onnxruntime_cxx_api.h>
+
 // =============================================================================
 // CUDA error checking
 // =============================================================================
 
-inline void cuda_error_check(cudaError_t err, const char* file, int line) {
-    if (err != cudaSuccess) {
-        ::fprintf(stderr, "CUDA ERROR at %s[%d]: %s\n", file, line,
-                  cudaGetErrorString(err));
+inline void cuda_error_check(cudaError_t err, const char* file, int line)
+{
+    if (err != cudaSuccess)
+    {
+        ::fprintf(stderr, "CUDA ERROR at %s[%d]: %s\n", file, line, cudaGetErrorString(err));
         abort();
     }
 }
@@ -46,7 +48,8 @@ inline void cuda_error_check(cudaError_t err, const char* file, int line) {
 
 // Convert a filesystem path to the string type expected by the ORT C++ API
 // (wstring on Windows, string elsewhere).
-inline auto toOrtString(const std::filesystem::path& p) {
+inline auto toOrtString(const std::filesystem::path& p)
+{
 #ifdef _WIN32
     return p.wstring();
 #else
@@ -60,12 +63,14 @@ inline auto toOrtString(const std::filesystem::path& p) {
 // copy of the model that sits in the executable's current working directory
 // when the tests run, and only fall back to the baked-in download path if
 // that local copy is not present.
-inline std::filesystem::path resolveModelPath() {
+inline std::filesystem::path resolveModelPath()
+{
     namespace fs = std::filesystem;
     const fs::path injected_path{MODEL_FILE};
     std::error_code ec;
     const fs::path local_path = fs::current_path(ec) / injected_path.filename();
-    if (!ec && fs::is_regular_file(local_path, ec)) {
+    if (!ec && fs::is_regular_file(local_path, ec))
+    {
         return local_path;
     }
     return injected_path;
@@ -84,27 +89,32 @@ constexpr const char* kEpName = "NvTensorRTRTXExecutionProvider";
 //
 // Intended for per-test gating (e.g. GTEST_SKIP) on features introduced in a
 // specific ORT release without affecting tests that work on older runtimes.
-inline bool ort_runtime_at_least(int min_major, int min_minor,
-                                 std::string& version_out) {
+inline bool ort_runtime_at_least(int min_major, int min_minor, std::string& version_out)
+{
     const OrtApiBase* base = OrtGetApiBase();
-    if (base == nullptr || base->GetVersionString == nullptr) {
+    if (base == nullptr || base->GetVersionString == nullptr)
+    {
         version_out = "<unknown>";
         return false;
     }
     const char* v = base->GetVersionString();
     version_out = (v != nullptr) ? v : "<null>";
-    if (v == nullptr) return false;
+    if (v == nullptr)
+        return false;
 
     int major = 0;
     int minor = 0;
-    if (std::sscanf(v, "%d.%d", &major, &minor) < 2) return false;
+    if (std::sscanf(v, "%d.%d", &major, &minor) < 2)
+        return false;
 
-    if (major != min_major) return major > min_major;
+    if (major != min_major)
+        return major > min_major;
     return minor >= min_minor;
 }
 
 // Shorthand that swallows the version string.
-inline bool ort_runtime_at_least(int min_major, int min_minor) {
+inline bool ort_runtime_at_least(int min_major, int min_minor)
+{
     std::string unused;
     return ort_runtime_at_least(min_major, min_minor, unused);
 }
@@ -122,21 +132,28 @@ inline bool ort_runtime_at_least(int min_major, int min_minor) {
 //
 // Returns the negotiated EP API version (e.g. 24, 25, 26), or -1 if the EP is
 // older and does not publish the key — callers should treat -1 as "unknown".
-inline int ep_negotiated_ort_api_version(const OrtEpDevice* ep_device) {
-    if (ep_device == nullptr) return -1;
+inline int ep_negotiated_ort_api_version(const OrtEpDevice* ep_device)
+{
+    if (ep_device == nullptr)
+        return -1;
     const OrtApi& api = Ort::GetApi();
     const OrtKeyValuePairs* md = api.EpDevice_EpMetadata(ep_device);
-    if (md == nullptr) return -1;
+    if (md == nullptr)
+        return -1;
     const char* v = api.GetKeyValue(md, "nv_ep_ort_api_version");
-    if (v == nullptr) return -1;
+    if (v == nullptr)
+        return -1;
     return std::atoi(v);
 }
 
 // Returns the subset of EP devices that belong to the TRT RTX EP.
-inline std::vector<Ort::ConstEpDevice> get_trt_rtx_devices(Ort::Env& env) {
+inline std::vector<Ort::ConstEpDevice> get_trt_rtx_devices(Ort::Env& env)
+{
     std::vector<Ort::ConstEpDevice> result;
-    for (auto& device : env.GetEpDevices()) {
-        if (std::strcmp(device.EpName(), kEpName) == 0) {
+    for (auto& device : env.GetEpDevices())
+    {
+        if (std::strcmp(device.EpName(), kEpName) == 0)
+        {
             result.push_back(device);
         }
     }
@@ -167,15 +184,16 @@ void run_with_cpu_bindings(Ort::Session& session, int iterations);
 
 // Run `iterations` forward passes using GPU-side IoBinding with async
 // upload/download streams. Prints average per-iteration time to stdout.
-void run_with_gpu_bindings(Ort::Session& session, int iterations,
-                           cudaStream_t stream);
+void run_with_gpu_bindings(Ort::Session& session, int iterations, cudaStream_t stream);
 
 // =============================================================================
 // File helpers
 // =============================================================================
 
-inline void clearFileIfExists(const std::filesystem::path& path) {
-    if (std::filesystem::exists(path)) {
+inline void clearFileIfExists(const std::filesystem::path& path)
+{
+    if (std::filesystem::exists(path))
+    {
         std::filesystem::remove(path);
     }
 }
@@ -187,7 +205,6 @@ inline void clearFileIfExists(const std::filesystem::path& path) {
 // Create an IoBinding from session metadata. Allocates input tensors on CPU
 // (or with the given allocator). Dynamic dims (-1) are replaced with 1 unless
 // overridden via shape_overwrites.
-Ort::IoBinding generate_io_binding(
-    Ort::Session& session,
-    std::map<std::string, std::vector<int64_t>> shape_overwrites = {},
-    OrtAllocator* allocator = nullptr);
+Ort::IoBinding generate_io_binding(Ort::Session& session,
+                                   std::map<std::string, std::vector<int64_t>> shape_overwrites = {},
+                                   OrtAllocator* allocator = nullptr);

@@ -34,7 +34,7 @@ dynamic = ["version", "dependencies"]
 # dependencies (install_requires) is set in setup.py to pin the exact matching cu13 version.
 
 [project.urls]
-Homepage = "https://github.com/NVIDIA/trt-rtx-ep-abi"
+Homepage = "https://github.com/NVIDIA/TensorRT-RTX-EP-ABI"
 
 [tool.setuptools]
 packages = []

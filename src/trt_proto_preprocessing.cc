@@ -5,12 +5,14 @@
 
 #include "clip_bound_compatibility.h"
 #include "logical_output_compatibility.h"
+#include "multi_rotary_cache_concat_offset.h"
 #include "pooling_dilation_compatibility.h"
 
 namespace trt_rtx_ep
 {
 
-LoweredQdqInfo RunTensorRtProtoPreprocessing(onnx::ModelProto& model_proto)
+LoweredQdqInfo RunTensorRtProtoPreprocessing(onnx::ModelProto& model_proto,
+                                             const TensorRtProtoPreprocessingOptions& options)
 {
     auto lowered_qdq_info = RunQdqLoweringForTensorRt(model_proto);
 
@@ -26,6 +28,8 @@ LoweredQdqInfo RunTensorRtProtoPreprocessing(onnx::ModelProto& model_proto)
     // Lower provably-equivalent dilated AveragePool/MaxPool cases into
     // primitive ops so TRT does not see unsupported pooling dilations.
     RunPoolingDilationCompatibilityForTensorRt(model_proto);
+
+    RunMultiRotaryCacheConcatOffsetForTensorRt(model_proto, options.multi_rotary_cache_concat_offset);
     return lowered_qdq_info;
 }
 

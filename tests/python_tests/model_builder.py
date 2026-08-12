@@ -123,6 +123,81 @@ def create_node_output_not_used_model(path):
     save_model(make_model(graph), path)
 
 
+def create_initializer_matmul_model(path):
+    weights = np.array(
+        [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            9.0,
+            10.0,
+            11.0,
+            12.0,
+        ],
+        dtype=np.float32,
+    )
+    inputs = [value_info("X", TensorProto.FLOAT, (1, 4))]
+    outputs = [value_info("Y", TensorProto.FLOAT, (1, 3))]
+    initializers = [
+        helper.make_tensor("W", TensorProto.FLOAT, [4, 3], weights.tobytes(), raw=True),
+    ]
+    nodes = [helper.make_node("MatMul", ["X", "W"], ["Y"], name="matmul")]
+    graph = helper.make_graph(nodes, "InitializerMatMulGraph", inputs, outputs, initializer=initializers)
+    save_model(make_model(graph), path)
+
+
+def create_two_initializer_matmul_subgraphs_model(path):
+    weights_1 = np.eye(4, dtype=np.float32)
+    weights_2 = np.array(
+        [
+            1.0,
+            0.5,
+            -1.0,
+            2.0,
+            0.25,
+            -0.75,
+            1.5,
+            -1.5,
+        ],
+        dtype=np.float32,
+    )
+    inputs = [value_info("X", TensorProto.FLOAT, (1, 4))]
+    outputs = [value_info("Y", TensorProto.FLOAT, (1, 2))]
+    value_infos = [
+        value_info("matmul_1_output", TensorProto.FLOAT, (1, 4)),
+        value_info("fast_gelu_output", TensorProto.FLOAT, (1, 4)),
+    ]
+    initializers = [
+        helper.make_tensor("W1", TensorProto.FLOAT, [4, 4], weights_1.tobytes(), raw=True),
+        helper.make_tensor("W2", TensorProto.FLOAT, [4, 2], weights_2.tobytes(), raw=True),
+    ]
+    nodes = [
+        helper.make_node("MatMul", ["X", "W1"], ["matmul_1_output"], name="matmul_1"),
+        helper.make_node(
+            "FastGelu",
+            ["matmul_1_output"],
+            ["fast_gelu_output"],
+            name="fast_gelu",
+            domain="com.microsoft",
+        ),
+        helper.make_node("MatMul", ["fast_gelu_output", "W2"], ["Y"], name="matmul_2"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "TwoInitializerMatMulSubgraphs",
+        inputs,
+        outputs,
+        initializer=initializers,
+        value_info=value_infos,
+    )
+    save_model(make_model(graph, [helper.make_opsetid("", 13), helper.make_opsetid("com.microsoft", 1)]), path)
+
+
 def create_asymmetric_dq_matmul_fast_gelu_model(path):
     q_weights = np.array([16, -8, 5, 12, -3, 9], dtype=np.int8)
     zero_point = np.array([3], dtype=np.int8)

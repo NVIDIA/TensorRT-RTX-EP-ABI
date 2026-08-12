@@ -35,56 +35,55 @@ namespace trt_rtx_ep
 // Minimal error handling macros for cuda_graph.cc
 
 #if !defined(CUDA_CALL_THROW)
-#define CUDA_CALL_THROW(expr)                                                      \
-    do                                                                             \
-    {                                                                              \
-        cudaError_t err = (expr);                                                  \
-        if (err != cudaSuccess)                                                    \
-        {                                                                          \
-            std::ostringstream oss;                                                \
-            oss << "CUDA error " << cudaGetErrorName(err) << ": "                  \
-                << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__; \
-            throw std::runtime_error(oss.str());                                   \
-        }                                                                          \
+#define CUDA_CALL_THROW(expr)                                                                                      \
+    do                                                                                                             \
+    {                                                                                                              \
+        cudaError_t err = (expr);                                                                                  \
+        if (err != cudaSuccess)                                                                                    \
+        {                                                                                                          \
+            std::ostringstream oss;                                                                                \
+            oss << "CUDA error " << cudaGetErrorName(err) << ": " << cudaGetErrorString(err) << " at " << __FILE__ \
+                << ":" << __LINE__;                                                                                \
+            throw std::runtime_error(oss.str());                                                                   \
+        }                                                                                                          \
     } while (0)
 #endif
 
 #if !defined(CUDA_RETURN_IF_ERROR)
-#define CUDA_RETURN_IF_ERROR(expr)                                                 \
-    do                                                                             \
-    {                                                                              \
-        cudaError_t err = (expr);                                                  \
-        if (err != cudaSuccess)                                                    \
-        {                                                                          \
-            return Ort::GetApi().CreateStatus(ORT_EP_FAIL,                         \
-                                              (std::string("CUDA error: ") +       \
-                                               cudaGetErrorName(err) + ": " +      \
-                                               cudaGetErrorString(err)).c_str());  \
-        }                                                                          \
+#define CUDA_RETURN_IF_ERROR(expr)                                                                               \
+    do                                                                                                           \
+    {                                                                                                            \
+        cudaError_t err = (expr);                                                                                \
+        if (err != cudaSuccess)                                                                                  \
+        {                                                                                                        \
+            return Ort::GetApi().CreateStatus(                                                                   \
+                ORT_EP_FAIL,                                                                                     \
+                (std::string("CUDA error: ") + cudaGetErrorName(err) + ": " + cudaGetErrorString(err)).c_str()); \
+        }                                                                                                        \
     } while (0)
 #endif
 
 #if !defined(ORT_ENFORCE)
-#define ORT_ENFORCE(condition, ...)                                                \
-    do                                                                             \
-    {                                                                              \
-        if (!(condition))                                                          \
-        {                                                                          \
-            std::ostringstream oss;                                                \
-            oss << "Enforcement failed: " << #condition;                           \
-            oss << " " << MakeString(__VA_ARGS__);                                 \
-            throw std::runtime_error(oss.str());                                   \
-        }                                                                          \
+#define ORT_ENFORCE(condition, ...)                      \
+    do                                                   \
+    {                                                    \
+        if (!(condition))                                \
+        {                                                \
+            std::ostringstream oss;                      \
+            oss << "Enforcement failed: " << #condition; \
+            oss << " " << MakeString(__VA_ARGS__);       \
+            throw std::runtime_error(oss.str());         \
+        }                                                \
     } while (0)
 #endif
 
 #if !defined(ORT_THROW)
-#define ORT_THROW(...)                                                             \
-    do                                                                             \
-    {                                                                              \
-        std::ostringstream oss;                                                    \
-        oss << MakeString(__VA_ARGS__);                                            \
-        throw std::runtime_error(oss.str());                                       \
+#define ORT_THROW(...)                       \
+    do                                       \
+    {                                        \
+        std::ostringstream oss;              \
+        oss << MakeString(__VA_ARGS__);      \
+        throw std::runtime_error(oss.str()); \
     } while (0)
 #endif
 

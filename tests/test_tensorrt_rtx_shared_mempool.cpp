@@ -38,10 +38,6 @@
 //   All size assertions use `cudaDeviceSynchronize()` + `cudaMemGetInfo()`
 //   deltas. Tolerance is centralized in `kToleranceBytes` (512 MB).
 
-#include <gtest/gtest.h>
-#include <onnxruntime_cxx_api.h>
-#include <onnxruntime_run_options_config_keys.h>
-
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -54,6 +50,9 @@
 
 #include "test_tensorrt_rtx_model_builder.h"
 #include "test_tensorrt_rtx_utils.h"
+#include <gtest/gtest.h>
+#include <onnxruntime_cxx_api.h>
+#include <onnxruntime_run_options_config_keys.h>
 
 extern std::unique_ptr<Ort::Env> ort_env;
 
@@ -76,7 +75,8 @@ constexpr size_t kGB = 1024ull * kMB;
 // TRT aligns pool allocations up to the next block (~32 MB granularity), so
 // the actual value is slightly larger than this lower bound; this is used
 // for assertion upper bounds.
-constexpr size_t ExpectedScratchBytes(int M) {
+constexpr size_t ExpectedScratchBytes(int M)
+{
     return static_cast<size_t>(M) * static_cast<size_t>(M) * sizeof(float);
 }
 
@@ -84,7 +84,8 @@ constexpr size_t ExpectedScratchBytes(int M) {
 // value can legitimately fall *below* the baseline (e.g. after Shrink has
 // released memory that was carried over from previous tests in the same
 // shared Ort::Env). Plain `a - b` would underflow.
-constexpr size_t SatSub(size_t a, size_t b) noexcept {
+constexpr size_t SatSub(size_t a, size_t b) noexcept
+{
     return (a > b) ? (a - b) : 0;
 }
 
@@ -106,9 +107,9 @@ constexpr size_t SatSub(size_t a, size_t b) noexcept {
 // proportionally so the relative deltas (and the 512 MB tolerance) remain
 // meaningful. Each test prints a `[mempool]` scoreboard line so the actual
 // GPU deltas are always visible.
-constexpr int kMDimSmall  = 16384;
+constexpr int kMDimSmall = 16384;
 constexpr int kMDimMedium = 23170;
-constexpr int kMDimLarge  = 32768;
+constexpr int kMDimLarge = 32768;
 
 // Minimum free GPU memory required by the suite. Derived from the worst-case
 // concurrent footprint: Ascending cohesion (~7 GB: small+medium+large scratch)
@@ -130,29 +131,27 @@ size_t gpu_used_bytes()
 
 void log_used(const char* label, size_t used, size_t baseline)
 {
-    const long long delta_mb =
-        static_cast<long long>(used) - static_cast<long long>(baseline);
-    std::printf("  [mempool] %-48s  used=%6zu MB  delta=%+6lld MB\n",
-                label, used / kMB, delta_mb / static_cast<long long>(kMB));
+    const long long delta_mb = static_cast<long long>(used) - static_cast<long long>(baseline);
+    std::printf("  [mempool] %-48s  used=%6zu MB  delta=%+6lld MB\n", label, used / kMB,
+                delta_mb / static_cast<long long>(kMB));
     std::fflush(stdout);
 }
 
-void append_trt_rtx_ep(Ort::SessionOptions& so,
-                       const std::unordered_map<std::string, std::string>& opts = {})
+void append_trt_rtx_ep(Ort::SessionOptions& so, const std::unordered_map<std::string, std::string>& opts = {})
 {
     auto devices = get_trt_rtx_devices(*ort_env);
     ASSERT_FALSE(devices.empty()) << "No TRT RTX EP devices found.";
     Ort::KeyValuePairs kv;
-    for (auto& [k, v] : opts) kv.Add(k.c_str(), v.c_str());
+    for (auto& [k, v] : opts)
+        kv.Add(k.c_str(), v.c_str());
     so.AppendExecutionProvider_V2(*ort_env, devices, kv);
 }
 
 // Build an Ort::Session for the large-scratch model with optional user
 // compute stream (passed via provider options `has_user_compute_stream` +
 // `user_compute_stream`, see src/tensorrt_rtx_provider_options.h).
-std::unique_ptr<Ort::Session> create_session_for_model(
-    const std::string& model_path,
-    cudaStream_t user_stream = nullptr)
+std::unique_ptr<Ort::Session> create_session_for_model(const std::string& model_path,
+                                                       cudaStream_t user_stream = nullptr)
 {
     Ort::SessionOptions so;
     std::unordered_map<std::string, std::string> ep_opts;
@@ -161,34 +160,33 @@ std::unique_ptr<Ort::Session> create_session_for_model(
         ep_opts["has_user_compute_stream"] = "1";
         // The EP parses this as a stringified size_t and reinterpret_casts
         // it back to the stream pointer (info.cc:54-60).
-        ep_opts["user_compute_stream"] =
-            std::to_string(reinterpret_cast<size_t>(user_stream));
+        ep_opts["user_compute_stream"] = std::to_string(reinterpret_cast<size_t>(user_stream));
     }
     append_trt_rtx_ep(so, ep_opts);
-    return std::make_unique<Ort::Session>(
-        *ort_env, toOrtString(model_path).c_str(), so);
+    return std::make_unique<Ort::Session>(*ort_env, toOrtString(model_path).c_str(), so);
 }
 
 // Build and run N inference iterations with zero-filled CPU inputs bound via
 // IoBinding. Outputs are discarded (only memory behavior is under test).
-void run_iterations(Ort::Session& session,
-                    Ort::RunOptions& run_opts,
-                    int iterations)
+void run_iterations(Ort::Session& session, Ort::RunOptions& run_opts, int iterations)
 {
     Ort::AllocatorWithDefaultOptions alloc;
     Ort::IoBinding io(session);
 
     for (size_t i = 0; i < session.GetInputCount(); ++i)
     {
-        auto name  = session.GetInputNameAllocated(i, alloc);
+        auto name = session.GetInputNameAllocated(i, alloc);
         // Keep TypeInfo alive while retrieving tensor shape info.
         // See https://github.com/microsoft/onnxruntime/issues/24300.
         auto type_info = session.GetInputTypeInfo(i);
         auto info = type_info.GetTensorTypeAndShapeInfo();
         auto shape = info.GetShape();
-        for (auto& d : shape) { if (d == -1) d = 1; }
-        auto val = Ort::Value::CreateTensor(
-            alloc, shape.data(), shape.size(), info.GetElementType());
+        for (auto& d : shape)
+        {
+            if (d == -1)
+                d = 1;
+        }
+        auto val = Ort::Value::CreateTensor(alloc, shape.data(), shape.size(), info.GetElementType());
         io.BindInput(name.get(), val);
     }
     for (size_t i = 0; i < session.GetOutputCount(); ++i)
@@ -208,8 +206,7 @@ void run_iterations(Ort::Session& session,
 // test suite; call `force=true` if you change the builder.
 std::string make_scratch_model(int M, const char* tag, bool force = false)
 {
-    std::string path = std::string("nv_mempool_model_") + tag + "_M" +
-                       std::to_string(M) + ".onnx";
+    std::string path = std::string("nv_mempool_model_") + tag + "_M" + std::to_string(M) + ".onnx";
     if (force || !std::filesystem::exists(path))
     {
         model_builder::CreateLargeScratchModel(path, M);
@@ -238,28 +235,26 @@ protected:
         // options) is only guaranteed to work correctly on ORT 1.25 or above.
         // Skip the whole suite on older runtimes rather than failing cryptically.
         std::string ort_version;
-        if (!ort_runtime_at_least(1, 25, ort_version)) {
-            GTEST_SKIP() << "Skipping: ONNX Runtime " << ort_version
-                         << " is older than the 1.25 minimum required for "
+        if (!ort_runtime_at_least(1, 25, ort_version))
+        {
+            GTEST_SKIP() << "Skipping: ONNX Runtime " << ort_version << " is older than the 1.25 minimum required for "
                          << "the CUDA mempool allocator tests.";
         }
 
-        ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty())
-            << "No TRT RTX EP devices found.";
+        ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
 
         // Preflight free-memory check: the suite needs room for multiple
         // large-scratch sessions alive concurrently (see kMDim* above).
         size_t free_bytes = 0, total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-        if (free_bytes < kMinFreeGpuBytes) {
-            GTEST_SKIP() << "Skipping: only " << (free_bytes / kMB)
-                         << " MB free on device; suite requires at least "
+        if (free_bytes < kMinFreeGpuBytes)
+        {
+            GTEST_SKIP() << "Skipping: only " << (free_bytes / kMB) << " MB free on device; suite requires at least "
                          << (kMinFreeGpuBytes / kMB) << " MB.";
         }
 
         baseline_ = gpu_used_bytes();
-        std::printf("  [mempool] baseline used=%zu MB (free=%zu MB)\n",
-                    baseline_ / kMB, free_bytes / kMB);
+        std::printf("  [mempool] baseline used=%zu MB (free=%zu MB)\n", baseline_ / kMB, free_bytes / kMB);
     }
 
     void TearDown() override
@@ -300,7 +295,8 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, Lifecycle_CreateAndDestroySession)
 {
     const auto path = make_scratch_model(kMDimSmall, "small");
 
-    auto run_one_cycle = [&](const char* label) -> size_t {
+    auto run_one_cycle = [&](const char* label) -> size_t
+    {
         {
             auto session = create_session_for_model(path);
             Ort::RunOptions ro;
@@ -318,24 +314,22 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, Lifecycle_CreateAndDestroySession)
     // Cycle 1 primes the pool: expect noticeable growth above baseline
     // (the small model's scratch is ~1 GB). We sanity-check it grew rather
     // than assert an exact number.
-    EXPECT_GT(used_after_cycle1, baseline_)
-        << "First cycle did not cause any GPU allocation — pool never primed.";
+    EXPECT_GT(used_after_cycle1, baseline_) << "First cycle did not cause any GPU allocation — pool never primed.";
 
     // The real invariant: cycles 2 and 3 must not grow the watermark beyond
     // cycle 1 + kToleranceBytes. A leak on each create/destroy would push
     // the watermark up by one scratch block per cycle.
     const size_t growth_c2 = SatSub(used_after_cycle2, used_after_cycle1);
     const size_t growth_c3 = SatSub(used_after_cycle3, used_after_cycle1);
-    std::printf("  [mempool] cycle2 growth=%zu MB  cycle3 growth=%zu MB\n",
-                growth_c2 / kMB, growth_c3 / kMB);
+    std::printf("  [mempool] cycle2 growth=%zu MB  cycle3 growth=%zu MB\n", growth_c2 / kMB, growth_c3 / kMB);
 
     EXPECT_LE(used_after_cycle2, used_after_cycle1 + kToleranceBytes)
-        << "Second create/destroy cycle leaked more than "
-        << (kToleranceBytes / kMB) << " MB; pool is not being reused across "
+        << "Second create/destroy cycle leaked more than " << (kToleranceBytes / kMB)
+        << " MB; pool is not being reused across "
         << "session lifetimes.";
     EXPECT_LE(used_after_cycle3, used_after_cycle1 + kToleranceBytes)
-        << "Third create/destroy cycle leaked more than "
-        << (kToleranceBytes / kMB) << " MB; pool is not being reused across "
+        << "Third create/destroy cycle leaked more than " << (kToleranceBytes / kMB)
+        << " MB; pool is not being reused across "
         << "session lifetimes.";
 }
 
@@ -365,15 +359,11 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchReuse_SameModel_DefaultStream)
     const size_t used_post_measure = gpu_used_bytes();
     log_used("after 10 measurement runs", used_post_measure, baseline_);
 
-    const size_t growth = (used_post_measure > used_post_warmup)
-                              ? used_post_measure - used_post_warmup
-                              : 0;
-    std::printf("  [mempool] scratch reallocation across 10 iters: %zu MB\n",
-                growth / kMB);
+    const size_t growth = (used_post_measure > used_post_warmup) ? used_post_measure - used_post_warmup : 0;
+    std::printf("  [mempool] scratch reallocation across 10 iters: %zu MB\n", growth / kMB);
 
-    EXPECT_LE(growth, kToleranceBytes)
-        << "Scratch grew by more than " << (kToleranceBytes / kMB)
-        << " MB across 10 iterations of the same model on the same stream.";
+    EXPECT_LE(growth, kToleranceBytes) << "Scratch grew by more than " << (kToleranceBytes / kMB)
+                                       << " MB across 10 iterations of the same model on the same stream.";
 }
 
 // =============================================================================
@@ -400,15 +390,11 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchReuse_SameModel_UserComputeStream
 
         run_iterations(*session, run_opts, /*iterations=*/10);
         const size_t used_post_measure = gpu_used_bytes();
-        log_used("after 10 measure runs (user stream)",
-                 used_post_measure, baseline_);
+        log_used("after 10 measure runs (user stream)", used_post_measure, baseline_);
 
-        const size_t growth = (used_post_measure > used_post_warmup)
-                                  ? used_post_measure - used_post_warmup
-                                  : 0;
-        EXPECT_LE(growth, kToleranceBytes)
-            << "Scratch grew by more than " << (kToleranceBytes / kMB)
-            << " MB across 10 iterations on a user-provided stream.";
+        const size_t growth = (used_post_measure > used_post_warmup) ? used_post_measure - used_post_warmup : 0;
+        EXPECT_LE(growth, kToleranceBytes) << "Scratch grew by more than " << (kToleranceBytes / kMB)
+                                           << " MB across 10 iterations on a user-provided stream.";
     }
     // Session destroyed. Synchronize the stream before destroying it to let
     // any queued cudaFreeAsync complete.
@@ -432,9 +418,9 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchReuse_SameModel_UserComputeStream
 //     used_after_all_three <= used_after_largest_alone + kToleranceBytes.
 TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Ascending)
 {
-    const auto path_small  = make_scratch_model(kMDimSmall,  "small");
+    const auto path_small = make_scratch_model(kMDimSmall, "small");
     const auto path_medium = make_scratch_model(kMDimMedium, "medium");
-    const auto path_large  = make_scratch_model(kMDimLarge,  "large");
+    const auto path_large = make_scratch_model(kMDimLarge, "large");
 
     // First: measure scratch for the large model alone.
     size_t used_large_alone = 0;
@@ -451,27 +437,25 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Ascending)
     log_used("after large destroyed", after_large_destroyed, baseline_);
 
     // Now ascending: small -> medium -> large, all alive concurrently.
-    auto s_small  = create_session_for_model(path_small);
+    auto s_small = create_session_for_model(path_small);
     Ort::RunOptions ro;
-    run_iterations(*s_small,  ro, 2);
-    log_used("after small warmup",  gpu_used_bytes(), baseline_);
+    run_iterations(*s_small, ro, 2);
+    log_used("after small warmup", gpu_used_bytes(), baseline_);
 
     auto s_medium = create_session_for_model(path_medium);
     run_iterations(*s_medium, ro, 2);
     log_used("after medium warmup", gpu_used_bytes(), baseline_);
 
-    auto s_large  = create_session_for_model(path_large);
-    run_iterations(*s_large,  ro, 2);
+    auto s_large = create_session_for_model(path_large);
+    run_iterations(*s_large, ro, 2);
     const size_t used_ascending_all = gpu_used_bytes();
-    log_used("after large warmup (3 sessions alive)",
-             used_ascending_all, baseline_);
+    log_used("after large warmup (3 sessions alive)", used_ascending_all, baseline_);
 
     // Spec: "Total allocated memory shall not exceed pure TensorRT runtime
     // requirements by more than 10%". We enforce the stronger inequality that
     // co-resident scratch does not exceed the single-largest scratch plus
     // kToleranceBytes (which covers 3x weight/IO overhead + 10% slack).
-    EXPECT_LE(used_ascending_all,
-              used_large_alone + kToleranceBytes)
+    EXPECT_LE(used_ascending_all, used_large_alone + kToleranceBytes)
         << "Ascending multi-session footprint exceeds single-largest by more "
         << "than " << (kToleranceBytes / kMB) << " MB; scratch cohesion failed.";
 }
@@ -490,11 +474,11 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Ascending)
 // up (i.e. the watermark is flat).
 TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Descending)
 {
-    const auto path_small  = make_scratch_model(kMDimSmall,  "small");
+    const auto path_small = make_scratch_model(kMDimSmall, "small");
     const auto path_medium = make_scratch_model(kMDimMedium, "medium");
-    const auto path_large  = make_scratch_model(kMDimLarge,  "large");
+    const auto path_large = make_scratch_model(kMDimLarge, "large");
 
-    auto s_large  = create_session_for_model(path_large);
+    auto s_large = create_session_for_model(path_large);
     Ort::RunOptions ro;
     run_iterations(*s_large, ro, 2);
     const size_t used_after_large = gpu_used_bytes();
@@ -505,7 +489,7 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Descending)
     const size_t used_after_medium = gpu_used_bytes();
     log_used("after medium warmup", used_after_medium, baseline_);
 
-    auto s_small  = create_session_for_model(path_small);
+    auto s_small = create_session_for_model(path_small);
     run_iterations(*s_small, ro, 2);
     const size_t used_after_small = gpu_used_bytes();
     log_used("after small warmup", used_after_small, baseline_);
@@ -513,21 +497,14 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ScratchCohesion_MultiSession_Descending)
     // After the large session primes the pool, the medium/small sessions
     // should not cause substantial growth — their scratch fits within the
     // existing block.
-    const size_t growth_medium = (used_after_medium > used_after_large)
-                                     ? used_after_medium - used_after_large
-                                     : 0;
-    const size_t growth_small  = (used_after_small  > used_after_large)
-                                     ? used_after_small  - used_after_large
-                                     : 0;
-    std::printf("  [mempool] growth(medium)=%zu MB growth(small)=%zu MB\n",
-                growth_medium / kMB, growth_small / kMB);
+    const size_t growth_medium = (used_after_medium > used_after_large) ? used_after_medium - used_after_large : 0;
+    const size_t growth_small = (used_after_small > used_after_large) ? used_after_small - used_after_large : 0;
+    std::printf("  [mempool] growth(medium)=%zu MB growth(small)=%zu MB\n", growth_medium / kMB, growth_small / kMB);
 
     EXPECT_LE(growth_medium, kToleranceBytes)
-        << "Adding medium session after large grew memory by more than "
-        << (kToleranceBytes / kMB) << " MB.";
+        << "Adding medium session after large grew memory by more than " << (kToleranceBytes / kMB) << " MB.";
     EXPECT_LE(growth_small, kToleranceBytes)
-        << "Adding small session after large/medium grew memory by more than "
-        << (kToleranceBytes / kMB) << " MB.";
+        << "Adding small session after large/medium grew memory by more than " << (kToleranceBytes / kMB) << " MB.";
 }
 
 // =============================================================================
@@ -551,11 +528,10 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ShrinkViaRunOption_ReturnsMemory)
 {
     // EP-side gate: Shrink requires EP DLL built with ORT >= 1.25.
     const auto devices = get_trt_rtx_devices(*ort_env);
-    const int ep_api_version = ep_negotiated_ort_api_version(
-        static_cast<const OrtEpDevice*>(devices[0]));
-    if (ep_api_version >= 0 && ep_api_version < 25) {
-        GTEST_SKIP() << "Skipping: EP DLL negotiated ORT API version "
-                     << ep_api_version
+    const int ep_api_version = ep_negotiated_ort_api_version(static_cast<const OrtEpDevice*>(devices[0]));
+    if (ep_api_version >= 0 && ep_api_version < 25)
+    {
+        GTEST_SKIP() << "Skipping: EP DLL negotiated ORT API version " << ep_api_version
                      << "; OrtAllocator::Shrink requires EP built against ORT >= 1.25.";
     }
 
@@ -579,12 +555,10 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ShrinkViaRunOption_ReturnsMemory)
     const size_t used_after_shrink = gpu_used_bytes();
     log_used("after shrink", used_after_shrink, baseline_);
 
-    ASSERT_LE(used_after_shrink, used_before_shrink)
-        << "Shrink grew device memory instead of releasing it.";
+    ASSERT_LE(used_after_shrink, used_before_shrink) << "Shrink grew device memory instead of releasing it.";
 
     const size_t released = SatSub(used_before_shrink, used_after_shrink);
-    std::printf("  [mempool] Shrink released %zu MB back to the OS\n",
-                released / kMB);
+    std::printf("  [mempool] Shrink released %zu MB back to the OS\n", released / kMB);
 
     // Two semantic checks that together pin down "scratch was released":
     //
@@ -598,15 +572,13 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ShrinkViaRunOption_ReturnsMemory)
     //     shrink` can legitimately drop *below* baseline (case observed in
     //     practice), so the comparison is written as `a <= b + tol` instead
     //     of `a - b <= tol` to avoid size_t underflow.
-    const size_t kMinReleased = SatSub(
-        ExpectedScratchBytes(kMDimMedium), kToleranceBytes);
-    EXPECT_GE(released, kMinReleased)
-        << "Shrink only released " << (released / kMB) << " MB; expected at "
-        << "least " << (kMinReleased / kMB) << " MB (one scratch block).";
+    const size_t kMinReleased = SatSub(ExpectedScratchBytes(kMDimMedium), kToleranceBytes);
+    EXPECT_GE(released, kMinReleased) << "Shrink only released " << (released / kMB) << " MB; expected at "
+                                      << "least " << (kMinReleased / kMB) << " MB (one scratch block).";
 
     EXPECT_LE(used_after_shrink, baseline_ + kToleranceBytes)
-        << "After Shrink, GPU usage stayed more than "
-        << (kToleranceBytes / kMB) << " MB above baseline; scratch block was "
+        << "After Shrink, GPU usage stayed more than " << (kToleranceBytes / kMB)
+        << " MB above baseline; scratch block was "
         << "not released.";
 }
 
@@ -640,11 +612,15 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, MultiStream_ConcurrentSessions_TwoThread
         auto session_a = create_session_for_model(path, stream_a);
         auto session_b = create_session_for_model(path, stream_b);
 
-        auto worker = [&](Ort::Session& s, std::atomic<bool>& err_flag) {
-            try {
+        auto worker = [&](Ort::Session& s, std::atomic<bool>& err_flag)
+        {
+            try
+            {
                 Ort::RunOptions ro;
                 run_iterations(s, ro, /*iterations=*/4);
-            } catch (const std::exception& e) {
+            }
+            catch (const std::exception& e)
+            {
                 std::fprintf(stderr, "thread failed: %s\n", e.what());
                 err_flag.store(true);
             }
@@ -681,9 +657,8 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, MultiStream_ConcurrentSessions_TwoThread
     std::printf("  [mempool] peak=%zu MB  upper_bound=%zu MB  "
                 "(per_session~%zu MB)\n",
                 peak_used / kMB, upper_bound / kMB, per_session / kMB);
-    EXPECT_LE(peak_used, upper_bound)
-        << "Concurrent two-stream usage exceeded 2x per-session scratch "
-        << "by more than " << (kToleranceBytes / kMB) << " MB.";
+    EXPECT_LE(peak_used, upper_bound) << "Concurrent two-stream usage exceeded 2x per-session scratch "
+                                      << "by more than " << (kToleranceBytes / kMB) << " MB.";
 }
 
 // =============================================================================
@@ -718,8 +693,7 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, MultiStream_SequentialSessions_PoolReuse
     }
     CUDA_CHECK(cudaStreamSynchronize(stream_a));
     const size_t after_first_destroyed = gpu_used_bytes();
-    log_used("after stream-A session destroyed",
-             after_first_destroyed, baseline_);
+    log_used("after stream-A session destroyed", after_first_destroyed, baseline_);
 
     {
         auto session_b = create_session_for_model(path, stream_b);
@@ -734,15 +708,11 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, MultiStream_SequentialSessions_PoolReuse
 
     // The second session's peak should be within tolerance of the first
     // session's peak — both should fit in the same reused pool block.
-    const size_t growth = (used_after_second > used_after_first)
-                              ? used_after_second - used_after_first
-                              : 0;
-    std::printf("  [mempool] cross-stream reuse growth: %zu MB\n",
-                growth / kMB);
-    EXPECT_LE(growth, kToleranceBytes)
-        << "Sequential two-stream usage grew the pool by more than "
-        << (kToleranceBytes / kMB) << " MB; pool did not reuse block across "
-        << "streams.";
+    const size_t growth = (used_after_second > used_after_first) ? used_after_second - used_after_first : 0;
+    std::printf("  [mempool] cross-stream reuse growth: %zu MB\n", growth / kMB);
+    EXPECT_LE(growth, kToleranceBytes) << "Sequential two-stream usage grew the pool by more than "
+                                       << (kToleranceBytes / kMB) << " MB; pool did not reuse block across "
+                                       << "streams.";
 }
 
 // =============================================================================
@@ -766,30 +736,28 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ArenaShrinkageComparison)
 {
     // EP-side gate: Shrink requires EP DLL built with ORT >= 1.25.
     const auto devices = get_trt_rtx_devices(*ort_env);
-    const int ep_api_version = ep_negotiated_ort_api_version(
-        static_cast<const OrtEpDevice*>(devices[0]));
-    if (ep_api_version >= 0 && ep_api_version < 25) {
-        GTEST_SKIP() << "Skipping: EP DLL negotiated ORT API version "
-                     << ep_api_version
+    const int ep_api_version = ep_negotiated_ort_api_version(static_cast<const OrtEpDevice*>(devices[0]));
+    if (ep_api_version >= 0 && ep_api_version < 25)
+    {
+        GTEST_SKIP() << "Skipping: EP DLL negotiated ORT API version " << ep_api_version
                      << "; OrtAllocator::Shrink requires EP built against ORT >= 1.25.";
     }
 
-    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath))
-        << "Model not found at: " << kModelPath;
+    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
-    constexpr int kWarmupRuns  = 3;
+    constexpr int kWarmupRuns = 3;
     constexpr int kMeasureRuns = 5;
 
     // Sessions in this test need CUDA graph capture enabled -- the mempool
     // allocator must return stable pointers across iterations for capture to
     // succeed, so this also implicitly smoke-tests pointer stability.
-    auto make_cuda_graph_session = []() {
+    auto make_cuda_graph_session = []()
+    {
         Ort::SessionOptions so;
         std::unordered_map<std::string, std::string> ep_opts;
         ep_opts["enable_cuda_graph"] = "1";
         append_trt_rtx_ep(so, ep_opts);
-        return std::make_unique<Ort::Session>(
-            *ort_env, toOrtString(kModelPath).c_str(), so);
+        return std::make_unique<Ort::Session>(*ort_env, toOrtString(kModelPath).c_str(), so);
     };
 
     // -------------------------------------------------------------------------
@@ -820,8 +788,7 @@ TEST_F(TensorRTRTXEpTest_SharedMempool, ArenaShrinkageComparison)
         log_used("after session creation", gpu_used_bytes(), baseline_);
 
         Ort::RunOptions run_opts_shrink;
-        run_opts_shrink.AddConfigEntry(
-            kOrtRunOptionsConfigEnableMemoryArenaShrinkage, "gpu:0");
+        run_opts_shrink.AddConfigEntry(kOrtRunOptionsConfigEnableMemoryArenaShrinkage, "gpu:0");
         run_iterations(*session, run_opts_shrink, kWarmupRuns);
         log_used("after warmup runs (B)", gpu_used_bytes(), baseline_);
 

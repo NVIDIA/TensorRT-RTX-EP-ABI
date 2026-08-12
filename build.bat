@@ -19,6 +19,7 @@ REM Example:
 REM   build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT"
 REM   build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT" --build
 REM   build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT" --clean --update --build
+REM   build.bat --cuda_home "C:\CUDA" --onnxruntime_home "C:\onnx" --trt_rtx_home "C:\TRT" --arm64
 REM
 REM Arguments can be provided in any order.
 REM ============================================================================
@@ -43,6 +44,8 @@ set "VCPKG_HOST_TRIPLET="
 set "VCPKG_TOOLCHAIN_FILE="
 set "DO_BUILD_WHEEL=0"
 set "WHEEL_OUTPUT_DIR="
+set "PLUGIN_HOME="
+set "SKIP_TESTS=0"
 
 REM Parse named arguments
 :parse_args
@@ -126,6 +129,22 @@ if /i "%~1"=="--wheel_dir" (
     shift
     goto :parse_args
 )
+if /i "%~1"=="--plugin_home" (
+    set "PLUGIN_HOME=%~2"
+    shift
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--arm64" (
+    set "ARCH=ARM64"
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--skip_tests" (
+    set "SKIP_TESTS=1"
+    shift
+    goto :parse_args
+)
 if /i "%~1"=="-h" goto :usage
 if /i "%~1"=="--help" goto :usage
 if /i "%~1"=="/?" goto :usage
@@ -173,6 +192,11 @@ if "%TRT_RTX_EP_VERSION%"=="" (
     )
 )
 
+REM For ARM64 cross-compilation, override vcpkg target triplet (host remains x64-windows)
+if "%ARCH%"=="ARM64" if "%USE_VCPKG%"=="ON" (
+    set "VCPKG_TARGET_TRIPLET=arm64-windows-static-md"
+)
+
 REM If no flags specified, do full build (clean + update + build)
 if "%FLAGS_SPECIFIED%"=="0" (
     set "DO_CLEAN=1"
@@ -181,7 +205,11 @@ if "%FLAGS_SPECIFIED%"=="0" (
 )
 
 REM Determine platform tag for wheel filename
-set "PLATFORM_TAG=win_amd64"
+if "%ARCH%"=="ARM64" (
+    set "PLATFORM_TAG=win_arm64"
+) else (
+    set "PLATFORM_TAG=win_amd64"
+)
 
 REM Wheel build requires the C++ DLL; auto-enable --build if caller forgot it
 if "%DO_BUILD_WHEEL%"=="1" (
@@ -212,6 +240,13 @@ if not exist "%ONNXRUNTIME_ROOT%" (
 if not exist "%TRT_RTX_ROOT%" (
     echo ERROR: TensorRT RTX SDK root path does not exist: %TRT_RTX_ROOT%
     exit /b 1
+)
+
+if not "%PLUGIN_HOME%"=="" (
+    if not exist "%PLUGIN_HOME%" (
+        echo ERROR: Plugin home path does not exist: %PLUGIN_HOME%
+        exit /b 1
+    )
 )
 
 REM Store source directory (where CMakeLists.txt is located)
@@ -258,6 +293,11 @@ if "%DO_BUILD_WHEEL%"=="1" (
         echo   Wheel Output:        %BUILD_DIR%\dist
     ) else (
         echo   Wheel Output:        %WHEEL_OUTPUT_DIR%
+    )
+    if "%PLUGIN_HOME%"=="" (
+        echo   Plugin Home:         ^(not set -- plugin DLL will NOT be bundled^)
+    ) else (
+        echo   Plugin Home:         %PLUGIN_HOME%
     )
 )
 echo ============================================================================
@@ -331,6 +371,16 @@ if "%USE_VCPKG%"=="ON" (
     ) else (
         set "VERSION_FLAG="
     )
+    if "%ARCH%"=="ARM64" (
+        set "HOST_PROTOC_FLAG=-DUSE_PRECOMPILED_HOST_PROTOC=ON"
+    ) else (
+        set "HOST_PROTOC_FLAG="
+    )
+    if "%SKIP_TESTS%"=="1" (
+        set "TESTS_FLAG=-DBUILD_TESTS=OFF"
+    ) else (
+        set "TESTS_FLAG="
+    )
     cmake -G "Visual Studio 17 2022" -A %ARCH% ^
           -DCUDAToolkit_ROOT="%CUDA_TOOLKIT_PATH%" ^
           -DONNXRUNTIME_ROOT="%ONNXRUNTIME_ROOT%" ^
@@ -341,6 +391,8 @@ if "%USE_VCPKG%"=="ON" (
           -DVCPKG_HOST_TRIPLET=%VCPKG_HOST_TRIPLET% ^
           !PRODUCTION_FLAG! ^
           !VERSION_FLAG! ^
+          !HOST_PROTOC_FLAG! ^
+          !TESTS_FLAG! ^
           "%SOURCE_DIR%"
     
     if !ERRORLEVEL! NEQ 0 (
@@ -401,7 +453,7 @@ REM Run the wheel build at top-level (not inside a giant `(...)` block) — cmd.
 REM delayed expansion silently breaks inside long nested paren blocks, causing
 REM `!VAR!` to evaluate literally and `if !ERRORLEVEL! NEQ 0` to always fire.
 if not "%DO_BUILD_WHEEL%"=="1" goto :end_wheel
-    REM Locate python/ — prefer inside trt-rtx-ep-abi/ (final repo layout),
+    REM Locate python/ — prefer inside TensorRT-RTX-EP-ABI/ (final repo layout),
     REM fall back to sibling directory (workspace layout during development)
     set "PYTHON_DIR="
     if exist "%SOURCE_DIR%\python\pyproject.toml" set "PYTHON_DIR=%SOURCE_DIR%\python"
@@ -438,13 +490,19 @@ if not "%DO_BUILD_WHEEL%"=="1" goto :end_wheel
         goto :end
     )
 
-    REM Stage DLLs into package dir
-    REM TRT RTX SDK layout: DLLs are in bin\, not lib\ (lib\ contains .lib import files)
-    REM CUDA runtime: prefer bin\x64 (CUDA 12+), fall back to bin\ (older layouts).
-    echo [WHEEL] Staging DLLs into package directory...
+    REM Stage DLLs, docs, and optional plugin into package dir
+    REM TRT RTX SDK layout: DLLs are in bin\, docs in doc\, lib\ has .lib import files only.
+    REM CUDA runtime: prefer bin\arm64 (ARM64) or bin\x64 (x64), fall back to bin\ (older layouts).
+    echo [WHEEL] Staging DLLs, docs, and plugins into package directory...
     set "CUDA_BIN_ARG="
-    if exist "%CUDA_TOOLKIT_PATH%\bin\x64" (
-        set "CUDA_BIN_ARG=--cuda-bin "%CUDA_TOOLKIT_PATH%\bin\x64""
+    if "%ARCH%"=="ARM64" (
+        if exist "%CUDA_TOOLKIT_PATH%\bin\arm64" (
+            set "CUDA_BIN_ARG=--cuda-bin "%CUDA_TOOLKIT_PATH%\bin\arm64""
+        )
+    ) else (
+        if exist "%CUDA_TOOLKIT_PATH%\bin\x64" (
+            set "CUDA_BIN_ARG=--cuda-bin "%CUDA_TOOLKIT_PATH%\bin\x64""
+        )
     )
     if not defined CUDA_BIN_ARG if exist "%CUDA_TOOLKIT_PATH%\bin" (
         set "CUDA_BIN_ARG=--cuda-bin "%CUDA_TOOLKIT_PATH%\bin""
@@ -452,10 +510,18 @@ if not "%DO_BUILD_WHEEL%"=="1" goto :end_wheel
     if not defined CUDA_BIN_ARG (
         echo [WHEEL] Warning: CUDA bin directory not found under %CUDA_TOOLKIT_PATH%; cudart will not be bundled.
     )
+    set "PLUGIN_DIR_ARG="
+    if not "%PLUGIN_HOME%"=="" (
+        set "PLUGIN_DIR_ARG=--plugin-dir "%PLUGIN_HOME%""
+    ) else (
+        echo [WHEEL] Warning: --plugin_home not provided; TensorRT plugin DLL will NOT be bundled in the wheel.
+    )
     call python "%PYTHON_DIR%\scripts\stage_windows_dlls.py" ^
         --ep-dll "%EP_DLL%" ^
         --trt-lib-dir "%TRT_RTX_ROOT%\bin" ^
-        %CUDA_BIN_ARG%
+        --trt-doc-dir "%TRT_RTX_ROOT%\doc" ^
+        %CUDA_BIN_ARG% ^
+        %PLUGIN_DIR_ARG%
     set "_STAGE_RC=%ERRORLEVEL%"
     if not "%_STAGE_RC%"=="0" (
         echo ERROR: DLL staging failed.
@@ -491,6 +557,7 @@ if not "%DO_BUILD_WHEEL%"=="1" goto :end_wheel
 
     REM Build wheel
     echo [WHEEL] Building Python wheel...
+    set "NV_TARGET_PLAT=%PLATFORM_TAG%"
     call python -m build --wheel --no-isolation --outdir "%WHEEL_OUTPUT_DIR%" "%PYTHON_DIR%"
     set "_WHEEL_RC=%ERRORLEVEL%"
     if not "%_WHEEL_RC%"=="0" (
@@ -563,10 +630,15 @@ echo   --build                    Compile the project
 echo   --version ^<M.m.p^>          Set EP version (e.g. 1.2.3). Required for --production
 echo   --production               Enable production build with signature verification
 echo   --use_vcpkg                Use VCPKG package manager
+echo   --arm64                    Target Windows on ARM64 ^(sets -A ARM64, enables USE_PRECOMPILED_HOST_PROTOC^)
+echo   --skip_tests               Disable test build ^(sets BUILD_TESTS=OFF^)
 
 echo   --build_wheel              Build Python wheel after C++ DLL build
 echo   --wheel_dir ^<PATH^>         Wheel output directory (default: ^<build_dir^>\dist)
 echo                              Prerequisite: pip install build
+echo   --plugin_home ^<PATH^>       TensorRT plugin directory (e.g. TensorRT-RTX-Plugins\RTX-1.5)
+echo                              When provided with --build_wheel, tensorrt_plugins.dll is bundled.
+echo                              If omitted, a warning is printed and the plugin is not bundled.
 echo   -h, --help, /?             Show this help message
 echo.
 echo Build Actions (can be combined, executed in order: clean -^> update -^> build):

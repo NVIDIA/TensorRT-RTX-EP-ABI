@@ -80,25 +80,25 @@ size_t GetTensorElementSize(int32_t data_type)
 {
     switch (data_type)
     {
-        case onnx::TensorProto_DataType_FLOAT:
-        case onnx::TensorProto_DataType_INT32:
-        case onnx::TensorProto_DataType_UINT32:
-            return 4;
-        case onnx::TensorProto_DataType_DOUBLE:
-        case onnx::TensorProto_DataType_INT64:
-        case onnx::TensorProto_DataType_UINT64:
-            return 8;
-        case onnx::TensorProto_DataType_FLOAT16:
-        case onnx::TensorProto_DataType_BFLOAT16:
-        case onnx::TensorProto_DataType_INT16:
-        case onnx::TensorProto_DataType_UINT16:
-            return 2;
-        case onnx::TensorProto_DataType_INT8:
-        case onnx::TensorProto_DataType_UINT8:
-        case onnx::TensorProto_DataType_BOOL:
-            return 1;
-        default:
-            return 0;
+    case onnx::TensorProto_DataType_FLOAT:
+    case onnx::TensorProto_DataType_INT32:
+    case onnx::TensorProto_DataType_UINT32:
+        return 4;
+    case onnx::TensorProto_DataType_DOUBLE:
+    case onnx::TensorProto_DataType_INT64:
+    case onnx::TensorProto_DataType_UINT64:
+        return 8;
+    case onnx::TensorProto_DataType_FLOAT16:
+    case onnx::TensorProto_DataType_BFLOAT16:
+    case onnx::TensorProto_DataType_INT16:
+    case onnx::TensorProto_DataType_UINT16:
+        return 2;
+    case onnx::TensorProto_DataType_INT8:
+    case onnx::TensorProto_DataType_UINT8:
+    case onnx::TensorProto_DataType_BOOL:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -251,55 +251,55 @@ BoundKind ClassifyScalarTensor(const onnx::TensorProto& tensor)
 
     switch (tensor.data_type())
     {
-        case onnx::TensorProto_DataType_FLOAT:
+    case onnx::TensorProto_DataType_FLOAT:
+    {
+        float value = 0.0f;
+        if (TryReadScalarBytes(tensor, value))
         {
-            float value = 0.0f;
-            if (TryReadScalarBytes(tensor, value))
-            {
-                return ClassifyFloatValue(value);
-            }
-            return tensor.float_data_size() == 1 ? ClassifyFloatValue(tensor.float_data(0)) : BoundKind::kUnknown;
+            return ClassifyFloatValue(value);
         }
-        case onnx::TensorProto_DataType_DOUBLE:
+        return tensor.float_data_size() == 1 ? ClassifyFloatValue(tensor.float_data(0)) : BoundKind::kUnknown;
+    }
+    case onnx::TensorProto_DataType_DOUBLE:
+    {
+        double value = 0.0;
+        if (TryReadScalarBytes(tensor, value))
         {
-            double value = 0.0;
-            if (TryReadScalarBytes(tensor, value))
-            {
-                return ClassifyDoubleValue(value);
-            }
-            return tensor.double_data_size() == 1 ? ClassifyDoubleValue(tensor.double_data(0)) : BoundKind::kUnknown;
+            return ClassifyDoubleValue(value);
         }
-        case onnx::TensorProto_DataType_FLOAT16:
+        return tensor.double_data_size() == 1 ? ClassifyDoubleValue(tensor.double_data(0)) : BoundKind::kUnknown;
+    }
+    case onnx::TensorProto_DataType_FLOAT16:
+    {
+        uint16_t bits = 0;
+        if (TryReadScalarBytes(tensor, bits))
         {
-            uint16_t bits = 0;
-            if (TryReadScalarBytes(tensor, bits))
-            {
-                return ClassifyFloat16Bits(bits);
-            }
-            return tensor.int32_data_size() == 1 ? ClassifyFloat16Bits(static_cast<uint16_t>(tensor.int32_data(0)))
-                                                 : BoundKind::kUnknown;
+            return ClassifyFloat16Bits(bits);
         }
-        case onnx::TensorProto_DataType_BFLOAT16:
+        return tensor.int32_data_size() == 1 ? ClassifyFloat16Bits(static_cast<uint16_t>(tensor.int32_data(0)))
+                                             : BoundKind::kUnknown;
+    }
+    case onnx::TensorProto_DataType_BFLOAT16:
+    {
+        uint16_t bits = 0;
+        if (TryReadScalarBytes(tensor, bits))
         {
-            uint16_t bits = 0;
-            if (TryReadScalarBytes(tensor, bits))
-            {
-                return ClassifyBFloat16Bits(bits);
-            }
-            return tensor.int32_data_size() == 1 ? ClassifyBFloat16Bits(static_cast<uint16_t>(tensor.int32_data(0)))
-                                                 : BoundKind::kUnknown;
+            return ClassifyBFloat16Bits(bits);
         }
-        case onnx::TensorProto_DataType_INT8:
-        case onnx::TensorProto_DataType_UINT8:
-        case onnx::TensorProto_DataType_INT16:
-        case onnx::TensorProto_DataType_UINT16:
-        case onnx::TensorProto_DataType_INT32:
-        case onnx::TensorProto_DataType_UINT32:
-        case onnx::TensorProto_DataType_INT64:
-        case onnx::TensorProto_DataType_UINT64:
-            return BoundKind::kFinite;
-        default:
-            return BoundKind::kUnknown;
+        return tensor.int32_data_size() == 1 ? ClassifyBFloat16Bits(static_cast<uint16_t>(tensor.int32_data(0)))
+                                             : BoundKind::kUnknown;
+    }
+    case onnx::TensorProto_DataType_INT8:
+    case onnx::TensorProto_DataType_UINT8:
+    case onnx::TensorProto_DataType_INT16:
+    case onnx::TensorProto_DataType_UINT16:
+    case onnx::TensorProto_DataType_INT32:
+    case onnx::TensorProto_DataType_UINT32:
+    case onnx::TensorProto_DataType_INT64:
+    case onnx::TensorProto_DataType_UINT64:
+        return BoundKind::kFinite;
+    default:
+        return BoundKind::kUnknown;
     }
 }
 

@@ -28,6 +28,7 @@
 //!
 
 #include "tensorrt_rtx_allocator.h"
+
 #include "utils/ort_api_init.h"
 
 #include <cuda_runtime_api.h>
@@ -72,7 +73,8 @@ void CUDA_RETURN_IF_ERROR(cudaError_t res);
 //! \note Does not set CUDA device; device will be set during Alloc() calls
 //!
 TensorrtRtxAllocator::TensorrtRtxAllocator(const OrtMemoryInfo* mem_info, DeviceId device_id)
-    : mem_info_(mem_info), device_id_(device_id)
+    : mem_info_(mem_info)
+    , device_id_(device_id)
 {
     // Initialize OrtAllocator interface with current API version
     OrtAllocator::version = NegotiatedOrtApiVersion();
@@ -81,17 +83,20 @@ TensorrtRtxAllocator::TensorrtRtxAllocator(const OrtMemoryInfo* mem_info, Device
     // Security checks are included in lambdas for defense in depth
     OrtAllocator::Alloc = [](OrtAllocator* this_, size_t size) -> void*
     {
-        if (this_ == nullptr) return nullptr;
+        if (this_ == nullptr)
+            return nullptr;
         return static_cast<TensorrtRtxAllocator*>(this_)->Alloc(size);
     };
     OrtAllocator::Free = [](OrtAllocator* this_, void* p)
     {
-        if (this_ == nullptr) return;
+        if (this_ == nullptr)
+            return;
         static_cast<TensorrtRtxAllocator*>(this_)->Free(p);
     };
     OrtAllocator::Info = [](const OrtAllocator* this_) -> const OrtMemoryInfo*
     {
-        if (this_ == nullptr) return nullptr;
+        if (this_ == nullptr)
+            return nullptr;
         return static_cast<const TensorrtRtxAllocator*>(this_)->Info();
     };
 
@@ -275,17 +280,20 @@ TensorrtRtxPinnedAllocator::TensorrtRtxPinnedAllocator(const OrtMemoryInfo* mem_
     // Security checks are included in lambdas for defense in depth
     OrtAllocator::Alloc = [](OrtAllocator* this_, size_t size) -> void*
     {
-        if (this_ == nullptr) return nullptr;
+        if (this_ == nullptr)
+            return nullptr;
         return static_cast<TensorrtRtxPinnedAllocator*>(this_)->Alloc(size);
     };
     OrtAllocator::Free = [](OrtAllocator* this_, void* p)
     {
-        if (this_ == nullptr) return;
+        if (this_ == nullptr)
+            return;
         static_cast<TensorrtRtxPinnedAllocator*>(this_)->Free(p);
     };
     OrtAllocator::Info = [](const OrtAllocator* this_) -> const OrtMemoryInfo*
     {
-        if (this_ == nullptr) return nullptr;
+        if (this_ == nullptr)
+            return nullptr;
         return static_cast<const TensorrtRtxPinnedAllocator*>(this_)->Info();
     };
 

@@ -4,96 +4,110 @@
 // Ported from onnxruntime/test/providers/nv_tensorrt_rtx/nv_ep_context_test.cc
 // Uses only public ORT SDK APIs.
 
-#include <gtest/gtest.h>
-#include <onnxruntime_cxx_api.h>
-#include <onnxruntime_session_options_config_keys.h>
-
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <cmath>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "test_tensorrt_rtx_model_builder.h"
 #include "test_tensorrt_rtx_utils.h"
+#include <gtest/gtest.h>
+#include <onnxruntime_cxx_api.h>
+#include <onnxruntime_session_options_config_keys.h>
 
 extern std::unique_ptr<Ort::Env> ort_env;
 
 // Helper: append TRT RTX EP to session options.
-static void AppendTrtRtxEp(
-    Ort::SessionOptions& so,
-    const std::unordered_map<std::string, std::string>& options = {}) {
+static void AppendTrtRtxEp(Ort::SessionOptions& so, const std::unordered_map<std::string, std::string>& options = {})
+{
     auto devices = get_trt_rtx_devices(*ort_env);
     ASSERT_FALSE(devices.empty()) << "No TRT RTX EP devices found.";
     Ort::KeyValuePairs kv_options;
-    for (auto& [k, v] : options) {
+    for (auto& [k, v] : options)
+    {
         kv_options.Add(k.c_str(), v.c_str());
     }
     so.AppendExecutionProvider_V2(*ort_env, devices, kv_options);
 }
 
 // Helper: read a file into a byte vector.
-static std::vector<char> readBinaryFile(const std::string& path) {
+static std::vector<char> readBinaryFile(const std::string& path)
+{
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
         throw std::runtime_error("Could not open file: " + path);
     }
     file.seekg(0, std::ios::end);
-    if (!file.good()) {
+    if (!file.good())
+    {
         throw std::runtime_error("Failed to seek in file: " + path);
     }
     auto size = file.tellg();
-    if (size < 0) {
+    if (size < 0)
+    {
         throw std::runtime_error("Failed to determine size of file: " + path);
     }
     file.seekg(0, std::ios::beg);
     std::vector<char> buf(static_cast<size_t>(size));
-    if (!file.read(buf.data(), size)) {
-        throw std::runtime_error("Failed to read " + std::to_string(size)
-                                 + " bytes from file: " + path);
+    if (!file.read(buf.data(), size))
+    {
+        throw std::runtime_error("Failed to read " + std::to_string(size) + " bytes from file: " + path);
     }
     return buf;
 }
 
-static std::string readTextFile(const std::filesystem::path& path) {
+static std::string readTextFile(const std::filesystem::path& path)
+{
     std::ifstream file(path, std::ios::in | std::ios::binary);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
         throw std::runtime_error("Could not open text file: " + path.string());
     }
-    return std::string(std::istreambuf_iterator<char>(file),
-                       std::istreambuf_iterator<char>());
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
-static onnx::ModelProto readOnnxModel(const std::filesystem::path& path) {
+static onnx::ModelProto readOnnxModel(const std::filesystem::path& path)
+{
     std::ifstream file(path, std::ios::in | std::ios::binary);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
         throw std::runtime_error("Could not open ONNX model: " + path.string());
     }
 
     onnx::ModelProto model;
-    if (!model.ParseFromIstream(&file)) {
+    if (!model.ParseFromIstream(&file))
+    {
         throw std::runtime_error("Failed to parse ONNX model: " + path.string());
     }
     return model;
 }
 
-static size_t countNodesByOpType(
-    const onnx::GraphProto& graph,
-    const std::string& op_type,
-    const std::string& domain = "") {
+static size_t countNodesByOpType(const onnx::GraphProto& graph, const std::string& op_type,
+                                 const std::string& domain = "")
+{
     size_t count = 0;
-    for (const auto& node : graph.node()) {
-        if (node.op_type() == op_type &&
-            (domain.empty() || node.domain() == domain)) {
+    for (const auto& node : graph.node())
+    {
+        if (node.op_type() == op_type && (domain.empty() || node.domain() == domain))
+        {
             ++count;
         }
 
-        for (const auto& attr : node.attribute()) {
-            if (attr.type() == onnx::AttributeProto_AttributeType_GRAPH) {
+        for (const auto& attr : node.attribute())
+        {
+            if (attr.type() == onnx::AttributeProto_AttributeType_GRAPH)
+            {
                 count += countNodesByOpType(attr.g(), op_type, domain);
-            } else if (attr.type() == onnx::AttributeProto_AttributeType_GRAPHS) {
-                for (const auto& nested_graph : attr.graphs()) {
+            }
+            else if (attr.type() == onnx::AttributeProto_AttributeType_GRAPHS)
+            {
+                for (const auto& nested_graph : attr.graphs())
+                {
                     count += countNodesByOpType(nested_graph, op_type, domain);
                 }
             }
@@ -103,23 +117,22 @@ static size_t countNodesByOpType(
     return count;
 }
 
-static std::vector<float> ComputeFastGeluReference(
-    const std::vector<float>& input_data) {
+static std::vector<float> ComputeFastGeluReference(const std::vector<float>& input_data)
+{
     std::vector<float> output;
     output.reserve(input_data.size());
 
-    for (float x : input_data) {
-        const float y =
-            x * (0.5f + 0.5f * std::tanh(x * (0.035677408136300125f * x * x +
-                                              0.7978845608028654f)));
+    for (float x : input_data)
+    {
+        const float y = x * (0.5f + 0.5f * std::tanh(x * (0.035677408136300125f * x * x + 0.7978845608028654f)));
         output.push_back(y);
     }
 
     return output;
 }
 
-static std::vector<float> ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput(
-    const std::vector<float>& x_data) {
+static std::vector<float> ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput(const std::vector<float>& x_data)
+{
     constexpr int kRows = 2;
     constexpr int kInner = 3;
     constexpr int kCols = 2;
@@ -129,18 +142,20 @@ static std::vector<float> ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput
 
     std::vector<float> dequantized_weights;
     dequantized_weights.reserve(q_weights.size());
-    for (const int8_t q : q_weights) {
-        dequantized_weights.push_back(
-            (static_cast<float>(q) - static_cast<float>(kZeroPoint)) * kScale);
+    for (const int8_t q : q_weights)
+    {
+        dequantized_weights.push_back((static_cast<float>(q) - static_cast<float>(kZeroPoint)) * kScale);
     }
 
     std::vector<float> matmul_output(kRows * kCols, 0.0f);
-    for (int row = 0; row < kRows; ++row) {
-        for (int col = 0; col < kCols; ++col) {
+    for (int row = 0; row < kRows; ++row)
+    {
+        for (int col = 0; col < kCols; ++col)
+        {
             float acc = 0.0f;
-            for (int inner = 0; inner < kInner; ++inner) {
-                acc += x_data[row * kInner + inner] *
-                       dequantized_weights[inner * kCols + col];
+            for (int inner = 0; inner < kInner; ++inner)
+            {
+                acc += x_data[row * kInner + inner] * dequantized_weights[inner * kCols + col];
             }
             matmul_output[row * kCols + col] = acc;
         }
@@ -149,8 +164,8 @@ static std::vector<float> ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput
     return ComputeFastGeluReference(matmul_output);
 }
 
-static std::vector<float> ComputeExpectedLoweredAsymmetricQdqMatMulFastGeluOutput(
-    const std::vector<float>& x_data) {
+static std::vector<float> ComputeExpectedLoweredAsymmetricQdqMatMulFastGeluOutput(const std::vector<float>& x_data)
+{
     constexpr int kRows = 2;
     constexpr int kInner = 3;
     constexpr int kCols = 2;
@@ -158,31 +173,27 @@ static std::vector<float> ComputeExpectedLoweredAsymmetricQdqMatMulFastGeluOutpu
     constexpr int8_t kZeroPoint = 5;
     constexpr int32_t kQMin = -128;
     constexpr int32_t kQMax = 127;
-    const std::vector<float> weights = {
-        1.25f, -0.75f,
-        0.50f,  2.00f,
-       -1.50f,  0.25f};
+    const std::vector<float> weights = {1.25f, -0.75f, 0.50f, 2.00f, -1.50f, 0.25f};
 
     std::vector<float> dequantized_x;
     dequantized_x.reserve(x_data.size());
-    for (float x : x_data) {
-        const float shifted = std::nearbyint(x / kScale) +
-                              static_cast<float>(kZeroPoint);
-        const int32_t clamped = std::max(
-            kQMin, std::min(kQMax, static_cast<int32_t>(shifted)));
+    for (float x : x_data)
+    {
+        const float shifted = std::nearbyint(x / kScale) + static_cast<float>(kZeroPoint);
+        const int32_t clamped = std::max(kQMin, std::min(kQMax, static_cast<int32_t>(shifted)));
         const int8_t quantized = static_cast<int8_t>(clamped);
-        dequantized_x.push_back(
-            (static_cast<float>(quantized) - static_cast<float>(kZeroPoint)) *
-            kScale);
+        dequantized_x.push_back((static_cast<float>(quantized) - static_cast<float>(kZeroPoint)) * kScale);
     }
 
     std::vector<float> matmul_output(kRows * kCols, 0.0f);
-    for (int row = 0; row < kRows; ++row) {
-        for (int col = 0; col < kCols; ++col) {
+    for (int row = 0; row < kRows; ++row)
+    {
+        for (int col = 0; col < kCols; ++col)
+        {
             float acc = 0.0f;
-            for (int inner = 0; inner < kInner; ++inner) {
-                acc += dequantized_x[row * kInner + inner] *
-                       weights[inner * kCols + col];
+            for (int inner = 0; inner < kInner; ++inner)
+            {
+                acc += dequantized_x[row * kInner + inner] * weights[inner * kCols + col];
             }
             matmul_output[row * kCols + col] = acc;
         }
@@ -195,44 +206,43 @@ static std::vector<float> ComputeExpectedLoweredAsymmetricQdqMatMulFastGeluOutpu
 // CompileApiTest — parameterized
 // =============================================================================
 
-struct CompileParam {
+struct CompileParam
+{
     bool embed_mode;
     bool bytestream_io;
     bool external_initializer_for_parser = false;
 
-    std::string to_string() const {
-        return "embed_mode_" + std::to_string(embed_mode)
-             + "_bytestream_io_" + std::to_string(bytestream_io)
-             + "_ext_init_" + std::to_string(external_initializer_for_parser);
+    std::string to_string() const
+    {
+        return "embed_mode_" + std::to_string(embed_mode) + "_bytestream_io_" + std::to_string(bytestream_io) +
+               "_ext_init_" + std::to_string(external_initializer_for_parser);
     }
 };
 
-class CompileApiTest
-    : public ::testing::TestWithParam<CompileParam> {
- protected:
-    void SetUp() override {
-        ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty())
-            << "No TRT RTX EP devices found.";
+class CompileApiTest : public ::testing::TestWithParam<CompileParam>
+{
+protected:
+    void SetUp() override
+    {
+        ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
     }
 };
 
-static void SmallModelTest(CompileParam test_param, bool fully_supported_model) {
+static void SmallModelTest(CompileParam test_param, bool fully_supported_model)
+{
     std::string test_name = test_param.to_string();
-    if (!fully_supported_model) test_name += "_fast_gelu";
+    if (!fully_supported_model)
+        test_name += "_fast_gelu";
 
-    const std::string model_name =
-        "nv_execution_provider_compile_" + test_name + ".onnx";
-    const std::string model_name_ctx =
-        "nv_execution_provider_compile_" + test_name + "_ctx.onnx";
+    const std::string model_name = "nv_execution_provider_compile_" + test_name + ".onnx";
+    const std::string model_name_ctx = "nv_execution_provider_compile_" + test_name + "_ctx.onnx";
     clearFileIfExists(model_name_ctx);
 
-    model_builder::CreateBaseModel(
-        model_name, "test", {1, 3, 2}, !fully_supported_model);
+    model_builder::CreateBaseModel(model_name, "test", {1, 3, 2}, !fully_supported_model);
 
     Ort::SessionOptions session_options;
     AppendTrtRtxEp(session_options,
-                   {{"nv_use_external_data_initializer",
-                     std::to_string(test_param.external_initializer_for_parser)}});
+                   {{"nv_use_external_data_initializer", std::to_string(test_param.external_initializer_for_parser)}});
 
     Ort::ModelCompilationOptions compile_opts(*ort_env, session_options);
     compile_opts.SetEpContextEmbedMode(test_param.embed_mode);
@@ -241,12 +251,14 @@ static void SmallModelTest(CompileParam test_param, bool fully_supported_model) 
     size_t output_context_size = 0;
     std::vector<char> input_onnx;
 
-    if (test_param.bytestream_io) {
+    if (test_param.bytestream_io)
+    {
         input_onnx = readBinaryFile(model_name);
         compile_opts.SetInputModelFromBuffer(input_onnx.data(), input_onnx.size());
-        compile_opts.SetOutputModelBuffer(
-            Ort::AllocatorWithDefaultOptions(), &output_context, &output_context_size);
-    } else {
+        compile_opts.SetOutputModelBuffer(Ort::AllocatorWithDefaultOptions(), &output_context, &output_context_size);
+    }
+    else
+    {
         compile_opts.SetInputModelPath(toOrtString(model_name).c_str());
         compile_opts.SetOutputModelPath(toOrtString(model_name_ctx).c_str());
     }
@@ -256,13 +268,14 @@ static void SmallModelTest(CompileParam test_param, bool fully_supported_model) 
 
     // JIT: load compiled model and run inference
     Ort::Session session{nullptr};
-    if (test_param.bytestream_io) {
-        session = Ort::Session(*ort_env, output_context, output_context_size,
-                               session_options);
+    if (test_param.bytestream_io)
+    {
+        session = Ort::Session(*ort_env, output_context, output_context_size, session_options);
         Ort::AllocatorWithDefaultOptions().Free(output_context);
-    } else {
-        session = Ort::Session(*ort_env, toOrtString(model_name_ctx).c_str(),
-                               session_options);
+    }
+    else
+    {
+        session = Ort::Session(*ort_env, toOrtString(model_name_ctx).c_str(), session_options);
     }
 
     auto io_binding = generate_io_binding(session);
@@ -270,46 +283,45 @@ static void SmallModelTest(CompileParam test_param, bool fully_supported_model) 
     session.Run(run_options, io_binding);
 }
 
-TEST_P(CompileApiTest, SmallModel) {
+TEST_P(CompileApiTest, SmallModel)
+{
     SmallModelTest(GetParam(), /*fully_supported_model=*/true);
 }
 
-TEST_P(CompileApiTest, SmallSplitModel) {
+TEST_P(CompileApiTest, SmallSplitModel)
+{
     SmallModelTest(GetParam(), /*fully_supported_model=*/false);
 }
 
 // Large model compilation with external-data I/O. embed_mode=1 is skipped
 // because an embedded context for a large model would exceed the 2 GB proto
 // limit.
-TEST_P(CompileApiTest, LargeModel) {
+TEST_P(CompileApiTest, LargeModel)
+{
     const CompileParam test_param = GetParam();
-    if (test_param.embed_mode) {
+    if (test_param.embed_mode)
+    {
         GTEST_SKIP() << "embed_mode=1 would exceed 2GB proto limit for large model.";
     }
 
     const std::string test_name = test_param.to_string();
-    const std::string model_name =
-        "nv_execution_provider_compile_large_" + test_name + ".onnx";
-    const std::string external_data_name =
-        "nv_execution_provider_compile_large_" + test_name + ".onnx_data";
-    const std::string model_name_ctx =
-        "nv_execution_provider_compile_large_" + test_name + "_ctx.onnx";
-    const std::string model_name_ctx_data =
-        "nv_execution_provider_compile_large_" + test_name + "_ctx.onnx_data";
+    const std::string model_name = "nv_execution_provider_compile_large_" + test_name + ".onnx";
+    const std::string external_data_name = "nv_execution_provider_compile_large_" + test_name + ".onnx_data";
+    const std::string model_name_ctx = "nv_execution_provider_compile_large_" + test_name + "_ctx.onnx";
+    const std::string model_name_ctx_data = "nv_execution_provider_compile_large_" + test_name + "_ctx.onnx_data";
     clearFileIfExists(model_name_ctx);
     clearFileIfExists(model_name_ctx_data);
 
     // Reuse the model across test iterations for speed.
-    if (!std::filesystem::exists(model_name) ||
-        !std::filesystem::exists(external_data_name)) {
+    if (!std::filesystem::exists(model_name) || !std::filesystem::exists(external_data_name))
+    {
         model_builder::CreateLargeModel(model_name, external_data_name);
     }
 
     Ort::SessionOptions session_options;
     AppendTrtRtxEp(session_options,
                    {{"nv_use_external_data_initializer",
-                     std::to_string(test_param.bytestream_io ||
-                                    test_param.external_initializer_for_parser)}});
+                     std::to_string(test_param.bytestream_io || test_param.external_initializer_for_parser)}});
 
     Ort::ModelCompilationOptions compile_opts(*ort_env, session_options);
     compile_opts.SetEpContextEmbedMode(test_param.embed_mode);
@@ -322,115 +334,106 @@ TEST_P(CompileApiTest, LargeModel) {
     std::vector<char*> ext_file_buffers;
     std::vector<size_t> ext_lengths;
 
-    if (test_param.bytestream_io) {
+    if (test_param.bytestream_io)
+    {
         input_onnx = readBinaryFile(model_name);
         input_data = readBinaryFile(external_data_name);
         // "location" stored in the ONNX model is the filename only (see
         // CreateLargeModel). Match that here so ORT can resolve the mapping.
         const auto filename = std::filesystem::path(external_data_name).filename();
-        ext_file_names   = {toOrtString(filename)};
+        ext_file_names = {toOrtString(filename)};
         ext_file_buffers = {input_data.data()};
-        ext_lengths      = {input_data.size()};
-        session_options.AddExternalInitializersFromFilesInMemory(
-            ext_file_names, ext_file_buffers, ext_lengths);
+        ext_lengths = {input_data.size()};
+        session_options.AddExternalInitializersFromFilesInMemory(ext_file_names, ext_file_buffers, ext_lengths);
 
         compile_opts.SetInputModelFromBuffer(input_onnx.data(), input_onnx.size());
-        compile_opts.SetOutputModelBuffer(
-            Ort::AllocatorWithDefaultOptions(), &output_context, &output_context_size);
-    } else {
+        compile_opts.SetOutputModelBuffer(Ort::AllocatorWithDefaultOptions(), &output_context, &output_context_size);
+    }
+    else
+    {
         compile_opts.SetInputModelPath(toOrtString(model_name).c_str());
         compile_opts.SetOutputModelPath(toOrtString(model_name_ctx).c_str());
-        compile_opts.SetOutputModelExternalInitializersFile(
-            toOrtString(model_name_ctx_data).c_str(), 1024);
+        compile_opts.SetOutputModelExternalInitializersFile(toOrtString(model_name_ctx_data).c_str(), 1024);
     }
 
     ASSERT_TRUE(Ort::CompileModel(*ort_env, compile_opts).IsOK());
 
     // JIT: load compiled model and run inference
     std::unique_ptr<Ort::Session> session;
-    if (test_param.bytestream_io) {
-        session = std::make_unique<Ort::Session>(
-            *ort_env, output_context, output_context_size, session_options);
-    } else {
-        session = std::make_unique<Ort::Session>(
-            *ort_env, toOrtString(model_name_ctx).c_str(), session_options);
+    if (test_param.bytestream_io)
+    {
+        session = std::make_unique<Ort::Session>(*ort_env, output_context, output_context_size, session_options);
+    }
+    else
+    {
+        session = std::make_unique<Ort::Session>(*ort_env, toOrtString(model_name_ctx).c_str(), session_options);
     }
 
     auto io_binding = generate_io_binding(*session);
     Ort::RunOptions run_options;
     session->Run(run_options, io_binding);
 
-    if (output_context != nullptr) {
+    if (output_context != nullptr)
+    {
         Ort::AllocatorWithDefaultOptions().Free(output_context);
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    TensorRTRTXEpTest_EpContext, CompileApiTest,
-    ::testing::Values(
-        CompileParam{true, false},
-        CompileParam{false, false},
-        CompileParam{true, true},
-        CompileParam{false, true},
-        CompileParam{true, true, true},
-        CompileParam{true, false, true}),
-    [](const ::testing::TestParamInfo<CompileApiTest::ParamType>& info) {
-        return info.param.to_string();
-    });
+INSTANTIATE_TEST_SUITE_P(TensorRTRTXEpTest_EpContext, CompileApiTest,
+                         ::testing::Values(CompileParam{true, false}, CompileParam{false, false},
+                                           CompileParam{true, true}, CompileParam{false, true},
+                                           CompileParam{true, true, true}, CompileParam{true, false, true}),
+                         [](const ::testing::TestParamInfo<CompileApiTest::ParamType>& info)
+                         {
+                             return info.param.to_string();
+                         });
 
 // Validates the runtime split-graph path for lowered asymmetric DQ:
 //   * the constant-weight DequantizeLinear(zp != 0) + MatMul region stays on TRT-RTX
 //   * FastGelu is intentionally excluded from TRT-RTX and executes on CPU
 //   * the final output still matches a CPU-side golden reference for the full graph
-TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricDqMatMulPreservesSplitGraph) {
-    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty())
-        << "No TRT RTX EP devices found.";
+TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricDqMatMulPreservesSplitGraph)
+{
+    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
 
-    const std::string model_path =
-        "ep_context_lowered_asymmetric_dq_fast_gelu.onnx";
+    const std::string model_path = "ep_context_lowered_asymmetric_dq_fast_gelu.onnx";
     clearFileIfExists(model_path);
 
-    model_builder::CreateAsymmetricDqMatMulFastGeluModel(
-        model_path, "LoweredAsymmetricDqFastGeluGraph");
+    model_builder::CreateAsymmetricDqMatMulFastGeluModel(model_path, "LoweredAsymmetricDqFastGeluGraph");
 
     Ort::SessionOptions session_options;
     // FastGelu is intentionally kept on CPU so this test can validate a stable
     // mixed-partition graph: the asymmetric DQ+MatMul region on TRT-RTX and
     // FastGelu on CPU.
     AppendTrtRtxEp(session_options, {{"nv_op_types_to_exclude", "FastGelu"}});
-    const std::filesystem::path profile_prefix =
-        "ep_context_lowered_asymmetric_dq_fast_gelu_profile";
+    const std::filesystem::path profile_prefix = "ep_context_lowered_asymmetric_dq_fast_gelu_profile";
     session_options.EnableProfiling(toOrtString(profile_prefix).c_str());
 
     Ort::Session session(*ort_env, toOrtString(model_path).c_str(), session_options);
     Ort::RunOptions run_options;
 
     const std::vector<int64_t> input_shape = {2, 3};
-    const std::vector<float> input_data = {
-        1.0f, 2.0f, -1.0f,
-        0.5f, -0.25f, 3.0f};
-    const std::vector<float> expected_output =
-        ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput(input_data);
+    const std::vector<float> input_data = {1.0f, 2.0f, -1.0f, 0.5f, -0.25f, 3.0f};
+    const std::vector<float> expected_output = ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput(input_data);
 
     Ort::AllocatorWithDefaultOptions allocator;
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        allocator.GetInfo(), const_cast<float*>(input_data.data()), input_data.size(),
-        input_shape.data(), input_shape.size());
+    Ort::Value input_tensor =
+        Ort::Value::CreateTensor<float>(allocator.GetInfo(), const_cast<float*>(input_data.data()), input_data.size(),
+                                        input_shape.data(), input_shape.size());
     const char* input_names[] = {"X"};
     const char* output_names[] = {"O"};
 
     std::vector<Ort::Value> outputs;
-    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, &input_tensor,
-                                          1, output_names, 1));
+    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, &input_tensor, 1, output_names, 1));
     ASSERT_EQ(outputs.size(), 1u);
     ASSERT_TRUE(outputs[0].IsTensor());
 
     const auto output_info = outputs[0].GetTensorTypeAndShapeInfo();
     EXPECT_EQ(output_info.GetElementCount(), expected_output.size());
     const float* output_data = outputs[0].GetTensorData<float>();
-    for (size_t i = 0; i < expected_output.size(); ++i) {
-        EXPECT_NEAR(output_data[i], expected_output[i], 1e-5f)
-            << "Mismatch at output index " << i;
+    for (size_t i = 0; i < expected_output.size(); ++i)
+    {
+        EXPECT_NEAR(output_data[i], expected_output[i], 1e-5f) << "Mismatch at output index " << i;
     }
 
     auto profile_path_alloc = session.EndProfilingAllocated(allocator);
@@ -442,8 +445,7 @@ TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricDqMatMulPreservesSplitGraph) 
 
     const std::string profile = readTextFile(profile_path);
 
-    EXPECT_NE(profile.find("FastGelu"), std::string::npos)
-        << "Expected FastGelu to appear in ORT profiling output";
+    EXPECT_NE(profile.find("FastGelu"), std::string::npos) << "Expected FastGelu to appear in ORT profiling output";
     EXPECT_NE(profile.find("CPUExecutionProvider"), std::string::npos)
         << "Expected CPUExecutionProvider to appear in ORT profiling output";
     EXPECT_NE(profile.find(kEpName), std::string::npos)
@@ -454,55 +456,48 @@ TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricDqMatMulPreservesSplitGraph) 
 //   * the QuantizeLinear/DequantizeLinear + MatMul region stays on TRT-RTX
 //   * FastGelu is intentionally excluded from TRT-RTX and executes on CPU
 //   * the final output still matches a CPU-side golden reference for the full graph
-TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricQdqMatMulPreservesSplitGraph) {
-    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty())
-        << "No TRT RTX EP devices found.";
+TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricQdqMatMulPreservesSplitGraph)
+{
+    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
 
-    const std::string model_path =
-        "ep_context_lowered_asymmetric_qdq_fast_gelu.onnx";
+    const std::string model_path = "ep_context_lowered_asymmetric_qdq_fast_gelu.onnx";
     clearFileIfExists(model_path);
 
-    model_builder::CreateAsymmetricQdqMatMulFastGeluModel(
-        model_path, "LoweredAsymmetricQdqFastGeluGraph");
+    model_builder::CreateAsymmetricQdqMatMulFastGeluModel(model_path, "LoweredAsymmetricQdqFastGeluGraph");
 
     Ort::SessionOptions session_options;
     // FastGelu is intentionally kept on CPU so this test can validate a stable
     // mixed-partition graph: the asymmetric Q/DQ + MatMul region on TRT-RTX and
     // FastGelu on CPU.
     AppendTrtRtxEp(session_options, {{"nv_op_types_to_exclude", "FastGelu"}});
-    const std::filesystem::path profile_prefix =
-        "ep_context_lowered_asymmetric_qdq_fast_gelu_profile";
+    const std::filesystem::path profile_prefix = "ep_context_lowered_asymmetric_qdq_fast_gelu_profile";
     session_options.EnableProfiling(toOrtString(profile_prefix).c_str());
 
     Ort::Session session(*ort_env, toOrtString(model_path).c_str(), session_options);
     Ort::RunOptions run_options;
 
     const std::vector<int64_t> input_shape = {2, 3};
-    const std::vector<float> input_data = {
-        1.10f, -0.35f, 2.30f,
-       -1.70f,  0.40f, 0.95f};
-    const std::vector<float> expected_output =
-        ComputeExpectedLoweredAsymmetricQdqMatMulFastGeluOutput(input_data);
+    const std::vector<float> input_data = {1.10f, -0.35f, 2.30f, -1.70f, 0.40f, 0.95f};
+    const std::vector<float> expected_output = ComputeExpectedLoweredAsymmetricQdqMatMulFastGeluOutput(input_data);
 
     Ort::AllocatorWithDefaultOptions allocator;
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        allocator.GetInfo(), const_cast<float*>(input_data.data()),
-        input_data.size(), input_shape.data(), input_shape.size());
+    Ort::Value input_tensor =
+        Ort::Value::CreateTensor<float>(allocator.GetInfo(), const_cast<float*>(input_data.data()), input_data.size(),
+                                        input_shape.data(), input_shape.size());
     const char* input_names[] = {"X"};
     const char* output_names[] = {"O"};
 
     std::vector<Ort::Value> outputs;
-    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, &input_tensor,
-                                          1, output_names, 1));
+    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, &input_tensor, 1, output_names, 1));
     ASSERT_EQ(outputs.size(), 1u);
     ASSERT_TRUE(outputs[0].IsTensor());
 
     const auto output_info = outputs[0].GetTensorTypeAndShapeInfo();
     EXPECT_EQ(output_info.GetElementCount(), expected_output.size());
     const float* output_data = outputs[0].GetTensorData<float>();
-    for (size_t i = 0; i < expected_output.size(); ++i) {
-        EXPECT_NEAR(output_data[i], expected_output[i], 1e-5f)
-            << "Mismatch at output index " << i;
+    for (size_t i = 0; i < expected_output.size(); ++i)
+    {
+        EXPECT_NEAR(output_data[i], expected_output[i], 1e-5f) << "Mismatch at output index " << i;
     }
 
     auto profile_path_alloc = session.EndProfilingAllocated(allocator);
@@ -514,8 +509,7 @@ TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricQdqMatMulPreservesSplitGraph)
 
     const std::string profile = readTextFile(profile_path);
 
-    EXPECT_NE(profile.find("FastGelu"), std::string::npos)
-        << "Expected FastGelu to appear in ORT profiling output";
+    EXPECT_NE(profile.find("FastGelu"), std::string::npos) << "Expected FastGelu to appear in ORT profiling output";
     EXPECT_NE(profile.find("CPUExecutionProvider"), std::string::npos)
         << "Expected CPUExecutionProvider to appear in ORT profiling output";
     EXPECT_NE(profile.find(kEpName), std::string::npos)
@@ -526,24 +520,19 @@ TEST(TensorRTRTXEpTest_EpContext, LoweredAsymmetricQdqMatMulPreservesSplitGraph)
 //   * compiling with TRT-RTX produces a mixed model that preserves EPContext + FastGelu
 //   * loading the compiled model keeps the TRT-RTX / CPU split intact at runtime
 //   * the final output still matches the same CPU-side golden reference
-TEST(TensorRTRTXEpTest_EpContext,
-     CompileLoweredAsymmetricDqMatMulPreservesSplitGraphAndOutput) {
-    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty())
-        << "No TRT RTX EP devices found.";
+TEST(TensorRTRTXEpTest_EpContext, CompileLoweredAsymmetricDqMatMulPreservesSplitGraphAndOutput)
+{
+    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
 
-    const std::string model_path =
-        "ep_context_compile_lowered_asymmetric_dq_fast_gelu.onnx";
-    const std::string compiled_model_path =
-        "ep_context_compile_lowered_asymmetric_dq_fast_gelu_ctx.onnx";
+    const std::string model_path = "ep_context_compile_lowered_asymmetric_dq_fast_gelu.onnx";
+    const std::string compiled_model_path = "ep_context_compile_lowered_asymmetric_dq_fast_gelu_ctx.onnx";
     clearFileIfExists(model_path);
     clearFileIfExists(compiled_model_path);
 
-    model_builder::CreateAsymmetricDqMatMulFastGeluModel(
-        model_path, "CompileLoweredAsymmetricDqFastGeluGraph");
+    model_builder::CreateAsymmetricDqMatMulFastGeluModel(model_path, "CompileLoweredAsymmetricDqFastGeluGraph");
 
     Ort::SessionOptions compile_session_options;
-    AppendTrtRtxEp(compile_session_options,
-                   {{"nv_op_types_to_exclude", "FastGelu"}});
+    AppendTrtRtxEp(compile_session_options, {{"nv_op_types_to_exclude", "FastGelu"}});
 
     Ort::ModelCompilationOptions compile_opts(*ort_env, compile_session_options);
     compile_opts.SetEpContextEmbedMode(true);
@@ -565,40 +554,34 @@ TEST(TensorRTRTXEpTest_EpContext,
 
     Ort::SessionOptions load_session_options;
     AppendTrtRtxEp(load_session_options, {{"nv_op_types_to_exclude", "FastGelu"}});
-    const std::filesystem::path profile_prefix =
-        "ep_context_compile_lowered_asymmetric_dq_fast_gelu_profile";
+    const std::filesystem::path profile_prefix = "ep_context_compile_lowered_asymmetric_dq_fast_gelu_profile";
     load_session_options.EnableProfiling(toOrtString(profile_prefix).c_str());
 
-    Ort::Session session(*ort_env, toOrtString(compiled_model_path).c_str(),
-                         load_session_options);
+    Ort::Session session(*ort_env, toOrtString(compiled_model_path).c_str(), load_session_options);
     Ort::RunOptions run_options;
 
     const std::vector<int64_t> input_shape = {2, 3};
-    const std::vector<float> input_data = {
-        1.0f, 2.0f, -1.0f,
-        0.5f, -0.25f, 3.0f};
-    const std::vector<float> expected_output =
-        ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput(input_data);
+    const std::vector<float> input_data = {1.0f, 2.0f, -1.0f, 0.5f, -0.25f, 3.0f};
+    const std::vector<float> expected_output = ComputeExpectedLoweredAsymmetricDqMatMulFastGeluOutput(input_data);
 
     Ort::AllocatorWithDefaultOptions allocator;
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        allocator.GetInfo(), const_cast<float*>(input_data.data()), input_data.size(),
-        input_shape.data(), input_shape.size());
+    Ort::Value input_tensor =
+        Ort::Value::CreateTensor<float>(allocator.GetInfo(), const_cast<float*>(input_data.data()), input_data.size(),
+                                        input_shape.data(), input_shape.size());
     const char* input_names[] = {"X"};
     const char* output_names[] = {"O"};
 
     std::vector<Ort::Value> outputs;
-    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, &input_tensor,
-                                          1, output_names, 1));
+    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, &input_tensor, 1, output_names, 1));
     ASSERT_EQ(outputs.size(), 1u);
     ASSERT_TRUE(outputs[0].IsTensor());
 
     const auto output_info = outputs[0].GetTensorTypeAndShapeInfo();
     EXPECT_EQ(output_info.GetElementCount(), expected_output.size());
     const float* output_data = outputs[0].GetTensorData<float>();
-    for (size_t i = 0; i < expected_output.size(); ++i) {
-        EXPECT_NEAR(output_data[i], expected_output[i], 1e-5f)
-            << "Mismatch at output index " << i;
+    for (size_t i = 0; i < expected_output.size(); ++i)
+    {
+        EXPECT_NEAR(output_data[i], expected_output[i], 1e-5f) << "Mismatch at output index " << i;
     }
 
     auto profile_path_alloc = session.EndProfilingAllocated(allocator);
@@ -609,12 +592,165 @@ TEST(TensorRTRTXEpTest_EpContext,
         << "Profiling output not found at: " << profile_path.string();
 
     const std::string profile = readTextFile(profile_path);
-    EXPECT_NE(profile.find("FastGelu"), std::string::npos)
-        << "Expected FastGelu to appear in ORT profiling output";
+    EXPECT_NE(profile.find("FastGelu"), std::string::npos) << "Expected FastGelu to appear in ORT profiling output";
     EXPECT_NE(profile.find("CPUExecutionProvider"), std::string::npos)
         << "Expected CPUExecutionProvider to appear in ORT profiling output";
     EXPECT_NE(profile.find(kEpName), std::string::npos)
         << "Expected NvTensorRTRTXExecutionProvider to appear in ORT profiling output";
+}
+
+// =============================================================================
+// compile_only_mode validation (ORT >= 1.27)
+//
+// On ORT 1.27+, CompileModel() internally sets kOrtSessionOptionCompileOnly="1"
+// on the throwaway compile session.  The TRT RTX EP reads this flag and skips
+// GPU deserialization (deserializeCudaEngine) and execution context creation
+// (createExecutionContext) during compilation, eliminating the double GPU JIT.
+//
+// This test verifies the full path end-to-end:
+//   CompileModel() [compile_only_mode active internally]
+//     → EPContext model saved to disk
+//     → Session loaded from EPContext model
+//     → Inference produces numerically correct output
+//
+// The numerical check ensures compile_only_mode did not corrupt the serialized
+// engine: a corrupted engine would either fail to load or produce wrong outputs.
+//
+// A VERBOSE log-capture attached to the compile-session's user logging function
+// asserts that the EP actually reached the compile-only stub-return path — not
+// just that CompileModel() returned OK. The EP emits a distinctive VERBOSE line
+// "[NvTensorRTRTX EP] Compile-only session..." on this path (see the graph and
+// precompiled-engine branches of the compile-only gate in the EP source).
+// =============================================================================
+
+namespace
+{
+
+constexpr const char* kCompileOnlyLogMarker = "Compile-only session";
+
+struct CompileOnlyLogCapture
+{
+    mutable std::mutex mutex;
+    std::vector<std::string> messages;
+};
+
+void ORT_API_CALL CaptureCompileOnlyLog(void* param, OrtLoggingLevel /*severity*/, const char* /*category*/,
+                                        const char* /*logid*/, const char* /*code_location*/, const char* message)
+{
+    if (param == nullptr || message == nullptr || std::strstr(message, kCompileOnlyLogMarker) == nullptr)
+    {
+        return;
+    }
+    auto* capture = static_cast<CompileOnlyLogCapture*>(param);
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    capture->messages.emplace_back(message);
+}
+
+void AttachCompileOnlyLogCapture(Ort::SessionOptions& session_options, CompileOnlyLogCapture& capture)
+{
+    session_options.SetLogSeverityLevel(ORT_LOGGING_LEVEL_VERBOSE);
+    Ort::ThrowOnError(Ort::GetApi().SetUserLoggingFunction(session_options, CaptureCompileOnlyLog, &capture));
+}
+
+}  // namespace
+
+TEST(TensorRTRTXEpTest_EpContext, CompileOnlyMode_CompileThenLoadProducesCorrectOutput)
+{
+    if (!ort_runtime_at_least(1, 27))
+    {
+        GTEST_SKIP() << "ORT < 1.27 does not set kOrtSessionOptionCompileOnly in "
+                        "CompileModel(); compile_only_mode optimization not exercised.";
+    }
+    ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
+
+    const std::string model_path = "compile_only_mode_source.onnx";
+    const std::string ctx_path = "compile_only_mode_ctx.onnx";
+    clearFileIfExists(model_path);
+    clearFileIfExists(ctx_path);
+
+    // Fully TRT-compilable Add-chain (no FastGelu):
+    //   O = ((X + Y) + Z) + S
+    // All ops land in one EPContext partition → single EPContext node expected.
+    model_builder::CreateBaseModel(model_path, "CompileOnlyModeGraph", {1, 3, 2});
+
+    // Step 1: CompileModel() — ORT internally activates compile_only_mode.
+    // Attach a VERBOSE log capture so we can assert the EP actually took the
+    // compile-only stub-return path, not just that CompileModel() returned OK.
+    Ort::SessionOptions compile_so;
+    AppendTrtRtxEp(compile_so);
+    CompileOnlyLogCapture compile_only_log;
+    AttachCompileOnlyLogCapture(compile_so, compile_only_log);
+
+    Ort::ModelCompilationOptions compile_opts(*ort_env, compile_so);
+    compile_opts.SetEpContextEmbedMode(true);
+    compile_opts.SetInputModelPath(toOrtString(model_path).c_str());
+    compile_opts.SetOutputModelPath(toOrtString(ctx_path).c_str());
+
+    ASSERT_TRUE(Ort::CompileModel(*ort_env, compile_opts).IsOK()) << "CompileModel() failed.";
+    ASSERT_TRUE(std::filesystem::is_regular_file(ctx_path)) << "EPContext model not written to: " << ctx_path;
+
+    // Assert the EP actually took the compile-only stub-return path. Without
+    // this check the test would silently pass even if the internal flag were
+    // never propagated to the EP and full GPU deserialization ran.
+    {
+        std::lock_guard<std::mutex> lock(compile_only_log.mutex);
+        ASSERT_FALSE(compile_only_log.messages.empty())
+            << "Expected at least one VERBOSE log matching \"" << kCompileOnlyLogMarker
+            << "\" from the TRT RTX EP during CompileModel(); the EP did not "
+               "appear to take the compile-only stub-return path.";
+    }
+
+    const onnx::ModelProto compiled = readOnnxModel(ctx_path);
+    EXPECT_GE(countNodesByOpType(compiled.graph(), "EPContext"), 1u)
+        << "Compiled model should contain at least one EPContext node.";
+
+    // Step 2: Load EPContext and run inference with known non-zero inputs.
+    Ort::SessionOptions load_so;
+    AppendTrtRtxEp(load_so);
+    Ort::Session session(*ort_env, toOrtString(ctx_path).c_str(), load_so);
+    Ort::RunOptions run_options;
+
+    // Input tensors (shape {1,3,2}) and scalar S (shape {1}).
+    // CPU reference: O[i] = X[i] + Y[i] + Z[i] + S[0]
+    const std::vector<int64_t> tensor_shape = {1, 3, 2};
+    const std::vector<int64_t> scalar_shape = {1};
+    const std::vector<float> X_data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const std::vector<float> Y_data = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+    const std::vector<float> Z_data = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+    const std::vector<float> S_data = {1.0f};
+    // expected[i] = X[i] + Y[i] + Z[i] + 1.0
+    const std::vector<float> expected = {2.6f, 3.7f, 4.8f, 5.9f, 7.0f, 8.1f};
+
+    Ort::AllocatorWithDefaultOptions alloc;
+    auto make_tensor = [&](const std::vector<float>& data, const std::vector<int64_t>& shape)
+    {
+        return Ort::Value::CreateTensor<float>(alloc.GetInfo(), const_cast<float*>(data.data()), data.size(),
+                                               shape.data(), shape.size());
+    };
+
+    std::vector<Ort::Value> inputs;
+    inputs.push_back(make_tensor(X_data, tensor_shape));
+    inputs.push_back(make_tensor(Y_data, tensor_shape));
+    inputs.push_back(make_tensor(Z_data, tensor_shape));
+    inputs.push_back(make_tensor(S_data, scalar_shape));
+
+    const char* input_names[] = {"X", "Y", "Z", "S"};
+    const char* output_names[] = {"O"};
+
+    std::vector<Ort::Value> outputs;
+    ASSERT_NO_THROW(outputs = session.Run(run_options, input_names, inputs.data(), 4, output_names, 1))
+        << "Inference on EPContext model compiled via compile_only_mode failed.";
+    ASSERT_EQ(outputs.size(), 1u);
+    ASSERT_TRUE(outputs[0].IsTensor());
+
+    const auto out_info = outputs[0].GetTensorTypeAndShapeInfo();
+    ASSERT_EQ(out_info.GetElementCount(), expected.size());
+    const float* out_data = outputs[0].GetTensorData<float>();
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_NEAR(out_data[i], expected[i], 1e-3f)
+            << "Output mismatch at index " << i << " — compile_only_mode may have corrupted the serialized engine.";
+    }
 }
 
 // =============================================================================
@@ -626,21 +762,22 @@ TEST(TensorRTRTXEpTest_EpContext,
 //   * still claims EPContext nodes with no "source" attribute (backward compat).
 // =============================================================================
 
-TEST(TensorRTRTXEpTest_EpContext, EPContextNode_ForeignSourceSkipped) {
+TEST(TensorRTRTXEpTest_EpContext, EPContextNode_ForeignSourceSkipped)
+{
     ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty());
     const std::string model_path = "ep_context_foreign_source_nv.onnx";
-    model_builder::CreateSyntheticEPContextModel(
-        model_path, "OpenVINOExecutionProvider");
+    model_builder::CreateSyntheticEPContextModel(model_path, "OpenVINOExecutionProvider");
 
     Ort::SessionOptions session_options;
     AppendTrtRtxEp(session_options);
 
-    try {
-        Ort::Session session(*ort_env, toOrtString(model_path).c_str(),
-                             session_options);
-        FAIL()
-            << "Expected session creation to fail for EPContext node with foreign source";
-    } catch (const Ort::Exception& e) {
+    try
+    {
+        Ort::Session session(*ort_env, toOrtString(model_path).c_str(), session_options);
+        FAIL() << "Expected session creation to fail for EPContext node with foreign source";
+    }
+    catch (const Ort::Exception& e)
+    {
         const std::string error_msg = e.what();
         EXPECT_TRUE(error_msg.find("EPContext") != std::string::npos)
             << "Error should mention EPContext. Actual: " << error_msg;
@@ -649,21 +786,22 @@ TEST(TensorRTRTXEpTest_EpContext, EPContextNode_ForeignSourceSkipped) {
     std::filesystem::remove(model_path);
 }
 
-TEST(TensorRTRTXEpTest_EpContext, EPContextNode_ClassicTrtSourceSkipped) {
+TEST(TensorRTRTXEpTest_EpContext, EPContextNode_ClassicTrtSourceSkipped)
+{
     ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty());
     const std::string model_path = "ep_context_classic_trt_source_nv.onnx";
-    model_builder::CreateSyntheticEPContextModel(
-        model_path, "TensorrtExecutionProvider");
+    model_builder::CreateSyntheticEPContextModel(model_path, "TensorrtExecutionProvider");
 
     Ort::SessionOptions session_options;
     AppendTrtRtxEp(session_options);
 
-    try {
-        Ort::Session session(*ort_env, toOrtString(model_path).c_str(),
-                             session_options);
-        FAIL()
-            << "Expected session creation to fail for EPContext node with classic TRT source";
-    } catch (const Ort::Exception& e) {
+    try
+    {
+        Ort::Session session(*ort_env, toOrtString(model_path).c_str(), session_options);
+        FAIL() << "Expected session creation to fail for EPContext node with classic TRT source";
+    }
+    catch (const Ort::Exception& e)
+    {
         const std::string error_msg = e.what();
         EXPECT_TRUE(error_msg.find("EPContext") != std::string::npos)
             << "Error should mention EPContext. Actual: " << error_msg;
@@ -672,25 +810,26 @@ TEST(TensorRTRTXEpTest_EpContext, EPContextNode_ClassicTrtSourceSkipped) {
     std::filesystem::remove(model_path);
 }
 
-TEST(TensorRTRTXEpTest_EpContext, EPContextNode_NoSourceAttribute_BackwardCompat) {
+TEST(TensorRTRTXEpTest_EpContext, EPContextNode_NoSourceAttribute_BackwardCompat)
+{
     ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty());
     const std::string model_path = "ep_context_no_source_nv.onnx";
-    model_builder::CreateSyntheticEPContextModel(
-        model_path, /*source_attr=*/"", /*include_source_attr=*/false);
+    model_builder::CreateSyntheticEPContextModel(model_path, /*source_attr=*/"", /*include_source_attr=*/false);
 
     Ort::SessionOptions session_options;
     AppendTrtRtxEp(session_options);
 
-    try {
-        Ort::Session session(*ort_env, toOrtString(model_path).c_str(),
-                             session_options);
+    try
+    {
+        Ort::Session session(*ort_env, toOrtString(model_path).c_str(), session_options);
         // If session creation succeeds, backward compatibility is working.
-    } catch (const Ort::Exception& e) {
+    }
+    catch (const Ort::Exception& e)
+    {
         const std::string error_msg = e.what();
         // Failure must NOT be "not compatible with any execution provider",
         // which would indicate the node was never claimed by the EP.
-        EXPECT_TRUE(error_msg.find("is not compatible with any execution provider")
-                    == std::string::npos)
+        EXPECT_TRUE(error_msg.find("is not compatible with any execution provider") == std::string::npos)
             << "Legacy EPContext node without source should still be claimed by EP. "
             << "Error: " << error_msg;
     }

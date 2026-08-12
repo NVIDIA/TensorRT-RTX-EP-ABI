@@ -286,7 +286,7 @@ fi
 # Step 4: BUILD PYTHON WHEEL
 # ============================================================================
 if [[ "$DO_BUILD_WHEEL" -eq 1 ]]; then
-    # Locate python/ — prefer inside trt-rtx-ep-abi/ (final repo layout),
+    # Locate python/ — prefer inside TensorRT-RTX-EP-ABI/ (final repo layout),
     # fall back to sibling directory (workspace layout during development)
     if [[ -f "$SOURCE_DIR/python/pyproject.toml" ]]; then
         PYTHON_DIR="$SOURCE_DIR/python"

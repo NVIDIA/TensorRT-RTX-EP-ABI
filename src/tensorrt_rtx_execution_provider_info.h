@@ -29,6 +29,7 @@ struct TensorrtRtxExecutionProviderInfo
     int device_id{0};
     bool has_user_compute_stream{false};
     void* user_compute_stream{nullptr};
+    void* user_aux_stream_array{nullptr};
     int max_partition_iterations{1000};
     int min_subgraph_size{1};
     size_t max_workspace_size{0};
@@ -59,8 +60,18 @@ struct TensorrtRtxExecutionProviderInfo
     bool dump_ep_context_model{false};
     std::string ep_context_file_path{""};
     int ep_context_embed_mode{0};
+    // Set internally by OrtCompileAPI::CompileModel(). When true, the EP skips GPU
+    // deserialization and execution context creation since the session will not run inference.
+    bool compile_only_mode{false};
     std::string engine_cache_prefix{""};
     std::string op_types_to_exclude{""};
+    bool enable_profiling{false};
+    std::string profiling_output_file{""};
+    // When true, install a synchronous GpuSyncAllocator (cudaMalloc/cudaFree) on the TRT RTX
+    // runtime/builder via setGpuAllocator, bypassing TRT RTX's default cudaMallocAsync path.
+    // Defaults to false to preserve current (async) behavior.
+    bool use_sync_gpu_allocator{false};
+    int64_t multi_rotary_cache_concat_offset{0};
 
     static TensorrtRtxExecutionProviderInfo FromProviderOptions(const ProviderOptions& options);
 };

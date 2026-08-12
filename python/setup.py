@@ -23,6 +23,7 @@ _cuda_major = os.environ.get("NV_CUDA_MAJOR", "").strip()
 _PLAT_TAG = {
     ("Windows", "x86_64"): "win_amd64",
     ("Windows", "AMD64"):  "win_amd64",
+    ("Windows", "ARM64"):  "win_arm64",
     ("Linux",   "x86_64"): "linux_x86_64",
 }
 
@@ -52,6 +53,11 @@ class bdist_wheel(_bdist_wheel):
     """No Python ABI coupling — only packaged binaries + pure Python helpers."""
 
     def get_tag(self):
+        # NV_TARGET_PLAT lets build.bat override the tag when cross-compiling
+        # (e.g. building win_arm64 on an x64 host where platform.machine()=="AMD64").
+        env_plat = os.environ.get("NV_TARGET_PLAT", "").strip()
+        if env_plat:
+            return "py3", "none", env_plat
         system = platform.system()
         machine = platform.machine()
         plat = _PLAT_TAG.get((system, machine))

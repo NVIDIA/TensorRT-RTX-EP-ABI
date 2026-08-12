@@ -29,7 +29,6 @@
 //     *never* drops a node on the floor.
 
 #include "qdq_lowering.h"
-#include "proto_node_id_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +41,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "proto_node_id_utils.h"
 
 namespace trt_rtx_ep
 {
@@ -300,24 +301,24 @@ size_t GetTensorElementSize(int32_t data_type)
 {
     switch (data_type)
     {
-        case onnx::TensorProto_DataType_FLOAT:
-        case onnx::TensorProto_DataType_INT32:
-        case onnx::TensorProto_DataType_UINT32:
-            return 4;
-        case onnx::TensorProto_DataType_DOUBLE:
-        case onnx::TensorProto_DataType_INT64:
-        case onnx::TensorProto_DataType_UINT64:
-            return 8;
-        case onnx::TensorProto_DataType_FLOAT16:
-        case onnx::TensorProto_DataType_BFLOAT16:
-        case onnx::TensorProto_DataType_INT16:
-        case onnx::TensorProto_DataType_UINT16:
-            return 2;
-        case onnx::TensorProto_DataType_INT8:
-        case onnx::TensorProto_DataType_UINT8:
-            return 1;
-        default:
-            return 0;
+    case onnx::TensorProto_DataType_FLOAT:
+    case onnx::TensorProto_DataType_INT32:
+    case onnx::TensorProto_DataType_UINT32:
+        return 4;
+    case onnx::TensorProto_DataType_DOUBLE:
+    case onnx::TensorProto_DataType_INT64:
+    case onnx::TensorProto_DataType_UINT64:
+        return 8;
+    case onnx::TensorProto_DataType_FLOAT16:
+    case onnx::TensorProto_DataType_BFLOAT16:
+    case onnx::TensorProto_DataType_INT16:
+    case onnx::TensorProto_DataType_UINT16:
+        return 2;
+    case onnx::TensorProto_DataType_INT8:
+    case onnx::TensorProto_DataType_UINT8:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -392,104 +393,104 @@ bool PackTensorFromTypedFields(const onnx::TensorProto& tensor, TensorDataView& 
 
     switch (tensor.data_type())
     {
-        case onnx::TensorProto_DataType_FLOAT:
-            if (static_cast<size_t>(tensor.float_data_size()) == element_count)
-            {
-                return CopyTypedValues<float>(tensor.float_data().data(), element_count, data_view.owned_bytes);
-            }
-            break;
-        case onnx::TensorProto_DataType_DOUBLE:
-            if (static_cast<size_t>(tensor.double_data_size()) == element_count)
-            {
-                return CopyTypedValues<double>(tensor.double_data().data(), element_count, data_view.owned_bytes);
-            }
-            break;
-        case onnx::TensorProto_DataType_INT64:
-            if (static_cast<size_t>(tensor.int64_data_size()) == element_count)
-            {
-                return CopyTypedValues<int64_t>(tensor.int64_data().data(), element_count, data_view.owned_bytes);
-            }
-            break;
-        case onnx::TensorProto_DataType_UINT64:
-            if (static_cast<size_t>(tensor.uint64_data_size()) == element_count)
-            {
-                return CopyTypedValues<uint64_t>(tensor.uint64_data().data(), element_count, data_view.owned_bytes);
-            }
-            break;
-        case onnx::TensorProto_DataType_FLOAT16:
-        case onnx::TensorProto_DataType_BFLOAT16:
-        case onnx::TensorProto_DataType_INT8:
-        case onnx::TensorProto_DataType_UINT8:
-        case onnx::TensorProto_DataType_INT16:
-        case onnx::TensorProto_DataType_UINT16:
-        case onnx::TensorProto_DataType_INT32:
+    case onnx::TensorProto_DataType_FLOAT:
+        if (static_cast<size_t>(tensor.float_data_size()) == element_count)
         {
-            if (static_cast<size_t>(tensor.int32_data_size()) != element_count)
+            return CopyTypedValues<float>(tensor.float_data().data(), element_count, data_view.owned_bytes);
+        }
+        break;
+    case onnx::TensorProto_DataType_DOUBLE:
+        if (static_cast<size_t>(tensor.double_data_size()) == element_count)
+        {
+            return CopyTypedValues<double>(tensor.double_data().data(), element_count, data_view.owned_bytes);
+        }
+        break;
+    case onnx::TensorProto_DataType_INT64:
+        if (static_cast<size_t>(tensor.int64_data_size()) == element_count)
+        {
+            return CopyTypedValues<int64_t>(tensor.int64_data().data(), element_count, data_view.owned_bytes);
+        }
+        break;
+    case onnx::TensorProto_DataType_UINT64:
+        if (static_cast<size_t>(tensor.uint64_data_size()) == element_count)
+        {
+            return CopyTypedValues<uint64_t>(tensor.uint64_data().data(), element_count, data_view.owned_bytes);
+        }
+        break;
+    case onnx::TensorProto_DataType_FLOAT16:
+    case onnx::TensorProto_DataType_BFLOAT16:
+    case onnx::TensorProto_DataType_INT8:
+    case onnx::TensorProto_DataType_UINT8:
+    case onnx::TensorProto_DataType_INT16:
+    case onnx::TensorProto_DataType_UINT16:
+    case onnx::TensorProto_DataType_INT32:
+    {
+        if (static_cast<size_t>(tensor.int32_data_size()) != element_count)
+        {
+            break;
+        }
+        data_view.owned_bytes.resize(element_count * GetTensorElementSize(tensor.data_type()));
+        for (size_t i = 0; i < element_count; ++i)
+        {
+            const int32_t value = tensor.int32_data(static_cast<int>(i));
+            switch (tensor.data_type())
             {
+            case onnx::TensorProto_DataType_FLOAT16:
+            case onnx::TensorProto_DataType_BFLOAT16:
+            {
+                const uint16_t narrowed = static_cast<uint16_t>(value & 0xffff);
+                std::memcpy(data_view.owned_bytes.data() + i * sizeof(uint16_t), &narrowed, sizeof(uint16_t));
                 break;
             }
-            data_view.owned_bytes.resize(element_count * GetTensorElementSize(tensor.data_type()));
+            case onnx::TensorProto_DataType_INT8:
+            {
+                const int8_t narrowed = static_cast<int8_t>(value);
+                std::memcpy(data_view.owned_bytes.data() + i, &narrowed, sizeof(narrowed));
+                break;
+            }
+            case onnx::TensorProto_DataType_UINT8:
+            {
+                const uint8_t narrowed = static_cast<uint8_t>(value);
+                std::memcpy(data_view.owned_bytes.data() + i, &narrowed, sizeof(narrowed));
+                break;
+            }
+            case onnx::TensorProto_DataType_INT16:
+            {
+                const int16_t narrowed = static_cast<int16_t>(value);
+                std::memcpy(data_view.owned_bytes.data() + i * sizeof(int16_t), &narrowed, sizeof(narrowed));
+                break;
+            }
+            case onnx::TensorProto_DataType_UINT16:
+            {
+                const uint16_t narrowed = static_cast<uint16_t>(value);
+                std::memcpy(data_view.owned_bytes.data() + i * sizeof(uint16_t), &narrowed, sizeof(narrowed));
+                break;
+            }
+            case onnx::TensorProto_DataType_INT32:
+            {
+                std::memcpy(data_view.owned_bytes.data() + i * sizeof(int32_t), &value, sizeof(value));
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        break;
+    }
+    case onnx::TensorProto_DataType_UINT32:
+        if (static_cast<size_t>(tensor.uint64_data_size()) == element_count)
+        {
+            data_view.owned_bytes.resize(element_count * sizeof(uint32_t));
             for (size_t i = 0; i < element_count; ++i)
             {
-                const int32_t value = tensor.int32_data(static_cast<int>(i));
-                switch (tensor.data_type())
-                {
-                    case onnx::TensorProto_DataType_FLOAT16:
-                    case onnx::TensorProto_DataType_BFLOAT16:
-                    {
-                        const uint16_t narrowed = static_cast<uint16_t>(value & 0xffff);
-                        std::memcpy(data_view.owned_bytes.data() + i * sizeof(uint16_t), &narrowed, sizeof(uint16_t));
-                        break;
-                    }
-                    case onnx::TensorProto_DataType_INT8:
-                    {
-                        const int8_t narrowed = static_cast<int8_t>(value);
-                        std::memcpy(data_view.owned_bytes.data() + i, &narrowed, sizeof(narrowed));
-                        break;
-                    }
-                    case onnx::TensorProto_DataType_UINT8:
-                    {
-                        const uint8_t narrowed = static_cast<uint8_t>(value);
-                        std::memcpy(data_view.owned_bytes.data() + i, &narrowed, sizeof(narrowed));
-                        break;
-                    }
-                    case onnx::TensorProto_DataType_INT16:
-                    {
-                        const int16_t narrowed = static_cast<int16_t>(value);
-                        std::memcpy(data_view.owned_bytes.data() + i * sizeof(int16_t), &narrowed, sizeof(narrowed));
-                        break;
-                    }
-                    case onnx::TensorProto_DataType_UINT16:
-                    {
-                        const uint16_t narrowed = static_cast<uint16_t>(value);
-                        std::memcpy(data_view.owned_bytes.data() + i * sizeof(uint16_t), &narrowed, sizeof(narrowed));
-                        break;
-                    }
-                    case onnx::TensorProto_DataType_INT32:
-                    {
-                        std::memcpy(data_view.owned_bytes.data() + i * sizeof(int32_t), &value, sizeof(value));
-                        break;
-                    }
-                    default:
-                        break;
-                }
+                const uint32_t value = static_cast<uint32_t>(tensor.uint64_data(static_cast<int>(i)));
+                std::memcpy(data_view.owned_bytes.data() + i * sizeof(uint32_t), &value, sizeof(value));
             }
             break;
         }
-        case onnx::TensorProto_DataType_UINT32:
-            if (static_cast<size_t>(tensor.uint64_data_size()) == element_count)
-            {
-                data_view.owned_bytes.resize(element_count * sizeof(uint32_t));
-                for (size_t i = 0; i < element_count; ++i)
-                {
-                    const uint32_t value = static_cast<uint32_t>(tensor.uint64_data(static_cast<int>(i)));
-                    std::memcpy(data_view.owned_bytes.data() + i * sizeof(uint32_t), &value, sizeof(value));
-                }
-                break;
-            }
-            return false;
-        default:
-            return false;
+        return false;
+    default:
+        return false;
     }
 
     if (data_view.owned_bytes.empty())
@@ -594,30 +595,30 @@ bool TensorHasAnyNonZeroValue(const onnx::TensorProto& tensor)
     const size_t element_count = GetTensorElementCount(tensor);
     switch (tensor.data_type())
     {
-        case onnx::TensorProto_DataType_INT8:
-            return TensorBytesHaveAnyNonZero<int8_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_UINT8:
-            return TensorBytesHaveAnyNonZero<uint8_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_INT16:
-            return TensorBytesHaveAnyNonZero<int16_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_UINT16:
-        case onnx::TensorProto_DataType_FLOAT16:
-        case onnx::TensorProto_DataType_BFLOAT16:
-            return TensorBytesHaveAnyNonZero<uint16_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_INT32:
-            return TensorBytesHaveAnyNonZero<int32_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_UINT32:
-            return TensorBytesHaveAnyNonZero<uint32_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_INT64:
-            return TensorBytesHaveAnyNonZero<int64_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_UINT64:
-            return TensorBytesHaveAnyNonZero<uint64_t>(data_view, element_count);
-        case onnx::TensorProto_DataType_FLOAT:
-            return TensorBytesHaveAnyNonZero<float>(data_view, element_count);
-        case onnx::TensorProto_DataType_DOUBLE:
-            return TensorBytesHaveAnyNonZero<double>(data_view, element_count);
-        default:
-            return false;
+    case onnx::TensorProto_DataType_INT8:
+        return TensorBytesHaveAnyNonZero<int8_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_UINT8:
+        return TensorBytesHaveAnyNonZero<uint8_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_INT16:
+        return TensorBytesHaveAnyNonZero<int16_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_UINT16:
+    case onnx::TensorProto_DataType_FLOAT16:
+    case onnx::TensorProto_DataType_BFLOAT16:
+        return TensorBytesHaveAnyNonZero<uint16_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_INT32:
+        return TensorBytesHaveAnyNonZero<int32_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_UINT32:
+        return TensorBytesHaveAnyNonZero<uint32_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_INT64:
+        return TensorBytesHaveAnyNonZero<int64_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_UINT64:
+        return TensorBytesHaveAnyNonZero<uint64_t>(data_view, element_count);
+    case onnx::TensorProto_DataType_FLOAT:
+        return TensorBytesHaveAnyNonZero<float>(data_view, element_count);
+    case onnx::TensorProto_DataType_DOUBLE:
+        return TensorBytesHaveAnyNonZero<double>(data_view, element_count);
+    default:
+        return false;
     }
 }
 
@@ -657,56 +658,56 @@ void SetScalarInitializerData(onnx::TensorProto& tensor_proto, int32_t data_type
     tensor_proto.set_data_location(onnx::TensorProto_DataLocation_DEFAULT);
     switch (data_type)
     {
-        case onnx::TensorProto_DataType_INT8:
-        {
-            const int8_t value = static_cast<int8_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_UINT8:
-        {
-            const uint8_t value = static_cast<uint8_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_INT16:
-        {
-            const int16_t value = static_cast<int16_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_UINT16:
-        {
-            const uint16_t value = static_cast<uint16_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_INT32:
-        {
-            const int32_t value = static_cast<int32_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_UINT32:
-        {
-            const uint32_t value = static_cast<uint32_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_INT64:
-        {
-            const int64_t value = int_value;
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        case onnx::TensorProto_DataType_UINT64:
-        {
-            const uint64_t value = static_cast<uint64_t>(int_value);
-            tensor_proto.set_raw_data(&value, sizeof(value));
-            break;
-        }
-        default:
-            break;
+    case onnx::TensorProto_DataType_INT8:
+    {
+        const int8_t value = static_cast<int8_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_UINT8:
+    {
+        const uint8_t value = static_cast<uint8_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_INT16:
+    {
+        const int16_t value = static_cast<int16_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_UINT16:
+    {
+        const uint16_t value = static_cast<uint16_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_INT32:
+    {
+        const int32_t value = static_cast<int32_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_UINT32:
+    {
+        const uint32_t value = static_cast<uint32_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_INT64:
+    {
+        const int64_t value = int_value;
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    case onnx::TensorProto_DataType_UINT64:
+    {
+        const uint64_t value = static_cast<uint64_t>(int_value);
+        tensor_proto.set_raw_data(&value, sizeof(value));
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -811,56 +812,63 @@ bool TryReadIntegerTensorData(const onnx::TensorProto& tensor, std::vector<int64
     values.resize(element_count);
     switch (tensor.data_type())
     {
-        case onnx::TensorProto_DataType_INT8:
-        {
-            const auto* source = static_cast<const int8_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = source[i];
-            return true;
-        }
-        case onnx::TensorProto_DataType_UINT8:
-        {
-            const auto* source = static_cast<const uint8_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = source[i];
-            return true;
-        }
-        case onnx::TensorProto_DataType_INT16:
-        {
-            const auto* source = static_cast<const int16_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = source[i];
-            return true;
-        }
-        case onnx::TensorProto_DataType_UINT16:
-        {
-            const auto* source = static_cast<const uint16_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = source[i];
-            return true;
-        }
-        case onnx::TensorProto_DataType_INT32:
-        {
-            const auto* source = static_cast<const int32_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = source[i];
-            return true;
-        }
-        case onnx::TensorProto_DataType_UINT32:
-        {
-            const auto* source = static_cast<const uint32_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = static_cast<int64_t>(source[i]);
-            return true;
-        }
-        case onnx::TensorProto_DataType_INT64:
-        {
-            const auto* source = static_cast<const int64_t*>(data_view.data);
-            values.assign(source, source + element_count);
-            return true;
-        }
-        case onnx::TensorProto_DataType_UINT64:
-        {
-            const auto* source = static_cast<const uint64_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = static_cast<int64_t>(source[i]);
-            return true;
-        }
-        default:
-            return false;
+    case onnx::TensorProto_DataType_INT8:
+    {
+        const auto* source = static_cast<const int8_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = source[i];
+        return true;
+    }
+    case onnx::TensorProto_DataType_UINT8:
+    {
+        const auto* source = static_cast<const uint8_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = source[i];
+        return true;
+    }
+    case onnx::TensorProto_DataType_INT16:
+    {
+        const auto* source = static_cast<const int16_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = source[i];
+        return true;
+    }
+    case onnx::TensorProto_DataType_UINT16:
+    {
+        const auto* source = static_cast<const uint16_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = source[i];
+        return true;
+    }
+    case onnx::TensorProto_DataType_INT32:
+    {
+        const auto* source = static_cast<const int32_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = source[i];
+        return true;
+    }
+    case onnx::TensorProto_DataType_UINT32:
+    {
+        const auto* source = static_cast<const uint32_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = static_cast<int64_t>(source[i]);
+        return true;
+    }
+    case onnx::TensorProto_DataType_INT64:
+    {
+        const auto* source = static_cast<const int64_t*>(data_view.data);
+        values.assign(source, source + element_count);
+        return true;
+    }
+    case onnx::TensorProto_DataType_UINT64:
+    {
+        const auto* source = static_cast<const uint64_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = static_cast<int64_t>(source[i]);
+        return true;
+    }
+    default:
+        return false;
     }
 }
 
@@ -876,32 +884,35 @@ bool TryReadFloatingTensorData(const onnx::TensorProto& tensor, std::vector<doub
     values.resize(element_count);
     switch (tensor.data_type())
     {
-        case onnx::TensorProto_DataType_FLOAT:
-        {
-            const auto* source = static_cast<const float*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = static_cast<double>(source[i]);
-            return true;
-        }
-        case onnx::TensorProto_DataType_DOUBLE:
-        {
-            const auto* source = static_cast<const double*>(data_view.data);
-            values.assign(source, source + element_count);
-            return true;
-        }
-        case onnx::TensorProto_DataType_FLOAT16:
-        {
-            const auto* source = static_cast<const uint16_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = static_cast<double>(Float16BitsToFloat(source[i]));
-            return true;
-        }
-        case onnx::TensorProto_DataType_BFLOAT16:
-        {
-            const auto* source = static_cast<const uint16_t*>(data_view.data);
-            for (size_t i = 0; i < element_count; ++i) values[i] = static_cast<double>(BFloat16BitsToFloat(source[i]));
-            return true;
-        }
-        default:
-            return false;
+    case onnx::TensorProto_DataType_FLOAT:
+    {
+        const auto* source = static_cast<const float*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = static_cast<double>(source[i]);
+        return true;
+    }
+    case onnx::TensorProto_DataType_DOUBLE:
+    {
+        const auto* source = static_cast<const double*>(data_view.data);
+        values.assign(source, source + element_count);
+        return true;
+    }
+    case onnx::TensorProto_DataType_FLOAT16:
+    {
+        const auto* source = static_cast<const uint16_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = static_cast<double>(Float16BitsToFloat(source[i]));
+        return true;
+    }
+    case onnx::TensorProto_DataType_BFLOAT16:
+    {
+        const auto* source = static_cast<const uint16_t*>(data_view.data);
+        for (size_t i = 0; i < element_count; ++i)
+            values[i] = static_cast<double>(BFloat16BitsToFloat(source[i]));
+        return true;
+    }
+    default:
+        return false;
     }
 }
 
@@ -918,7 +929,11 @@ bool IsPositiveScaleTensor(const onnx::TensorProto& tensor)
     {
         return false;
     }
-    return std::all_of(values.begin(), values.end(), [](double value) { return value > 0.0 && std::isfinite(value); });
+    return std::all_of(values.begin(), values.end(),
+                       [](double value)
+                       {
+                           return value > 0.0 && std::isfinite(value);
+                       });
 }
 
 // Given a flat output element index, work out which flat index of the
@@ -1103,32 +1118,32 @@ bool TryGetQuantizedValueRange(int32_t data_type, int64_t& min_value, int64_t& m
 {
     switch (data_type)
     {
-        case onnx::TensorProto_DataType_INT8:
-            min_value = -128;
-            max_value = 127;
-            return true;
-        case onnx::TensorProto_DataType_UINT8:
-            min_value = 0;
-            max_value = 255;
-            return true;
-        case onnx::TensorProto_DataType_INT16:
-            min_value = std::numeric_limits<int16_t>::min();
-            max_value = std::numeric_limits<int16_t>::max();
-            return true;
-        case onnx::TensorProto_DataType_UINT16:
-            min_value = 0;
-            max_value = std::numeric_limits<uint16_t>::max();
-            return true;
-        case onnx::TensorProto_DataType_INT32:
-            min_value = std::numeric_limits<int32_t>::min();
-            max_value = std::numeric_limits<int32_t>::max();
-            return true;
-        case onnx::TensorProto_DataType_UINT32:
-            min_value = 0;
-            max_value = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
-            return true;
-        default:
-            return false;
+    case onnx::TensorProto_DataType_INT8:
+        min_value = -128;
+        max_value = 127;
+        return true;
+    case onnx::TensorProto_DataType_UINT8:
+        min_value = 0;
+        max_value = 255;
+        return true;
+    case onnx::TensorProto_DataType_INT16:
+        min_value = std::numeric_limits<int16_t>::min();
+        max_value = std::numeric_limits<int16_t>::max();
+        return true;
+    case onnx::TensorProto_DataType_UINT16:
+        min_value = 0;
+        max_value = std::numeric_limits<uint16_t>::max();
+        return true;
+    case onnx::TensorProto_DataType_INT32:
+        min_value = std::numeric_limits<int32_t>::min();
+        max_value = std::numeric_limits<int32_t>::max();
+        return true;
+    case onnx::TensorProto_DataType_UINT32:
+        min_value = 0;
+        max_value = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -1145,8 +1160,8 @@ bool TryGetQuantizedValueRange(int32_t data_type, int64_t& min_value, int64_t& m
 //     without any runtime cost.
 onnx::TensorProto* AddExpandedInitializer(onnx::GraphProto& graph, GraphIndex& index, const std::string& name,
                                           const onnx::TensorProto& source_tensor,
-                                          const std::vector<int64_t>& input_shape,
-                                          std::optional<int64_t> axis_attr, int64_t block_size)
+                                          const std::vector<int64_t>& input_shape, std::optional<int64_t> axis_attr,
+                                          int64_t block_size)
 {
     TensorDataView data_view;
     if (!TryGetTensorDataView(source_tensor, data_view))
@@ -1207,9 +1222,8 @@ onnx::TensorProto* AddExpandedInitializer(onnx::GraphProto& graph, GraphIndex& i
 //   * Full-rank parameter: accepted as-is only when rank matches input rank;
 //     unusual ONNX layouts fall through as "unsupported, keep native".
 bool MaybeAddAxisReshape(onnx::GraphProto& graph, GraphIndex& index,
-                         google::protobuf::RepeatedPtrField<onnx::NodeProto>& nodes,
-                         const onnx::NodeProto& source_node, const std::string& input_name,
-                         const std::string& base_name, std::optional<int64_t> input_rank,
+                         google::protobuf::RepeatedPtrField<onnx::NodeProto>& nodes, const onnx::NodeProto& source_node,
+                         const std::string& input_name, const std::string& base_name, std::optional<int64_t> input_rank,
                          std::optional<int64_t> axis_attr, const onnx::TensorProto& parameter_tensor,
                          int64_t block_size, size_t unique_id, std::string& broadcast_name)
 {
@@ -1234,7 +1248,8 @@ bool MaybeAddAxisReshape(onnx::GraphProto& graph, GraphIndex& index,
             return false;
         }
         const std::string expanded_name = MakeLoweredName(base_name, "expanded", unique_id);
-        if (AddExpandedInitializer(graph, index, expanded_name, parameter_tensor, input_shape, axis_attr, block_size) == nullptr)
+        if (AddExpandedInitializer(graph, index, expanded_name, parameter_tensor, input_shape, axis_attr, block_size) ==
+            nullptr)
         {
             return false;
         }
@@ -1302,8 +1317,7 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
 {
     // Only fp32/fp64 folding is safe; fp16/bf16 folding would lose precision
     // relative to what the runtime path would have produced.
-    if (arithmetic_type != onnx::TensorProto_DataType_FLOAT &&
-        arithmetic_type != onnx::TensorProto_DataType_DOUBLE)
+    if (arithmetic_type != onnx::TensorProto_DataType_FLOAT && arithmetic_type != onnx::TensorProto_DataType_DOUBLE)
     {
         return false;
     }
@@ -1347,8 +1361,10 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
             {
                 return false;
             }
-            const double zero_point = zero_point_tensor != nullptr ? static_cast<double>(zero_point_values[zero_index]) : 0.0;
-            output_values[i] = static_cast<float>((static_cast<double>(input_values[i]) - zero_point) * scale_values[scale_index]);
+            const double zero_point =
+                zero_point_tensor != nullptr ? static_cast<double>(zero_point_values[zero_index]) : 0.0;
+            output_values[i] =
+                static_cast<float>((static_cast<double>(input_values[i]) - zero_point) * scale_values[scale_index]);
         }
         tensor_proto->set_raw_data(output_values.data(), output_values.size() * sizeof(float));
     }
@@ -1368,7 +1384,8 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
             {
                 return false;
             }
-            const double zero_point = zero_point_tensor != nullptr ? static_cast<double>(zero_point_values[zero_index]) : 0.0;
+            const double zero_point =
+                zero_point_tensor != nullptr ? static_cast<double>(zero_point_values[zero_index]) : 0.0;
             output_values[i] = (static_cast<double>(input_values[i]) - zero_point) * scale_values[scale_index];
         }
         tensor_proto->set_raw_data(output_values.data(), output_values.size() * sizeof(double));
@@ -1396,13 +1413,13 @@ std::optional<int32_t> GetArithmeticTypeForScale(const onnx::TensorProto& scale_
 {
     switch (scale_tensor.data_type())
     {
-        case onnx::TensorProto_DataType_FLOAT:
-        case onnx::TensorProto_DataType_FLOAT16:
-        case onnx::TensorProto_DataType_BFLOAT16:
-        case onnx::TensorProto_DataType_DOUBLE:
-            return scale_tensor.data_type();
-        default:
-            return std::nullopt;
+    case onnx::TensorProto_DataType_FLOAT:
+    case onnx::TensorProto_DataType_FLOAT16:
+    case onnx::TensorProto_DataType_BFLOAT16:
+    case onnx::TensorProto_DataType_DOUBLE:
+        return scale_tensor.data_type();
+    default:
+        return std::nullopt;
     }
 }
 
@@ -1465,11 +1482,11 @@ std::optional<int32_t> GetDequantizeIntegerMathType(int32_t input_type)
 {
     switch (input_type)
     {
-        case onnx::TensorProto_DataType_INT32:
-        case onnx::TensorProto_DataType_UINT32:
-            return onnx::TensorProto_DataType_INT64;
-        default:
-            return std::nullopt;
+    case onnx::TensorProto_DataType_INT32:
+    case onnx::TensorProto_DataType_UINT32:
+        return onnx::TensorProto_DataType_INT64;
+    default:
+        return std::nullopt;
     }
 }
 
@@ -1527,28 +1544,28 @@ std::string TensorDataTypeToString(int32_t data_type)
 {
     switch (data_type)
     {
-        case onnx::TensorProto_DataType_INT8:
-            return "int8";
-        case onnx::TensorProto_DataType_UINT8:
-            return "uint8";
-        case onnx::TensorProto_DataType_INT16:
-            return "int16";
-        case onnx::TensorProto_DataType_UINT16:
-            return "uint16";
-        case onnx::TensorProto_DataType_INT32:
-            return "int32";
-        case onnx::TensorProto_DataType_UINT32:
-            return "uint32";
-        case onnx::TensorProto_DataType_FLOAT16:
-            return "float16";
-        case onnx::TensorProto_DataType_BFLOAT16:
-            return "bfloat16";
-        case onnx::TensorProto_DataType_FLOAT:
-            return "float32";
-        case onnx::TensorProto_DataType_DOUBLE:
-            return "float64";
-        default:
-            return std::to_string(data_type);
+    case onnx::TensorProto_DataType_INT8:
+        return "int8";
+    case onnx::TensorProto_DataType_UINT8:
+        return "uint8";
+    case onnx::TensorProto_DataType_INT16:
+        return "int16";
+    case onnx::TensorProto_DataType_UINT16:
+        return "uint16";
+    case onnx::TensorProto_DataType_INT32:
+        return "int32";
+    case onnx::TensorProto_DataType_UINT32:
+        return "uint32";
+    case onnx::TensorProto_DataType_FLOAT16:
+        return "float16";
+    case onnx::TensorProto_DataType_BFLOAT16:
+        return "bfloat16";
+    case onnx::TensorProto_DataType_FLOAT:
+        return "float32";
+    case onnx::TensorProto_DataType_DOUBLE:
+        return "float64";
+    default:
+        return std::to_string(data_type);
     }
 }
 
@@ -1630,7 +1647,8 @@ QdqLoweringDecision EvaluateBaseQuantizeLowering(const onnx::NodeProto& node, co
     const auto* zero_point_tensor =
         (node.input_size() > 2 && !node.input(2).empty()) ? index.FindInitializer(node.input(2)) : nullptr;
 
-    int32_t output_type = zero_point_tensor != nullptr ? zero_point_tensor->data_type() : onnx::TensorProto_DataType_UINT8;
+    int32_t output_type =
+        zero_point_tensor != nullptr ? zero_point_tensor->data_type() : onnx::TensorProto_DataType_UINT8;
     if (zero_point_tensor == nullptr)
     {
         if (auto output_dtype = FindIntAttribute(node, "output_dtype"))
@@ -1818,7 +1836,8 @@ QdqLoweringDecision EvaluateDequantizeLowering(const onnx::NodeProto& node, cons
     const auto* anchor = FindSingleConsumerAnchor(node, index);
     if (anchor == nullptr)
     {
-        base_decision.reason = "keep native symmetric constant DequantizeLinear because there is no single compute anchor";
+        base_decision.reason =
+            "keep native symmetric constant DequantizeLinear because there is no single compute anchor";
         return base_decision;
     }
 
@@ -1829,8 +1848,8 @@ QdqLoweringDecision EvaluateDequantizeLowering(const onnx::NodeProto& node, cons
                           "' because " + harmonization_reason};
     }
 
-    base_decision.reason = "keep native symmetric constant DequantizeLinear because anchor '" + NodeDisplayName(*anchor) +
-                           "' has no sibling Q/DQ path that must lower";
+    base_decision.reason = "keep native symmetric constant DequantizeLinear because anchor '" +
+                           NodeDisplayName(*anchor) + "' has no sibling Q/DQ path that must lower";
     return base_decision;
 }
 
@@ -1846,7 +1865,7 @@ QdqLoweringDecision EvaluateDequantizeLowering(const onnx::NodeProto& node, cons
 //       These ranges are modeled exactly by our arithmetic (with the fp32
 //       promotion from GetQuantizeArithmeticType for the 16-bit cases).
 bool ShouldLowerQuantizeLinear(const onnx::NodeProto& node, const onnx::TensorProto& scale_tensor,
-                                const onnx::TensorProto* zero_point_tensor, int32_t output_type)
+                               const onnx::TensorProto* zero_point_tensor, int32_t output_type)
 {
     (void)node;
     (void)scale_tensor;
@@ -1951,9 +1970,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             {
                 // Constant DQ is folded to a float initializer plus a trivial Identity so the
                 // lowered graph still exposes the original tensor name to downstream nodes.
-                if (TryFoldConstantDequantizeLinear(graph, index, lowered_nodes, node, *input_initializer, *scale_tensor,
-                                                    zero_point_tensor, *arithmetic_type, axis_attr, block_size, unique_id,
-                                                    lowered_qdq_info))
+                if (TryFoldConstantDequantizeLinear(graph, index, lowered_nodes, node, *input_initializer,
+                                                    *scale_tensor, zero_point_tensor, *arithmetic_type, axis_attr,
+                                                    block_size, unique_id, lowered_qdq_info))
                 {
                     ++lowered_qdq_info.lowered_node_count;
                     continue;
@@ -1969,7 +1988,7 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             //
             //   x_q -- Cast(input_math_type)
             //       -- Sub(Cast(zp))
-            //       -- Cast(arithmetic_type)? 
+            //       -- Cast(arithmetic_type)?
             //       -- Mul(scale)
             //       --> y_f
             //
@@ -1980,8 +1999,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
 
             ++unique_id;
             if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
-                                     MakeLoweredName(node_base, "scale", unique_id), index.FindTensorRank(node.input(0)),
-                                     axis_attr, *scale_tensor, block_size, unique_id, lowered_scale_name))
+                                     MakeLoweredName(node_base, "scale", unique_id),
+                                     index.FindTensorRank(node.input(0)), axis_attr, *scale_tensor, block_size,
+                                     unique_id, lowered_scale_name))
             {
                 *lowered_nodes.Add() = node;
                 continue;
@@ -1992,17 +2012,19 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                 if (NeedsPromotedZeroPoint(zero_point_tensor->data_type()))
                 {
                     lowered_zero_name = MakeLoweredName(node_base, "zero_promoted", ++unique_id);
-                    if (AddPromotedIntegerInitializer(graph, index, lowered_zero_name, *zero_point_tensor,
-                                                      GetPromotedZeroPointType(zero_point_tensor->data_type(), *arithmetic_type)) == nullptr)
+                    if (AddPromotedIntegerInitializer(
+                            graph, index, lowered_zero_name, *zero_point_tensor,
+                            GetPromotedZeroPointType(zero_point_tensor->data_type(), *arithmetic_type)) == nullptr)
                     {
                         *lowered_nodes.Add() = node;
                         continue;
                     }
                 }
                 ++unique_id;
-                if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_zero_name,
-                                         MakeLoweredName(node_base, "zero", unique_id), index.FindTensorRank(node.input(0)),
-                                         axis_attr, *index.FindInitializer(lowered_zero_name), block_size, unique_id, lowered_zero_name))
+                if (!MaybeAddAxisReshape(
+                        graph, index, lowered_nodes, node, lowered_zero_name,
+                        MakeLoweredName(node_base, "zero", unique_id), index.FindTensorRank(node.input(0)), axis_attr,
+                        *index.FindInitializer(lowered_zero_name), block_size, unique_id, lowered_zero_name))
                 {
                     *lowered_nodes.Add() = node;
                     continue;
@@ -2059,7 +2081,8 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
 
         if (node.op_type() == "QuantizeLinear")
         {
-            int32_t output_type = zero_point_tensor != nullptr ? zero_point_tensor->data_type() : onnx::TensorProto_DataType_UINT8;
+            int32_t output_type =
+                zero_point_tensor != nullptr ? zero_point_tensor->data_type() : onnx::TensorProto_DataType_UINT8;
             if (zero_point_tensor == nullptr)
             {
                 if (auto output_dtype = FindIntAttribute(node, "output_dtype"))
@@ -2105,8 +2128,9 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                 std::string lowered_zero_name = zero_point_tensor != nullptr ? node.input(2) : std::string();
                 ++unique_id;
                 if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
-                                         MakeLoweredName(node_base, "scale", unique_id), index.FindTensorRank(node.input(0)),
-                                         axis_attr, *scale_tensor, block_size, unique_id, lowered_scale_name))
+                                         MakeLoweredName(node_base, "scale", unique_id),
+                                         index.FindTensorRank(node.input(0)), axis_attr, *scale_tensor, block_size,
+                                         unique_id, lowered_scale_name))
                 {
                     *lowered_nodes.Add() = node;
                     continue;
@@ -2130,9 +2154,10 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                     if (NeedsPromotedZeroPoint(zero_point_tensor->data_type()))
                     {
                         lowered_zero_name = MakeLoweredName(node_base, "zero_promoted", ++unique_id);
-                        if (AddPromotedIntegerInitializer(graph, index, lowered_zero_name, *zero_point_tensor,
-                                                          GetPromotedZeroPointType(zero_point_tensor->data_type(),
-                                                                                   *quantize_arithmetic_type)) == nullptr)
+                        if (AddPromotedIntegerInitializer(
+                                graph, index, lowered_zero_name, *zero_point_tensor,
+                                GetPromotedZeroPointType(zero_point_tensor->data_type(), *quantize_arithmetic_type)) ==
+                            nullptr)
                         {
                             *lowered_nodes.Add() = node;
                             continue;
@@ -2140,8 +2165,10 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                     }
                     ++unique_id;
                     if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_zero_name,
-                                             MakeLoweredName(node_base, "zero", unique_id), index.FindTensorRank(node.input(0)),
-                                             axis_attr, *index.FindInitializer(lowered_zero_name), block_size, unique_id, lowered_zero_name))
+                                             MakeLoweredName(node_base, "zero", unique_id),
+                                             index.FindTensorRank(node.input(0)), axis_attr,
+                                             *index.FindInitializer(lowered_zero_name), block_size, unique_id,
+                                             lowered_zero_name))
                     {
                         *lowered_nodes.Add() = node;
                         continue;
@@ -2179,12 +2206,12 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                 }
 
                 const std::string rounded_name = MakeLoweredName(node_base, "rounded", ++unique_id);
-                AppendNode(lowered_nodes, node, "Round", MakeLoweredName(node_base, "round", unique_id),
-                           {shifted_name}, {rounded_name});
+                AppendNode(lowered_nodes, node, "Round", MakeLoweredName(node_base, "round", unique_id), {shifted_name},
+                           {rounded_name});
 
-                const int32_t qrange_constant_type =
-                    output_type == onnx::TensorProto_DataType_UINT32 ? onnx::TensorProto_DataType_INT64
-                                                                     : onnx::TensorProto_DataType_INT32;
+                const int32_t qrange_constant_type = output_type == onnx::TensorProto_DataType_UINT32
+                                                         ? onnx::TensorProto_DataType_INT64
+                                                         : onnx::TensorProto_DataType_INT32;
                 const std::string qmin_name = MakeLoweredName(node_base, "qmin", ++unique_id);
                 const std::string qmax_name = MakeLoweredName(node_base, "qmax", ++unique_id);
                 AddScalarInitializer(graph, index, qmin_name, qrange_constant_type, qmin);

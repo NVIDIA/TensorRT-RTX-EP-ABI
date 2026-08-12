@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "qdq_lowering.h"
 
 namespace trt_rtx_ep
@@ -19,6 +21,14 @@ namespace trt_rtx_ep
 //      -inf/+inf.
 //   4. Pooling dilation compatibility for static, zero-padding AveragePool /
 //      MaxPool cases TRT-RTX rejects natively.
-LoweredQdqInfo RunTensorRtProtoPreprocessing(onnx::ModelProto& model_proto);
+//   5. Optional long-rope rotary cache offset propagation for TRT-RTX
+//      attention plugins.
+struct TensorRtProtoPreprocessingOptions
+{
+    int64_t multi_rotary_cache_concat_offset = 0;
+};
+
+LoweredQdqInfo RunTensorRtProtoPreprocessing(onnx::ModelProto& model_proto,
+                                             const TensorRtProtoPreprocessingOptions& options = {});
 
 }  // namespace trt_rtx_ep

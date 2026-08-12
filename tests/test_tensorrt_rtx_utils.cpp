@@ -26,8 +26,10 @@
 #ifdef NVTX
 #include <nvtx3/nvtx3.hpp>
 #else
-namespace nvtx3 {
-struct scoped_range {
+namespace nvtx3
+{
+struct scoped_range
+{
     explicit scoped_range(const char*) {}
     explicit scoped_range(const std::string&) {}
 };
@@ -38,30 +40,33 @@ struct scoped_range {
 // Session inspection
 // =============================================================================
 
-void describe_session(Ort::Session& session) {
+void describe_session(Ort::Session& session)
+{
     Ort::AllocatorWithDefaultOptions cpu_alloc;
 
     const auto input_count = session.GetInputCount();
     std::cout << "Input count: " << input_count << "\n";
-    for (size_t i = 0; i < input_count; ++i) {
-        auto name  = session.GetInputNameAllocated(i, cpu_alloc);
+    for (size_t i = 0; i < input_count; ++i)
+    {
+        auto name = session.GetInputNameAllocated(i, cpu_alloc);
         auto type_info = session.GetInputTypeInfo(i);
         auto info = type_info.GetTensorTypeAndShapeInfo();
-        std::cout << "  [" << i << "] " << name.get()
-                  << "  dtype=" << info.GetElementType() << "  shape=[ ";
-        for (auto s : info.GetShape()) std::cout << s << " ";
+        std::cout << "  [" << i << "] " << name.get() << "  dtype=" << info.GetElementType() << "  shape=[ ";
+        for (auto s : info.GetShape())
+            std::cout << s << " ";
         std::cout << "]\n";
     }
 
     const auto output_count = session.GetOutputCount();
     std::cout << "Output count: " << output_count << "\n";
-    for (size_t i = 0; i < output_count; ++i) {
-        auto name  = session.GetOutputNameAllocated(i, cpu_alloc);
+    for (size_t i = 0; i < output_count; ++i)
+    {
+        auto name = session.GetOutputNameAllocated(i, cpu_alloc);
         auto type_info = session.GetOutputTypeInfo(i);
         auto info = type_info.GetTensorTypeAndShapeInfo();
-        std::cout << "  [" << i << "] " << name.get()
-                  << "  dtype=" << info.GetElementType() << "  shape=[ ";
-        for (auto s : info.GetShape()) std::cout << s << " ";
+        std::cout << "  [" << i << "] " << name.get() << "  dtype=" << info.GetElementType() << "  shape=[ ";
+        for (auto s : info.GetShape())
+            std::cout << s << " ";
         std::cout << "]\n";
     }
 }
@@ -70,27 +75,42 @@ void describe_session(Ort::Session& session) {
 // Type / size helpers
 // =============================================================================
 
-size_t ONNXDtypeToBytes(ONNXTensorElementDataType t) {
-    switch (t) {
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:   return sizeof(float);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:  return sizeof(double);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:   return sizeof(uint8_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:    return sizeof(int8_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:  return sizeof(uint16_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:   return sizeof(int16_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return sizeof(uint16_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:   return sizeof(int32_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:  return sizeof(uint32_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:   return sizeof(int64_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:  return sizeof(uint64_t);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:    return sizeof(bool);
-        default:
-            std::cerr << "ONNXDtypeToBytes: unexpected dtype " << t << "\n";
-            return 0;
+size_t ONNXDtypeToBytes(ONNXTensorElementDataType t)
+{
+    switch (t)
+    {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+        return sizeof(float);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+        return sizeof(double);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        return sizeof(uint8_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+        return sizeof(int8_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+        return sizeof(uint16_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+        return sizeof(int16_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        return sizeof(uint16_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+        return sizeof(int32_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+        return sizeof(uint32_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+        return sizeof(int64_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+        return sizeof(uint64_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+        return sizeof(bool);
+    default:
+        std::cerr << "ONNXDtypeToBytes: unexpected dtype " << t << "\n";
+        return 0;
     }
 }
 
-size_t ORTValueToBytes(const Ort::Value& value) {
+size_t ORTValueToBytes(const Ort::Value& value)
+{
     auto info = value.GetTensorTypeAndShapeInfo();
     return info.GetElementCount() * ONNXDtypeToBytes(info.GetElementType());
 }
@@ -99,7 +119,8 @@ size_t ORTValueToBytes(const Ort::Value& value) {
 // run_with_cpu_bindings
 // =============================================================================
 
-void run_with_cpu_bindings(Ort::Session& session, int iterations) {
+void run_with_cpu_bindings(Ort::Session& session, int iterations)
+{
     Ort::AllocatorWithDefaultOptions cpu_alloc;
     Ort::IoBinding io_binding(session);
 
@@ -111,17 +132,16 @@ void run_with_cpu_bindings(Ort::Session& session, int iterations) {
     output_values_flop.reserve(output_count);
     output_values_flip.reserve(output_count);
 
-    for (size_t i = 0; i < output_count; ++i) {
-        auto name  = session.GetOutputNameAllocated(i, cpu_alloc);
-        auto info  = session.GetOutputTypeInfo(i);
+    for (size_t i = 0; i < output_count; ++i)
+    {
+        auto name = session.GetOutputNameAllocated(i, cpu_alloc);
+        auto info = session.GetOutputTypeInfo(i);
         auto shape_info = info.GetTensorTypeAndShapeInfo();
         auto type = shape_info.GetElementType();
         output_values_flop.emplace_back(
-            Ort::Value::CreateTensor(cpu_alloc, shape_info.GetShape().data(),
-                                     shape_info.GetShape().size(), type));
-        output_values_flip.emplace_back(
-            Ort::Value::CreateTensor(cpu_alloc, shape_info.GetShape().data(),
-                                     shape_info.GetShape().size(), shape_info.GetElementType()));
+            Ort::Value::CreateTensor(cpu_alloc, shape_info.GetShape().data(), shape_info.GetShape().size(), type));
+        output_values_flip.emplace_back(Ort::Value::CreateTensor(
+            cpu_alloc, shape_info.GetShape().data(), shape_info.GetShape().size(), shape_info.GetElementType()));
         io_binding.BindOutput(name.get(), output_values_flop.back());
         output_names.emplace_back(name.get());
     }
@@ -131,17 +151,18 @@ void run_with_cpu_bindings(Ort::Session& session, int iterations) {
         nvtx3::scoped_range r{"cpu bindings"};
         auto start = std::chrono::high_resolution_clock::now();
 
-        for (int i = 0; i < iterations; ++i) {
+        for (int i = 0; i < iterations; ++i)
+        {
             // Re-bind inputs every iteration (zero-filled)
             const auto input_count = session.GetInputCount();
-            for (size_t in = 0; in < input_count; ++in) {
-                auto name  = session.GetInputNameAllocated(in, cpu_alloc);
-                auto info  = session.GetInputTypeInfo(in);
+            for (size_t in = 0; in < input_count; ++in)
+            {
+                auto name = session.GetInputNameAllocated(in, cpu_alloc);
+                auto info = session.GetInputTypeInfo(in);
                 auto shape_info = info.GetTensorTypeAndShapeInfo();
                 auto type = shape_info.GetElementType();
-                auto val   = Ort::Value::CreateTensor(
-                    cpu_alloc, shape_info.GetShape().data(),
-                    shape_info.GetShape().size(), type);
+                auto val = Ort::Value::CreateTensor(cpu_alloc, shape_info.GetShape().data(),
+                                                    shape_info.GetShape().size(), type);
                 io_binding.BindInput(name.get(), val);
             }
 
@@ -150,10 +171,9 @@ void run_with_cpu_bindings(Ort::Session& session, int iterations) {
         }
 
         auto stop = std::chrono::high_resolution_clock::now();
-        auto us   = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
         std::cout << "CPU bindings per iteration [ms]: "
-                  << static_cast<float>(us) / static_cast<float>(iterations) / 1000.f
-                  << "\n";
+                  << static_cast<float>(us) / static_cast<float>(iterations) / 1000.f << "\n";
     }
     CUDA_CHECK(cudaProfilerStop());
 }
@@ -162,16 +182,14 @@ void run_with_cpu_bindings(Ort::Session& session, int iterations) {
 // run_with_gpu_bindings
 // =============================================================================
 
-void run_with_gpu_bindings(Ort::Session& session, int iterations,
-                           cudaStream_t stream) {
+void run_with_gpu_bindings(Ort::Session& session, int iterations, cudaStream_t stream)
+{
     const int device_id = 0;
 
-    Ort::MemoryInfo pinned_info("CudaPinned", OrtArenaAllocator, device_id,
-                                OrtMemTypeDefault);
+    Ort::MemoryInfo pinned_info("CudaPinned", OrtArenaAllocator, device_id, OrtMemTypeDefault);
     Ort::Allocator cpu_alloc(session, pinned_info);
 
-    Ort::MemoryInfo cuda_info("Cuda", OrtArenaAllocator, device_id,
-                              OrtMemTypeDefault);
+    Ort::MemoryInfo cuda_info("Cuda", OrtArenaAllocator, device_id, OrtMemTypeDefault);
     Ort::Allocator gpu_alloc(session, cuda_info);
     OrtAllocator* gpu = gpu_alloc;
 
@@ -188,14 +206,15 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
     out_flip.reserve(output_count);
 
     Ort::IoBinding io_binding(session);
-    for (size_t i = 0; i < output_count; ++i) {
+    for (size_t i = 0; i < output_count; ++i)
+    {
         auto name = session.GetOutputNameAllocated(i, cpu_alloc);
-        auto info  = session.GetOutputTypeInfo(i);
+        auto info = session.GetOutputTypeInfo(i);
         auto shape_info = info.GetTensorTypeAndShapeInfo();
-        out_flop.emplace_back(Ort::Value::CreateTensor(
-            gpu, shape_info.GetShape().data(), shape_info.GetShape().size(), shape_info.GetElementType()));
-        out_flip.emplace_back(Ort::Value::CreateTensor(
-            gpu, shape_info.GetShape().data(), shape_info.GetShape().size(), shape_info.GetElementType()));
+        out_flop.emplace_back(Ort::Value::CreateTensor(gpu, shape_info.GetShape().data(), shape_info.GetShape().size(),
+                                                       shape_info.GetElementType()));
+        out_flip.emplace_back(Ort::Value::CreateTensor(gpu, shape_info.GetShape().data(), shape_info.GetShape().size(),
+                                                       shape_info.GetElementType()));
         io_binding.BindOutput(name.get(), out_flop.back());
         output_names.emplace_back(name.get());
     }
@@ -206,22 +225,24 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
     in_gpu.reserve(input_count);
     in_cpu.reserve(input_count);
 
-    for (size_t i = 0; i < input_count; ++i) {
+    for (size_t i = 0; i < input_count; ++i)
+    {
         auto name = session.GetInputNameAllocated(i, cpu_alloc);
         auto type_info = session.GetInputTypeInfo(i);
         auto info = type_info.GetTensorTypeAndShapeInfo();
-        in_gpu.emplace_back(Ort::Value::CreateTensor(
-            gpu, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
-        in_cpu.emplace_back(Ort::Value::CreateTensor(
-            cpu_alloc, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
+        in_gpu.emplace_back(
+            Ort::Value::CreateTensor(gpu, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
+        in_cpu.emplace_back(
+            Ort::Value::CreateTensor(cpu_alloc, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
         io_binding.BindInput(name.get(), in_gpu.back());
     }
-    for (size_t i = 0; i < output_count; ++i) {
+    for (size_t i = 0; i < output_count; ++i)
+    {
         auto name = session.GetOutputNameAllocated(i, cpu_alloc);
         auto type_info = session.GetOutputTypeInfo(i);
         auto info = type_info.GetTensorTypeAndShapeInfo();
-        out_cpu.emplace_back(Ort::Value::CreateTensor(
-            cpu_alloc, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
+        out_cpu.emplace_back(
+            Ort::Value::CreateTensor(cpu_alloc, info.GetShape().data(), info.GetShape().size(), info.GetElementType()));
     }
 
     cudaEvent_t ev_infer, ev_infer_cpu, ev_upload;
@@ -236,24 +257,24 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
         nvtx3::scoped_range r{"gpu bindings"};
         auto start = std::chrono::high_resolution_clock::now();
 
-        for (int i = 0; i < iterations; ++i) {
+        for (int i = 0; i < iterations; ++i)
+        {
             auto& out_current = (i % 2) ? out_flip : out_flop;
             const std::string label = (i % 2) ? "flip" : "flop";
 
             // Upload inputs
             {
                 nvtx3::scoped_range ru{"upload"};
-                for (size_t in = 0; in < in_gpu.size(); ++in) {
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        in_gpu[in].GetTensorMutableRawData(),
-                        in_cpu[in].GetTensorRawData(),
-                        ORTValueToBytes(in_gpu[in]),
-                        cudaMemcpyHostToDevice, upload_stream));
+                for (size_t in = 0; in < in_gpu.size(); ++in)
+                {
+                    CUDA_CHECK(cudaMemcpyAsync(in_gpu[in].GetTensorMutableRawData(), in_cpu[in].GetTensorRawData(),
+                                               ORTValueToBytes(in_gpu[in]), cudaMemcpyHostToDevice, upload_stream));
                 }
                 CUDA_CHECK(cudaEventRecord(ev_upload, upload_stream));
             }
 
-            for (size_t oi = 0; oi < output_names.size(); ++oi) {
+            for (size_t oi = 0; oi < output_names.size(); ++oi)
+            {
                 io_binding.BindOutput(output_names[oi].c_str(), out_current[oi]);
             }
 
@@ -274,22 +295,20 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
             {
                 nvtx3::scoped_range rd{"download " + label};
                 CUDA_CHECK(cudaStreamWaitEvent(download_stream, ev_infer));
-                for (size_t oi = 0; oi < out_current.size(); ++oi) {
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        out_cpu[oi].GetTensorMutableRawData(),
-                        out_current[oi].GetTensorRawData(),
-                        ORTValueToBytes(out_flop[oi]),
-                        cudaMemcpyDeviceToHost, download_stream));
+                for (size_t oi = 0; oi < out_current.size(); ++oi)
+                {
+                    CUDA_CHECK(cudaMemcpyAsync(out_cpu[oi].GetTensorMutableRawData(),
+                                               out_current[oi].GetTensorRawData(), ORTValueToBytes(out_flop[oi]),
+                                               cudaMemcpyDeviceToHost, download_stream));
                 }
             }
         }
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
         auto stop = std::chrono::high_resolution_clock::now();
-        auto us   = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
         std::cout << "GPU bindings per iteration [ms]: "
-                  << static_cast<float>(us) / static_cast<float>(iterations) / 1000.f
-                  << "\n";
+                  << static_cast<float>(us) / static_cast<float>(iterations) / 1000.f << "\n";
     }
     CUDA_CHECK(cudaProfilerStop());
 
@@ -304,17 +323,18 @@ void run_with_gpu_bindings(Ort::Session& session, int iterations,
 // IoBinding helper
 // =============================================================================
 
-Ort::IoBinding generate_io_binding(
-    Ort::Session& session,
-    std::map<std::string, std::vector<int64_t>> shape_overwrites,
-    OrtAllocator* allocator) {
+Ort::IoBinding generate_io_binding(Ort::Session& session, std::map<std::string, std::vector<int64_t>> shape_overwrites,
+                                   OrtAllocator* allocator)
+{
     Ort::IoBinding binding(session);
     Ort::AllocatorWithDefaultOptions default_allocator;
-    if (allocator == nullptr) {
+    if (allocator == nullptr)
+    {
         allocator = default_allocator;
     }
 
-    for (size_t i = 0; i < session.GetInputCount(); ++i) {
+    for (size_t i = 0; i < session.GetInputCount(); ++i)
+    {
         auto name = session.GetInputNameAllocated(i, Ort::AllocatorWithDefaultOptions());
         // session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo(); has lifetime issues
         // https://github.com/microsoft/onnxruntime/issues/24300
@@ -324,20 +344,25 @@ Ort::IoBinding generate_io_binding(
         auto type = tensor_info.GetElementType();
 
         auto it = shape_overwrites.find(name.get());
-        if (it != shape_overwrites.end()) {
+        if (it != shape_overwrites.end())
+        {
             shape = it->second;
-        } else {
-            for (auto& v : shape) {
-                if (v == -1) v = 1;
+        }
+        else
+        {
+            for (auto& v : shape)
+            {
+                if (v == -1)
+                    v = 1;
             }
         }
 
-        auto tensor = Ort::Value::CreateTensor(allocator,
-                                               shape.data(), shape.size(), type);
+        auto tensor = Ort::Value::CreateTensor(allocator, shape.data(), shape.size(), type);
         binding.BindInput(name.get(), tensor);
     }
 
-    for (size_t i = 0; i < session.GetOutputCount(); ++i) {
+    for (size_t i = 0; i < session.GetOutputCount(); ++i)
+    {
         auto name = session.GetOutputNameAllocated(i, Ort::AllocatorWithDefaultOptions());
         binding.BindOutput(name.get(), default_allocator.GetInfo());
     }

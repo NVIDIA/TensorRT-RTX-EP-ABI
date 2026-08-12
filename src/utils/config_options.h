@@ -19,35 +19,44 @@
 #include <unordered_map>
 
 // Configuration options class for session configuration
-class ConfigOptions {
- public:
-  ConfigOptions() = default;
-  ConfigOptions(const std::unordered_map<std::string, std::string>& config) : config_(config) {}
-
-  // Get a configuration value or return the default if not found
-  std::string GetConfigOrDefault(const std::string& key, const std::string& default_value) const {
-    auto it = config_.find(key);
-    if (it != config_.end()) {
-      return it->second;
+class ConfigOptions
+{
+public:
+    ConfigOptions() = default;
+    ConfigOptions(const std::unordered_map<std::string, std::string>& config)
+        : config_(config)
+    {
     }
-    return default_value;
-  }
 
-  // Set a configuration value
-  void SetConfig(const std::string& key, const std::string& value) {
-    config_[key] = value;
-  }
+    // Get a configuration value or return the default if not found
+    std::string GetConfigOrDefault(const std::string& key, const std::string& default_value) const
+    {
+        auto it = config_.find(key);
+        if (it != config_.end())
+        {
+            return it->second;
+        }
+        return default_value;
+    }
 
-  // Check if a configuration key exists
-  bool HasConfig(const std::string& key) const {
-    return config_.find(key) != config_.end();
-  }
+    // Set a configuration value
+    void SetConfig(const std::string& key, const std::string& value)
+    {
+        config_[key] = value;
+    }
 
-  // Get the underlying map
-  const std::unordered_map<std::string, std::string>& GetConfigs() const {
-    return config_;
-  }
+    // Check if a configuration key exists
+    bool HasConfig(const std::string& key) const
+    {
+        return config_.find(key) != config_.end();
+    }
 
- private:
-  std::unordered_map<std::string, std::string> config_;
+    // Get the underlying map
+    const std::unordered_map<std::string, std::string>& GetConfigs() const
+    {
+        return config_;
+    }
+
+private:
+    std::unordered_map<std::string, std::string> config_;
 };

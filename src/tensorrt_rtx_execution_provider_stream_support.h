@@ -16,8 +16,9 @@
 #pragma once
 
 #include "tensorrt_rtx_provider_factory.h"
-#include "utils/ep_utils.h"
+
 #include "nv_includes.h"
+#include "utils/ep_utils.h"
 
 #include "onnxruntime_c_api.h"
 
@@ -45,7 +46,9 @@ struct TensorrtRtxSyncStreamImpl;
 //! This allows synchronization between streams and between device/host.
 //! Only needed if your EP supports stream-aware execution.
 //!
-struct TensorrtRtxSyncNotificationImpl : OrtSyncNotificationImpl, ApiPtrs
+struct TensorrtRtxSyncNotificationImpl
+    : OrtSyncNotificationImpl
+    , ApiPtrs
 {
     // Factory method to create notification
     static OrtStatus* Create(cudaStream_t stream, const ApiPtrs& api_ptrs,
@@ -72,6 +75,7 @@ private:
 
     cudaStream_t stream_;
     cudaEvent_t event_;
+    CUcontext stream_context_{nullptr};
 };
 
 //!
@@ -80,12 +84,12 @@ private:
 //! This is used for stream-based execution and synchronization between operations.
 //! Only needed if your EP supports stream-aware execution.
 //!
-struct TensorrtRtxSyncStreamImpl : public OrtSyncStreamImpl, public ApiPtrs
+struct TensorrtRtxSyncStreamImpl
+    : public OrtSyncStreamImpl
+    , public ApiPtrs
 {
     // Factory method - use this to create instances (handles CUDA errors gracefully)
-    static OrtStatus* Create(TensorrtRtxExecutionProviderFactory& factory,
-                             const OrtEp* ep,
-                             uint32_t device_id,
+    static OrtStatus* Create(TensorrtRtxExecutionProviderFactory& factory, const OrtEp* ep, uint32_t device_id,
                              const OrtKeyValuePairs* stream_options,
                              std::unique_ptr<TensorrtRtxSyncStreamImpl>& stream_impl);
 
@@ -93,17 +97,15 @@ struct TensorrtRtxSyncStreamImpl : public OrtSyncStreamImpl, public ApiPtrs
 
 private:
     // Private constructor - use Create() factory method instead
-    TensorrtRtxSyncStreamImpl(TensorrtRtxExecutionProviderFactory& factory,
-                              const OrtEp* ep,
-                              uint32_t device_id,
+    TensorrtRtxSyncStreamImpl(TensorrtRtxExecutionProviderFactory& factory, const OrtEp* ep, uint32_t device_id,
                               const OrtKeyValuePairs* stream_options);
 
     // ========================================
     // Required OrtSyncStreamImpl Interface
     // ========================================
 
-    static OrtStatus* ORT_API_CALL CreateNotificationImpl(_In_ OrtSyncStreamImpl* this_ptr,
-                                                          _Outptr_ OrtSyncNotificationImpl** sync_notification) noexcept;
+    static OrtStatus* ORT_API_CALL CreateNotificationImpl(
+        _In_ OrtSyncStreamImpl* this_ptr, _Outptr_ OrtSyncNotificationImpl** sync_notification) noexcept;
 
     static void* ORT_API_CALL GetHandleImpl(_In_ OrtSyncStreamImpl* this_ptr) noexcept;
 
@@ -116,6 +118,7 @@ private:
     TensorrtRtxExecutionProviderFactory* factory_{nullptr};
     const OrtEp* ep_;
     cudaStream_t stream_{nullptr};
+    CUcontext stream_context_{nullptr};
     bool own_stream_{true};
     uint32_t device_id_;
 };

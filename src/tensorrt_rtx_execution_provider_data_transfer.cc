@@ -31,11 +31,11 @@ TensorrtRtxDataTransfer::TensorrtRtxDataTransfer(const ApiPtrs& api_ptrs,
                                                  std::vector<const OrtMemoryDevice*>& device_mem_devices,
                                                  std::vector<const OrtMemoryDevice*>& shared_mem_devices,
                                                  uint32_t nvidia_vendor_id)
-    : OrtDataTransferImpl{},
-      ApiPtrs{api_ptrs},
-      device_mem_devices_{device_mem_devices},
-      shared_mem_devices_{shared_mem_devices},
-      nvidia_vendor_id_{nvidia_vendor_id}
+    : OrtDataTransferImpl{}
+    , ApiPtrs{api_ptrs}
+    , device_mem_devices_{device_mem_devices}
+    , shared_mem_devices_{shared_mem_devices}
+    , nvidia_vendor_id_{nvidia_vendor_id}
 {
     // Initialize OrtDataTransferImpl interface function pointers
     ort_version_supported = NegotiatedOrtApiVersion();
@@ -81,10 +81,8 @@ bool ORT_API_CALL TensorrtRtxDataTransfer::CanCopyImpl(const OrtDataTransferImpl
 
 /*static*/
 OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransferImpl* this_ptr,
-                                                                 const OrtValue** src_tensors,
-                                                                 OrtValue** dst_tensors,
-                                                                 OrtSyncStream** streams,
-                                                                 size_t num_tensors) noexcept
+                                                                 const OrtValue** src_tensors, OrtValue** dst_tensors,
+                                                                 OrtSyncStream** streams, size_t num_tensors) noexcept
 {
     // Security check: validate input parameters are not null
     if (this_ptr == nullptr)
@@ -98,11 +96,13 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
     {
         if (src_tensors == nullptr)
         {
-            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CopyTensorsImpl: src_tensors is null");
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] CopyTensorsImpl: src_tensors is null");
         }
         if (dst_tensors == nullptr)
         {
-            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CopyTensorsImpl: dst_tensors is null");
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] CopyTensorsImpl: dst_tensors is null");
         }
         // Note: streams can be null (synchronous copy)
     }
@@ -117,11 +117,13 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
         // Security check: validate individual tensor pointers are not null
         if (src_tensor == nullptr)
         {
-            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CopyTensorsImpl: src_tensor at index is null");
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] CopyTensorsImpl: src_tensor at index is null");
         }
         if (dst_tensor == nullptr)
         {
-            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CopyTensorsImpl: dst_tensor at index is null");
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] CopyTensorsImpl: dst_tensor at index is null");
         }
 
         const OrtMemoryDevice* src_device = impl.ep_api.Value_GetMemoryDevice(src_tensor);
@@ -130,7 +132,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
         // Security check: validate memory device info was retrieved successfully
         if (src_device == nullptr || dst_device == nullptr)
         {
-            return impl.ort_api.CreateStatus(ORT_EP_FAIL, "[NvTensorRTRTX EP] CopyTensorsImpl: Failed to get memory device info from tensor");
+            return impl.ort_api.CreateStatus(
+                ORT_EP_FAIL, "[NvTensorRTRTX EP] CopyTensorsImpl: Failed to get memory device info from tensor");
         }
 
         size_t bytes;
@@ -146,10 +149,10 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
         OrtDeviceMemoryType src_mem_type = impl.ep_api.MemoryDevice_GetMemoryType(src_device);
         OrtDeviceMemoryType dst_mem_type = impl.ep_api.MemoryDevice_GetMemoryType(dst_device);
 
-        const bool src_is_gpu_default = src_type == OrtMemoryInfoDeviceType_GPU &&
-                                        src_mem_type == OrtDeviceMemoryType_DEFAULT;
-        const bool dst_is_gpu_default = dst_type == OrtMemoryInfoDeviceType_GPU &&
-                                        dst_mem_type == OrtDeviceMemoryType_DEFAULT;
+        const bool src_is_gpu_default =
+            src_type == OrtMemoryInfoDeviceType_GPU && src_mem_type == OrtDeviceMemoryType_DEFAULT;
+        const bool dst_is_gpu_default =
+            dst_type == OrtMemoryInfoDeviceType_GPU && dst_mem_type == OrtDeviceMemoryType_DEFAULT;
 
         cudaStream_t cuda_stream = nullptr;
         if (stream)
@@ -166,14 +169,15 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
                 {
                     if (cuda_stream)
                     {
-                        RETURN_IF_ERROR(CUDA_CALL(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyDeviceToDevice, cuda_stream)));
+                        RETURN_IF_ERROR(CUDA_CALL(
+                            cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyDeviceToDevice, cuda_stream)));
                     }
                     else
                     {
                         RETURN_IF_ERROR(CUDA_CALL(cudaMemcpy(dst_data, src_data, bytes, cudaMemcpyDeviceToDevice)));
 
-                        // For device memory to device memory copy, no host-side synchronization is performed by cudaMemcpy.
-                        // see https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html
+                        // For device memory to device memory copy, no host-side synchronization is performed by
+                        // cudaMemcpy. see https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html
                         need_stream_sync = true;
                     }
                 }
@@ -183,7 +187,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
                 // copy from pinned or non-pinned CPU memory to GPU
                 if (cuda_stream)
                 {
-                    RETURN_IF_ERROR(CUDA_CALL(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyHostToDevice, cuda_stream)));
+                    RETURN_IF_ERROR(
+                        CUDA_CALL(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyHostToDevice, cuda_stream)));
                 }
                 else
                 {
@@ -205,7 +210,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxDataTransfer::CopyTensorsImpl(OrtDataTransfer
 
             if (cuda_stream)
             {
-                RETURN_IF_ERROR(CUDA_CALL(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyDeviceToHost, cuda_stream)));
+                RETURN_IF_ERROR(
+                    CUDA_CALL(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyDeviceToHost, cuda_stream)));
             }
             else
             {

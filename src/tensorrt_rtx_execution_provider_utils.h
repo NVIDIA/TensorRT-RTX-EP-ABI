@@ -15,9 +15,8 @@
 
 #pragma once
 
-#include "utils/path_string.h"
 #include "utils/murmurhash3.h"
-#include "cuda_mempool_arena.h"
+#include "utils/path_string.h"
 
 #include <cuda_runtime_api.h>
 
@@ -29,6 +28,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "cuda_mempool_arena.h"
 
 namespace trt_rtx_ep
 {
@@ -66,7 +67,7 @@ AllocatorUniquePtr<T> MakeUniquePtrFromOrtAllocator(OrtAllocator* ort_allocator,
     return AllocatorUniquePtr<T>{p, [ort_allocator](T* p)
                                  {
                                      ort_allocator->Free(ort_allocator, p);
-                                 }};                                 
+                                 }};
 }
 
 //! \brief Stream-ordered allocation via CudaMempoolAllocator, wrapped in a unique_ptr.
@@ -135,8 +136,9 @@ inline bool MakeInputNameShapePair(std::string pair_string, std::pair<std::strin
 //! \brief Parse explicit profile min/max/opt shapes from Nv EP provider options.
 //!
 //! For example:
-//! The provider option is --trt_profile_min_shapes="input_id:32x1,attention_mask:32x1,input_id:32x41,attention_mask:32x41",
-//! after string is being parsed, the profile shapes has two profiles and is being represented as below.
+//! The provider option is
+//! --trt_profile_min_shapes="input_id:32x1,attention_mask:32x1,input_id:32x41,attention_mask:32x41", after string is
+//! being parsed, the profile shapes has two profiles and is being represented as below.
 //! {"input_id": [[32, 1], [32, 41]], "attention_mask": [[32, 1], [32, 41]]}
 //!
 //! \return True if string can be successfully parsed or false if string has wrong format.
@@ -179,9 +181,10 @@ inline bool ParseProfileShapes(std::string profile_shapes_string,
     return true;
 }
 
-inline bool ValidateProfileShapes(std::unordered_map<std::string, std::vector<std::vector<int64_t>>>& profile_min_shapes,
-                                  std::unordered_map<std::string, std::vector<std::vector<int64_t>>>& profile_max_shapes,
-                                  std::unordered_map<std::string, std::vector<std::vector<int64_t>>>& profile_opt_shapes)
+inline bool
+ValidateProfileShapes(std::unordered_map<std::string, std::vector<std::vector<int64_t>>>& profile_min_shapes,
+                      std::unordered_map<std::string, std::vector<std::vector<int64_t>>>& profile_max_shapes,
+                      std::unordered_map<std::string, std::vector<std::vector<int64_t>>>& profile_opt_shapes)
 {
     if (profile_min_shapes.empty() && profile_max_shapes.empty() && profile_opt_shapes.empty())
     {
@@ -294,16 +297,15 @@ inline HashValue TRTGenerateId(const OrtGraph* graph, const std::string& trt_ver
 
         std::string model_name = PathToUTF8String(filename);
 
-        Ort::ThrowOnError(g_ort_api->Logger_LogMessage(g_logger,
-                                                       OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
-                                                       ("Model name is " + model_name).c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+        Ort::ThrowOnError(g_ort_api->Logger_LogMessage(g_logger, OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                                       ("Model name is " + model_name).c_str(), ORT_FILE, __LINE__,
+                                                       __FUNCTION__));
         // Hash the model name directly - the hash function handles variable-length input
         hash_str(model_name);
     }
     else
     {
-        Ort::ThrowOnError(g_ort_api->Logger_LogMessage(g_logger,
-                                                       OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+        Ort::ThrowOnError(g_ort_api->Logger_LogMessage(g_logger, OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
                                                        "Model path is empty", ORT_FILE, __LINE__, __FUNCTION__));
     }
 
@@ -403,8 +405,9 @@ inline std::string join(const std::vector<std::string>& vec, const std::string& 
 //! \brief Parse engine cache name suffix when user customizes prefix for engine cache name.
 //!
 //! For example:
-//! When default subgraph name is "NvExecutionProvider_TRTKernel_graph_torch-jit-export_2068723788287043730_189_189_fp16"
-//! This func will generate the suffix "2068723788287043730_189_fp16"
+//! When default subgraph name is
+//! "NvExecutionProvider_TRTKernel_graph_torch-jit-export_2068723788287043730_189_189_fp16" This func will generate the
+//! suffix "2068723788287043730_189_fp16"
 //!
 inline std::string GetCacheSuffix(const std::string& fused_node_name, const std::string& trt_node_name_with_precision)
 {

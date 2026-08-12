@@ -15,16 +15,16 @@
 
 #ifdef _WIN32
 
-#include "utils/security.h"
 #include "utils/filesystem_utils.h"
 #include "utils/path_string.h"
-
-#include <windows.h>
-#include <delayimp.h>
+#include "utils/security.h"
 
 #include <algorithm>
 #include <cstring>
 #include <string>
+
+#include <delayimp.h>
+#include <windows.h>
 
 // Auto-link required Windows libraries
 #pragma comment(lib, "wintrust")
@@ -39,7 +39,8 @@
 #define TRT_ONNX_PARSER_DLL_NAME "tensorrt_onnxparser_rtx.dll"
 #endif
 
-namespace {
+namespace
+{
 
 //! \brief Case-insensitive string comparison helper
 //! \param a First string to compare
@@ -73,8 +74,7 @@ bool isTrtRtxTarget(const char* dllName)
         filename = lastForwardSlash + 1;
     }
 
-    return strEqualsIgnoreCase(filename, TRT_RTX_DLL_NAME) ||
-           strEqualsIgnoreCase(filename, TRT_ONNX_PARSER_DLL_NAME);
+    return strEqualsIgnoreCase(filename, TRT_RTX_DLL_NAME) || strEqualsIgnoreCase(filename, TRT_ONNX_PARSER_DLL_NAME);
 }
 
 //! \brief Log security warning and abort the delay-load by raising an exception
@@ -174,60 +174,59 @@ static FARPROC WINAPI delayLoadNotifyHook(unsigned dliNotify, PDelayLoadInfo pdl
 {
     switch (dliNotify)
     {
-        case dliNotePreLoadLibrary:
+    case dliNotePreLoadLibrary:
+    {
+        // Only intervene for TensorRT RTX DLLs
+        if (!isTrtRtxTarget(pdli->szDll))
         {
-            // Only intervene for TensorRT RTX DLLs
-            if (!isTrtRtxTarget(pdli->szDll))
-            {
-                return nullptr;  // Let default delay-load handle non-target DLLs
-            }
-
-            // Verify DLL location (and signature in production builds)
-            // This call raises an exception on failure via securityFailure
-            if (!verifyDllSignature(pdli->szDll))
-            {
-                // verifyDllSignature already raised an exception
-                // This line should never be reached
-                return nullptr;
-            }
-
-            // Load exclusively from the EP directory using absolute path
-            std::wstring dllNameW = extractDllFilename(pdli->szDll);
-            std::wstring baseDir = trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&delayLoadNotifyHook);
-            if (baseDir.empty())
-            {
-                securityFailure(dllNameW.c_str(), L"could not determine the expected library directory.");
-                return nullptr;  // Never reached
-            }
-
-            std::wstring fullPath = baseDir + L"\\" + dllNameW;
-
-            // Load from the EP directory only using absolute path
-            // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: Search the folder containing the DLL (from fullPath)
-            // LOAD_LIBRARY_SEARCH_SYSTEM32: Allow system DLL dependencies
-            // This combination prevents loading from arbitrary search paths
-            HMODULE hModule = LoadLibraryExW(fullPath.c_str(), nullptr,
-                                              LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                              LOAD_LIBRARY_SEARCH_SYSTEM32);
-            if (!hModule)
-            {
-                securityFailure(dllNameW.c_str(), L"failed to load the library from the execution provider directory.");
-                return nullptr;  // Never reached
-            }
-
-            return reinterpret_cast<FARPROC>(hModule);
+            return nullptr;  // Let default delay-load handle non-target DLLs
         }
 
-        case dliNotePreGetProcAddress:
-            // Called before GetProcAddress is called
-            break;
+        // Verify DLL location (and signature in production builds)
+        // This call raises an exception on failure via securityFailure
+        if (!verifyDllSignature(pdli->szDll))
+        {
+            // verifyDllSignature already raised an exception
+            // This line should never be reached
+            return nullptr;
+        }
 
-        case dliNoteEndProcessing:
-            // Called after all processing is done
-            break;
+        // Load exclusively from the EP directory using absolute path
+        std::wstring dllNameW = extractDllFilename(pdli->szDll);
+        std::wstring baseDir = trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&delayLoadNotifyHook);
+        if (baseDir.empty())
+        {
+            securityFailure(dllNameW.c_str(), L"could not determine the expected library directory.");
+            return nullptr;  // Never reached
+        }
 
-        default:
-            break;
+        std::wstring fullPath = baseDir + L"\\" + dllNameW;
+
+        // Load from the EP directory only using absolute path
+        // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: Search the folder containing the DLL (from fullPath)
+        // LOAD_LIBRARY_SEARCH_SYSTEM32: Allow system DLL dependencies
+        // This combination prevents loading from arbitrary search paths
+        HMODULE hModule =
+            LoadLibraryExW(fullPath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!hModule)
+        {
+            securityFailure(dllNameW.c_str(), L"failed to load the library from the execution provider directory.");
+            return nullptr;  // Never reached
+        }
+
+        return reinterpret_cast<FARPROC>(hModule);
+    }
+
+    case dliNotePreGetProcAddress:
+        // Called before GetProcAddress is called
+        break;
+
+    case dliNoteEndProcessing:
+        // Called after all processing is done
+        break;
+
+    default:
+        break;
     }
 
     return nullptr;  // Return nullptr to let the default processing continue
@@ -247,7 +246,7 @@ static FARPROC WINAPI delayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pd
         {
             std::wstring dllNameW = ToWideString(pdli->szDll);
             securityFailure(dllNameW.c_str(),
-                L"could not be loaded. Please ensure TensorRT RTX is properly installed.");
+                            L"could not be loaded. Please ensure TensorRT RTX is properly installed.");
         }
     }
     else if (dliNotify == dliFailGetProc)
@@ -272,7 +271,8 @@ static FARPROC WINAPI delayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pd
 
 // These are the official delay load hook function pointers
 // The delay load helper looks for these symbols
-extern "C" {
+extern "C"
+{
     // Notify hook - called at various stages of delay loading
     const PfnDliHook __pfnDliNotifyHook2 = delayLoadNotifyHook;
 

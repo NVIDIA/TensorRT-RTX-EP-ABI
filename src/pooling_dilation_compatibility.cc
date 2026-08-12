@@ -181,8 +181,7 @@ bool IsSupportedPoolOp(const onnx::NodeProto& node)
 
 bool IsSupportedElementType(int32_t element_type)
 {
-    return element_type == onnx::TensorProto_DataType_FLOAT ||
-           element_type == onnx::TensorProto_DataType_FLOAT16;
+    return element_type == onnx::TensorProto_DataType_FLOAT || element_type == onnx::TensorProto_DataType_FLOAT16;
 }
 
 std::vector<int64_t> DefaultVector(size_t size, int64_t value)
@@ -192,17 +191,29 @@ std::vector<int64_t> DefaultVector(size_t size, int64_t value)
 
 bool HasNonZeroPadding(const std::vector<int64_t>& pads)
 {
-    return std::any_of(pads.begin(), pads.end(), [](int64_t value) { return value != 0; });
+    return std::any_of(pads.begin(), pads.end(),
+                       [](int64_t value)
+                       {
+                           return value != 0;
+                       });
 }
 
 bool HasNonUnitDilation(const std::vector<int64_t>& dilations)
 {
-    return std::any_of(dilations.begin(), dilations.end(), [](int64_t value) { return value != 1; });
+    return std::any_of(dilations.begin(), dilations.end(),
+                       [](int64_t value)
+                       {
+                           return value != 1;
+                       });
 }
 
 bool AllPositive(const std::vector<int64_t>& values)
 {
-    return std::all_of(values.begin(), values.end(), [](int64_t value) { return value > 0; });
+    return std::all_of(values.begin(), values.end(),
+                       [](int64_t value)
+                       {
+                           return value > 0;
+                       });
 }
 
 bool CheckedMultiply(size_t lhs, int64_t rhs, size_t& result)
@@ -377,8 +388,7 @@ bool TryBuildPoolLoweringPlan(const onnx::NodeProto& node, const GraphIndex& ind
         return false;
     }
 
-    if (!index.TryGetStaticShape(node.input(0), plan.input_shape) ||
-        plan.input_shape.size() != spatial_rank + 2 ||
+    if (!index.TryGetStaticShape(node.input(0), plan.input_shape) || plan.input_shape.size() != spatial_rank + 2 ||
         !index.TryGetStaticShape(node.output(0), plan.output_shape) ||
         plan.output_shape.size() != plan.input_shape.size())
     {

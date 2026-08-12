@@ -17,20 +17,20 @@
 #define _UNICODE 1
 #define UNICODE 1
 
-#include <tchar.h>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
 
-#include <windows.h>
+#include <inttypes.h>
 #include <Softpub.h>
+#include <tchar.h>
 #include <wincrypt.h>
+#include <windows.h>
 #include <wintrust.h>
 
-#include <inttypes.h>
-
-#define GetProc(hModule, procName, proc) (((NULL == proc) && (NULL == (*((FARPROC*)&proc) = GetProcAddress(hModule, procName)))) ? FALSE : TRUE)
+#define GetProc(hModule, procName, proc) \
+    (((NULL == proc) && (NULL == (*((FARPROC*)&proc) = GetProcAddress(hModule, procName)))) ? FALSE : TRUE)
 
 typedef BOOL(WINAPI* PfnCryptMsgClose)(IN HCRYPTMSG hCryptMsg);
 static PfnCryptMsgClose pfnCryptMsgClose = NULL;
@@ -38,98 +38,54 @@ static PfnCryptMsgClose pfnCryptMsgClose = NULL;
 typedef BOOL(WINAPI* PfnCertCloseStore)(IN HCERTSTORE hCertStore, DWORD dwFlags);
 static PfnCertCloseStore pfnCertCloseStore = NULL;
 
-typedef HCERTSTORE (WINAPI* PfnCertOpenStore)(
-    _In_ LPCSTR lpszStoreProvider,
-    _In_ DWORD dwEncodingType,
-    _In_opt_ HCRYPTPROV_LEGACY hCryptProv,
-    _In_ DWORD dwFlags,
-    _In_opt_ const void* pvPara
-);
+typedef HCERTSTORE(WINAPI* PfnCertOpenStore)(_In_ LPCSTR lpszStoreProvider, _In_ DWORD dwEncodingType,
+                                             _In_opt_ HCRYPTPROV_LEGACY hCryptProv, _In_ DWORD dwFlags,
+                                             _In_opt_ const void* pvPara);
 static PfnCertOpenStore pfnCertOpenStore = NULL;
 
 typedef BOOL(WINAPI* PfnCertFreeCertificateContext)(IN PCCERT_CONTEXT pCertContext);
 static PfnCertFreeCertificateContext pfnCertFreeCertificateContext = NULL;
 
-typedef PCCERT_CONTEXT(WINAPI* PfnCertFindCertificateInStore)(
-    IN HCERTSTORE hCertStore,
-    IN DWORD dwCertEncodingType,
-    IN DWORD dwFindFlags,
-    IN DWORD dwFindType,
-    IN const void* pvFindPara,
-    IN PCCERT_CONTEXT pPrevCertContext
-    );
+typedef PCCERT_CONTEXT(WINAPI* PfnCertFindCertificateInStore)(IN HCERTSTORE hCertStore, IN DWORD dwCertEncodingType,
+                                                              IN DWORD dwFindFlags, IN DWORD dwFindType,
+                                                              IN const void* pvFindPara,
+                                                              IN PCCERT_CONTEXT pPrevCertContext);
 static PfnCertFindCertificateInStore pfnCertFindCertificateInStore = NULL;
 
-typedef BOOL(WINAPI* PfnCryptMsgGetParam)(
-    IN HCRYPTMSG hCryptMsg,
-    IN DWORD dwParamType,
-    IN DWORD dwIndex,
-    OUT void* pvData,
-    IN OUT DWORD* pcbData
-    );
+typedef BOOL(WINAPI* PfnCryptMsgGetParam)(IN HCRYPTMSG hCryptMsg, IN DWORD dwParamType, IN DWORD dwIndex,
+                                          OUT void* pvData, IN OUT DWORD* pcbData);
 static PfnCryptMsgGetParam pfnCryptMsgGetParam = NULL;
 
-typedef HCRYPTMSG (WINAPI* PfnCryptMsgOpenToDecode)(
-    _In_ DWORD dwMsgEncodingType,
-    _In_ DWORD dwFlags,
-    _In_ DWORD dwMsgType,
-    _In_opt_ HCRYPTPROV_LEGACY hCryptProv,
-    _Reserved_ PCERT_INFO pRecipientInfo,
-    _In_opt_ PCMSG_STREAM_INFO pStreamInfo
-);
+typedef HCRYPTMSG(WINAPI* PfnCryptMsgOpenToDecode)(_In_ DWORD dwMsgEncodingType, _In_ DWORD dwFlags,
+                                                   _In_ DWORD dwMsgType, _In_opt_ HCRYPTPROV_LEGACY hCryptProv,
+                                                   _Reserved_ PCERT_INFO pRecipientInfo,
+                                                   _In_opt_ PCMSG_STREAM_INFO pStreamInfo);
 static PfnCryptMsgOpenToDecode pfnCryptMsgOpenToDecode = NULL;
 
-typedef BOOL (WINAPI* PfnCryptMsgUpdate)(
-    _In_ HCRYPTMSG hCryptMsg,
-    _In_reads_bytes_opt_(cbData) const BYTE* pbData,
-    _In_ DWORD cbData,
-    _In_ BOOL fFinal
-);
+typedef BOOL(WINAPI* PfnCryptMsgUpdate)(_In_ HCRYPTMSG hCryptMsg, _In_reads_bytes_opt_(cbData) const BYTE* pbData,
+                                        _In_ DWORD cbData, _In_ BOOL fFinal);
 static PfnCryptMsgUpdate pfnCryptMsgUpdate = NULL;
 
-typedef BOOL(WINAPI* PfnCryptQueryObject)(
-    DWORD            dwObjectType,
-    const void* pvObject,
-    DWORD            dwExpectedContentTypeFlags,
-    DWORD            dwExpectedFormatTypeFlags,
-    DWORD            dwFlags,
-    DWORD* pdwMsgAndCertEncodingType,
-    DWORD* pdwContentType,
-    DWORD* pdwFormatType,
-    HCERTSTORE* phCertStore,
-    HCRYPTMSG* phMsg,
-    const void** ppvContext
-    );
+typedef BOOL(WINAPI* PfnCryptQueryObject)(DWORD dwObjectType, const void* pvObject, DWORD dwExpectedContentTypeFlags,
+                                          DWORD dwExpectedFormatTypeFlags, DWORD dwFlags,
+                                          DWORD* pdwMsgAndCertEncodingType, DWORD* pdwContentType, DWORD* pdwFormatType,
+                                          HCERTSTORE* phCertStore, HCRYPTMSG* phMsg, const void** ppvContext);
 static PfnCryptQueryObject pfnCryptQueryObject = NULL;
 
-typedef BOOL(WINAPI* PfnCryptDecodeObjectEx)(
-    IN DWORD              dwCertEncodingType,
-    IN LPCSTR             lpszStructType,
-    IN const BYTE* pbEncoded,
-    IN DWORD              cbEncoded,
-    IN DWORD              dwFlags,
-    IN PCRYPT_DECODE_PARA pDecodePara,
-    OUT void* pvStructInfo,
-    IN OUT DWORD* pcbStructInfo
-    );
+typedef BOOL(WINAPI* PfnCryptDecodeObjectEx)(IN DWORD dwCertEncodingType, IN LPCSTR lpszStructType,
+                                             IN const BYTE* pbEncoded, IN DWORD cbEncoded, IN DWORD dwFlags,
+                                             IN PCRYPT_DECODE_PARA pDecodePara, OUT void* pvStructInfo,
+                                             IN OUT DWORD* pcbStructInfo);
 static PfnCryptDecodeObjectEx pfnCryptDecodeObjectEx = NULL;
 
-typedef LONG(WINAPI* PfnWinVerifyTrust)(
-    IN HWND   hwnd,
-    IN GUID* pgActionID,
-    IN LPVOID pWVTData
-    );
+typedef LONG(WINAPI* PfnWinVerifyTrust)(IN HWND hwnd, IN GUID* pgActionID, IN LPVOID pWVTData);
 static PfnWinVerifyTrust pfnWinVerifyTrust = NULL;
 
 // Additional function pointer types for certificate name verification
-typedef DWORD(WINAPI* PfnCertGetNameStringW)(
-    _In_ PCCERT_CONTEXT pCertContext,
-    _In_ DWORD dwType,
-    _In_ DWORD dwFlags,
-    _In_opt_ void* pvTypePara,
-    _Out_writes_opt_(cchNameString) LPWSTR pszNameString,
-    _In_ DWORD cchNameString
-);
+typedef DWORD(WINAPI* PfnCertGetNameStringW)(_In_ PCCERT_CONTEXT pCertContext, _In_ DWORD dwType, _In_ DWORD dwFlags,
+                                             _In_opt_ void* pvTypePara,
+                                             _Out_writes_opt_(cchNameString) LPWSTR pszNameString,
+                                             _In_ DWORD cchNameString);
 static PfnCertGetNameStringW pfnCertGetNameStringW = NULL;
 
 // Thread-safe initialization flags
@@ -142,31 +98,32 @@ static bool g_wintrustInitialized = false;
 //! \return true if initialization succeeded, false otherwise
 inline bool initializeCrypt32Functions()
 {
-    std::call_once(g_crypt32InitFlag, []() {
-        // We only support Win10+ so we can search for module in system32 directly
-        auto hModCrypt32 = LoadLibraryExW(L"crypt32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (hModCrypt32 &&
-            GetProc(hModCrypt32, "CryptMsgClose", pfnCryptMsgClose) &&
-            GetProc(hModCrypt32, "CertCloseStore", pfnCertCloseStore) &&
-            GetProc(hModCrypt32, "CertOpenStore", pfnCertOpenStore) &&
-            GetProc(hModCrypt32, "CertFreeCertificateContext", pfnCertFreeCertificateContext) &&
-            GetProc(hModCrypt32, "CertFindCertificateInStore", pfnCertFindCertificateInStore) &&
-            GetProc(hModCrypt32, "CryptMsgGetParam", pfnCryptMsgGetParam) &&
-            GetProc(hModCrypt32, "CryptMsgUpdate", pfnCryptMsgUpdate) &&
-            GetProc(hModCrypt32, "CryptMsgOpenToDecode", pfnCryptMsgOpenToDecode) &&
-            GetProc(hModCrypt32, "CryptQueryObject", pfnCryptQueryObject) &&
-            GetProc(hModCrypt32, "CryptDecodeObjectEx", pfnCryptDecodeObjectEx) &&
-            GetProc(hModCrypt32, "CertGetNameStringW", pfnCertGetNameStringW))
-        {
-            g_crypt32Initialized = true;
-            // NOTE: FreeLibrary is intentionally not called on hModCrypt32.
-            // The library is loaded once and kept for the lifetime of the process because:
-            // 1. The function pointers (pfnCrypt*, pfnCert*) must remain valid for all subsequent calls
-            // 2. System DLLs like crypt32.dll are reference-counted and shared across processes
-            // 3. Avoiding reload overhead improves performance for repeated cryptographic operations
-            // 4. The OS automatically unloads all DLLs when the process terminates
-        }
-    });
+    std::call_once(g_crypt32InitFlag,
+                   []()
+                   {
+                       // We only support Win10+ so we can search for module in system32 directly
+                       auto hModCrypt32 = LoadLibraryExW(L"crypt32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                       if (hModCrypt32 && GetProc(hModCrypt32, "CryptMsgClose", pfnCryptMsgClose) &&
+                           GetProc(hModCrypt32, "CertCloseStore", pfnCertCloseStore) &&
+                           GetProc(hModCrypt32, "CertOpenStore", pfnCertOpenStore) &&
+                           GetProc(hModCrypt32, "CertFreeCertificateContext", pfnCertFreeCertificateContext) &&
+                           GetProc(hModCrypt32, "CertFindCertificateInStore", pfnCertFindCertificateInStore) &&
+                           GetProc(hModCrypt32, "CryptMsgGetParam", pfnCryptMsgGetParam) &&
+                           GetProc(hModCrypt32, "CryptMsgUpdate", pfnCryptMsgUpdate) &&
+                           GetProc(hModCrypt32, "CryptMsgOpenToDecode", pfnCryptMsgOpenToDecode) &&
+                           GetProc(hModCrypt32, "CryptQueryObject", pfnCryptQueryObject) &&
+                           GetProc(hModCrypt32, "CryptDecodeObjectEx", pfnCryptDecodeObjectEx) &&
+                           GetProc(hModCrypt32, "CertGetNameStringW", pfnCertGetNameStringW))
+                       {
+                           g_crypt32Initialized = true;
+                           // NOTE: FreeLibrary is intentionally not called on hModCrypt32.
+                           // The library is loaded once and kept for the lifetime of the process because:
+                           // 1. The function pointers (pfnCrypt*, pfnCert*) must remain valid for all subsequent calls
+                           // 2. System DLLs like crypt32.dll are reference-counted and shared across processes
+                           // 3. Avoiding reload overhead improves performance for repeated cryptographic operations
+                           // 4. The OS automatically unloads all DLLs when the process terminates
+                       }
+                   });
     return g_crypt32Initialized;
 }
 
@@ -174,20 +131,22 @@ inline bool initializeCrypt32Functions()
 //! \return true if initialization succeeded, false otherwise
 inline bool initializeWintrustFunctions()
 {
-    std::call_once(g_wintrustInitFlag, []() {
-        // We only support Win10+ so we can search for module in system32 directly
-        auto hModWintrust = LoadLibraryExW(L"wintrust.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (hModWintrust && GetProc(hModWintrust, "WinVerifyTrust", pfnWinVerifyTrust))
-        {
-            g_wintrustInitialized = true;
-            // NOTE: FreeLibrary is intentionally not called on hModWintrust.
-            // The library is loaded once and kept for the lifetime of the process because:
-            // 1. The function pointers (pfnWinVerifyTrust) must remain valid for all subsequent calls
-            // 2. System DLLs like wintrust.dll are reference-counted and shared across processes
-            // 3. Avoiding reload overhead improves performance for repeated signature verification
-            // 4. The OS automatically unloads all DLLs when the process terminates
-        }
-    });
+    std::call_once(g_wintrustInitFlag,
+                   []()
+                   {
+                       // We only support Win10+ so we can search for module in system32 directly
+                       auto hModWintrust = LoadLibraryExW(L"wintrust.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                       if (hModWintrust && GetProc(hModWintrust, "WinVerifyTrust", pfnWinVerifyTrust))
+                       {
+                           g_wintrustInitialized = true;
+                           // NOTE: FreeLibrary is intentionally not called on hModWintrust.
+                           // The library is loaded once and kept for the lifetime of the process because:
+                           // 1. The function pointers (pfnWinVerifyTrust) must remain valid for all subsequent calls
+                           // 2. System DLLs like wintrust.dll are reference-counted and shared across processes
+                           // 3. Avoiding reload overhead improves performance for repeated signature verification
+                           // 4. The OS automatically unloads all DLLs when the process terminates
+                       }
+                   });
     return g_wintrustInitialized;
 }
 
@@ -223,30 +182,18 @@ bool verifyPrimarySignerIsNVIDIA(const wchar_t* pathToFile)
     PCCERT_CONTEXT pCertContext = NULL;
 
     // Get message handle, store handle, and signer certificate from the signed file.
-    auto bResult = pfnCryptQueryObject(CERT_QUERY_OBJECT_FILE,
-        pathToFile,
-        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-        CERT_QUERY_FORMAT_FLAG_BINARY,
-        0,
-        &dwEncoding,
-        &dwContentType,
-        &dwFormatType,
-        &hStore,
-        &hMsg,
-        NULL);
+    auto bResult = pfnCryptQueryObject(CERT_QUERY_OBJECT_FILE, pathToFile, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                                       CERT_QUERY_FORMAT_FLAG_BINARY, 0, &dwEncoding, &dwContentType, &dwFormatType,
+                                       &hStore, &hMsg, NULL);
     if (!bResult)
     {
-       return false;
+        return false;
     }
 
     // Get the signer certificate from the message
     DWORD dwSignerInfo = 0;
-    bResult = pfnCryptMsgGetParam(hMsg,
-        CMSG_SIGNER_INFO_PARAM,
-        0,
-        NULL,
-        &dwSignerInfo);
-    
+    bResult = pfnCryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, NULL, &dwSignerInfo);
+
     if (bResult && dwSignerInfo > 0)
     {
         // Security check: Validate dwSignerInfo to prevent integer overflow attacks
@@ -271,35 +218,27 @@ bool verifyPrimarySignerIsNVIDIA(const wchar_t* pathToFile)
         };
         using SignerInfoPtr = std::unique_ptr<CMSG_SIGNER_INFO, LocalAllocDeleter>;
 
-        SignerInfoPtr pSignerInfo(static_cast<PCMSG_SIGNER_INFO>(
-            LocalAlloc(LPTR, dwSignerInfo)));
+        SignerInfoPtr pSignerInfo(static_cast<PCMSG_SIGNER_INFO>(LocalAlloc(LPTR, dwSignerInfo)));
         if (pSignerInfo)
         {
-            if (pfnCryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0,
-                                    static_cast<PVOID>(pSignerInfo.get()), &dwSignerInfo))
+            if (pfnCryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, static_cast<PVOID>(pSignerInfo.get()),
+                                    &dwSignerInfo))
             {
                 // Find the signer certificate in the store
                 CERT_INFO CertInfo{};
                 CertInfo.Issuer = pSignerInfo->Issuer;
                 CertInfo.SerialNumber = pSignerInfo->SerialNumber;
 
-                pCertContext = pfnCertFindCertificateInStore(hStore,
-                    (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING),
-                    0,
-                    CERT_FIND_SUBJECT_CERT,
-                    static_cast<PVOID>(&CertInfo),
-                    NULL);
+                pCertContext =
+                    pfnCertFindCertificateInStore(hStore, (X509_ASN_ENCODING | PKCS_7_ASN_ENCODING), 0,
+                                                  CERT_FIND_SUBJECT_CERT, static_cast<PVOID>(&CertInfo), NULL);
 
                 if (pCertContext)
                 {
                     // Get the certificate subject name
                     wchar_t subjectName[kMaxSubjectNameLength];
-                    DWORD nameLen = pfnCertGetNameStringW(pCertContext,
-                        CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                        0,
-                        NULL,
-                        subjectName,
-                        kMaxSubjectNameLength);
+                    DWORD nameLen = pfnCertGetNameStringW(pCertContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL,
+                                                          subjectName, kMaxSubjectNameLength);
 
                     if (nameLen > 1)
                     {
@@ -332,16 +271,21 @@ bool verifyPrimarySignerIsNVIDIA(const wchar_t* pathToFile)
 //! \brief Verify that a file has a valid embedded signature
 //! \param pathToFile Full path to the file to verify (must be absolute path)
 //! \return true if the file has a valid embedded signature, false otherwise
-//! \note See https://docs.microsoft.com/en-us/windows/win32/seccrypto/example-c-program--verifying-the-signature-of-a-pe-file
+//! \note See
+//! https://docs.microsoft.com/en-us/windows/win32/seccrypto/example-c-program--verifying-the-signature-of-a-pe-file
 //! \note IMPORTANT: Always pass in the FULL PATH to the file, relative paths are NOT allowed!
 //!
 //! WVTPolicyGUID specifies the policy to apply on the file.
 //! WINTRUST_ACTION_GENERIC_VERIFY_V2 policy checks:
-//! 1) The certificate used to sign the file chains up to a root certificate located in the trusted root certificate store.
+//! 1) The certificate used to sign the file chains up to a root certificate located in the trusted root certificate
+//! store.
 //!    This implies that the identity of the publisher has been verified by a certification authority.
-//! 2) In cases where user interface is displayed (which this example does not do), WinVerifyTrust will check for whether
-//!    the end entity certificate is stored in the trusted publisher store, implying that the user trusts content from this publisher.
-//! 3) The end entity certificate has sufficient permission to sign code, as indicated by the presence of a code signing EKU or no EKU.
+//! 2) In cases where user interface is displayed (which this example does not do), WinVerifyTrust will check for
+//! whether
+//!    the end entity certificate is stored in the trusted publisher store, implying that the user trusts content from
+//!    this publisher.
+//! 3) The end entity certificate has sufficient permission to sign code, as indicated by the presence of a code signing
+//! EKU or no EKU.
 bool verifyEmbeddedSignature(const wchar_t* pathToFile)
 {
     bool valid = true;
@@ -408,7 +352,7 @@ bool verifyEmbeddedSignature(const wchar_t* pathToFile)
     if (valid)
     {
         // Verify the primary signer is NVIDIA Corporation
-        valid &= verifyPrimarySignerIsNVIDIA(pathToFile);         
+        valid &= verifyPrimarySignerIsNVIDIA(pathToFile);
     }
 
     // Any hWVTStateData must be released by a call with close.
@@ -432,7 +376,7 @@ bool verifyEmbeddedSignature(const wchar_t* pathToFile)
 ///       1. The signature chains to a trusted CA (OS verification with strong crypto)
 ///       2. The signer certificate subject contains "NVIDIA Corporation"
 ///       This approach survives certificate/key rotation and is ISV-friendly.
-inline bool VerifyNvidiaSignature(const std::wstring& pathToFile) {
+inline bool VerifyNvidiaSignature(const std::wstring& pathToFile)
+{
     return trt_rtx_ep::security::verifyEmbeddedSignature(pathToFile.c_str());
 }
-

@@ -5,9 +5,8 @@
 // No internal ORT headers — only onnx/onnx_pb.h.
 #pragma once
 
-#include <onnx/onnx_pb.h>
-
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -16,26 +15,35 @@
 #include <string>
 #include <vector>
 
-namespace model_builder {
+#include <onnx/onnx_pb.h>
+
+namespace model_builder
+{
+
+inline constexpr const char* kMemAddrExternalDataLocation = "_MEM_ADDR_";
 
 // ---------------------------------------------------------------------------
 // Float32 -> IEEE 754 binary16 (FLOAT16) conversion.
 // Truncates mantissa; handles zero/inf/NaN. Subnormals flushed to zero.
 // ---------------------------------------------------------------------------
-inline uint16_t Float32ToFloat16(float f) {
+inline uint16_t Float32ToFloat16(float f)
+{
     uint32_t x;
     std::memcpy(&x, &f, sizeof(x));
-    const uint32_t sign     = (x >> 16) & 0x8000u;
-    const int32_t  exp32    = static_cast<int32_t>((x >> 23) & 0xFFu);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t exp32 = static_cast<int32_t>((x >> 23) & 0xFFu);
     const uint32_t mantissa = (x >> 13) & 0x3FFu;
-    if (exp32 == 0xFF) {
+    if (exp32 == 0xFF)
+    {
         // Inf or NaN — preserve NaN mantissa at least partially.
         const uint16_t m = ((x & 0x7FFFFFu) != 0u) ? 0x1u : 0u;
         return static_cast<uint16_t>(sign | 0x7C00u | m);
     }
     const int32_t exp16 = exp32 - 127 + 15;
-    if (exp16 <= 0) return static_cast<uint16_t>(sign);
-    if (exp16 >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    if (exp16 <= 0)
+        return static_cast<uint16_t>(sign);
+    if (exp16 >= 31)
+        return static_cast<uint16_t>(sign | 0x7C00u);
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp16) << 10) | mantissa);
 }
 
@@ -45,23 +53,26 @@ inline uint16_t Float32ToFloat16(float f) {
 
 // Add a ValueInfoProto (graph input or output) with optional shape.
 // dims={} means no shape (unknown). dim value -1 becomes a symbolic param.
-inline void AddValueInfo(
-    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto>* list,
-    const std::string& name,
-    int32_t elem_type,
-    const std::vector<int>& dims) {
+inline void AddValueInfo(google::protobuf::RepeatedPtrField<onnx::ValueInfoProto>* list, const std::string& name,
+                         int32_t elem_type, const std::vector<int>& dims)
+{
     auto* vi = list->Add();
     vi->set_name(name);
     auto* tensor_type = vi->mutable_type()->mutable_tensor_type();
     tensor_type->set_elem_type(elem_type);
-    if (!dims.empty()) {
+    if (!dims.empty())
+    {
         auto* shape = tensor_type->mutable_shape();
         int dyn_idx = 0;
-        for (int d : dims) {
+        for (int d : dims)
+        {
             auto* dim = shape->add_dim();
-            if (d == -1) {
+            if (d == -1)
+            {
                 dim->set_dim_param(name + "_dim_" + std::to_string(dyn_idx++));
-            } else {
+            }
+            else
+            {
                 dim->set_dim_value(d);
             }
         }
@@ -69,32 +80,205 @@ inline void AddValueInfo(
 }
 
 // Add a node to the graph.
-inline onnx::NodeProto* AddNode(
-    onnx::GraphProto* graph,
-    const std::string& name,
-    const std::string& op_type,
-    const std::vector<std::string>& inputs,
-    const std::vector<std::string>& outputs,
-    const std::string& domain = "") {
+inline onnx::NodeProto* AddNode(onnx::GraphProto* graph, const std::string& name, const std::string& op_type,
+                                const std::vector<std::string>& inputs, const std::vector<std::string>& outputs,
+                                const std::string& domain = "")
+{
     auto* node = graph->add_node();
     node->set_name(name);
     node->set_op_type(op_type);
-    if (!domain.empty()) node->set_domain(domain);
-    for (auto& in : inputs) node->add_input(in);
-    for (auto& out : outputs) node->add_output(out);
+    if (!domain.empty())
+        node->set_domain(domain);
+    for (auto& in : inputs)
+        node->add_input(in);
+    for (auto& out : outputs)
+        node->add_output(out);
     return node;
 }
 
+inline void AddExternalDataEntry(onnx::TensorProto* tensor, const std::string& key, const std::string& value)
+{
+    auto* entry = tensor->add_external_data();
+    entry->set_key(key);
+    entry->set_value(value);
+}
+
+inline void SetMemAddrFloatTensor(onnx::TensorProto* tensor, const std::string& name, const std::vector<int64_t>& dims,
+                                  const void* data, size_t bytes)
+{
+    tensor->set_name(name);
+    tensor->set_data_type(onnx::TensorProto_DataType_FLOAT);
+    for (const auto dim : dims)
+    {
+        tensor->add_dims(dim);
+    }
+
+    tensor->set_data_location(onnx::TensorProto_DataLocation_EXTERNAL);
+    AddExternalDataEntry(tensor, "location", kMemAddrExternalDataLocation);
+    AddExternalDataEntry(tensor, "offset", std::to_string(reinterpret_cast<uintptr_t>(data)));
+    AddExternalDataEntry(tensor, "length", std::to_string(bytes));
+}
+
+inline onnx::ModelProto CreateModelWithDefaultOpset(const std::string& graph_name, int64_t opset_version = 13)
+{
+    onnx::ModelProto model;
+    model.set_ir_version(7);
+
+    auto* opset = model.add_opset_import();
+    opset->set_domain("");
+    opset->set_version(opset_version);
+
+    model.mutable_graph()->set_name(graph_name);
+    return model;
+}
+
 // Serialize model to file.
-inline void SaveModel(const onnx::ModelProto& model,
-                      const std::string& path) {
+inline void SaveModel(const onnx::ModelProto& model, const std::string& path)
+{
     std::ofstream out(path, std::ios::binary);
-    if (!out.is_open()) {
+    if (!out.is_open())
+    {
         throw std::runtime_error("Cannot open file for writing: " + path);
     }
-    if (!model.SerializeToOstream(&out)) {
+    if (!model.SerializeToOstream(&out))
+    {
         throw std::runtime_error("Failed to serialize model to: " + path);
     }
+}
+
+// ---------------------------------------------------------------------------
+// CreateDumpTestModelWithNestedMemAddrTensors
+// ---------------------------------------------------------------------------
+//
+// Builds a small MatMul model whose initializer payloads are represented with
+// the TRT RTX EP's _MEM_ADDR_ convention. The node also carries tensor and
+// graph attributes so dump tests can verify recursive materialization.
+//
+inline onnx::ModelProto CreateDumpTestModelWithNestedMemAddrTensors(
+    const void* weight_data, size_t weight_bytes, const void* attr_tensor_data, size_t attr_tensor_bytes,
+    const void* attr_tensor_list_data, size_t attr_tensor_list_bytes, const void* nested_graph_initializer_data,
+    size_t nested_graph_initializer_bytes, const void* nested_graph_list_initializer_data,
+    size_t nested_graph_list_initializer_bytes)
+{
+    auto model = CreateModelWithDefaultOpset("dump_test_graph");
+    auto* graph = model.mutable_graph();
+
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {1, 2});
+    AddValueInfo(graph->mutable_output(), "Y", onnx::TensorProto_DataType_FLOAT, {1, 2});
+
+    SetMemAddrFloatTensor(graph->add_initializer(), "W", {2, 2}, weight_data, weight_bytes);
+
+    auto* node = AddNode(graph, "matmul", "MatMul", {"X", "W"}, {"Y"});
+
+    {
+        auto* attr = node->add_attribute();
+        attr->set_name("single_tensor");
+        attr->set_type(onnx::AttributeProto_AttributeType_TENSOR);
+        SetMemAddrFloatTensor(attr->mutable_t(), "single_tensor", {1}, attr_tensor_data, attr_tensor_bytes);
+    }
+    {
+        auto* attr = node->add_attribute();
+        attr->set_name("tensor_list");
+        attr->set_type(onnx::AttributeProto_AttributeType_TENSORS);
+        SetMemAddrFloatTensor(attr->add_tensors(), "tensor_list_0", {1}, attr_tensor_list_data, attr_tensor_list_bytes);
+    }
+    {
+        auto* attr = node->add_attribute();
+        attr->set_name("single_graph");
+        attr->set_type(onnx::AttributeProto_AttributeType_GRAPH);
+        auto* nested_graph = attr->mutable_g();
+        nested_graph->set_name("single_nested_graph");
+        SetMemAddrFloatTensor(nested_graph->add_initializer(), "nested_W", {1}, nested_graph_initializer_data,
+                              nested_graph_initializer_bytes);
+    }
+    {
+        auto* attr = node->add_attribute();
+        attr->set_name("graph_list");
+        attr->set_type(onnx::AttributeProto_AttributeType_GRAPHS);
+        auto* nested_graph = attr->add_graphs();
+        nested_graph->set_name("nested_graph_list_0");
+        SetMemAddrFloatTensor(nested_graph->add_initializer(), "nested_graph_list_W", {1},
+                              nested_graph_list_initializer_data, nested_graph_list_initializer_bytes);
+    }
+
+    return model;
+}
+
+inline onnx::ModelProto CreateDumpTestMatMulModelWithMemAddrWeight(const void* weight_data, size_t weight_bytes,
+                                                                   int weight_rows, int weight_cols)
+{
+    auto model = CreateModelWithDefaultOpset("dump_test_matmul_graph");
+    auto* graph = model.mutable_graph();
+
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {1, weight_rows});
+    AddValueInfo(graph->mutable_output(), "Y", onnx::TensorProto_DataType_FLOAT, {1, weight_cols});
+
+    SetMemAddrFloatTensor(graph->add_initializer(), "W", {weight_rows, weight_cols}, weight_data, weight_bytes);
+    AddNode(graph, "matmul", "MatMul", {"X", "W"}, {"Y"});
+    return model;
+}
+
+inline void CreateInitializerMatMulModel(const std::string& path)
+{
+    auto model = CreateModelWithDefaultOpset("InitializerMatMulGraph");
+    auto* graph = model.mutable_graph();
+
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {1, 4});
+    AddValueInfo(graph->mutable_output(), "Y", onnx::TensorProto_DataType_FLOAT, {1, 3});
+
+    const std::vector<float> weights = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F};
+
+    auto* tensor = graph->add_initializer();
+    tensor->set_name("W");
+    tensor->set_data_type(onnx::TensorProto_DataType_FLOAT);
+    tensor->add_dims(4);
+    tensor->add_dims(3);
+    tensor->set_raw_data(weights.data(), weights.size() * sizeof(float));
+
+    AddNode(graph, "matmul", "MatMul", {"X", "W"}, {"Y"});
+    SaveModel(model, path);
+}
+
+inline void CreateTwoInitializerMatMulSubgraphsModel(const std::string& path)
+{
+    auto model = CreateModelWithDefaultOpset("TwoInitializerMatMulSubgraphs");
+    auto* ms_opset = model.add_opset_import();
+    ms_opset->set_domain("com.microsoft");
+    ms_opset->set_version(1);
+
+    auto* graph = model.mutable_graph();
+
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {1, 4});
+    AddValueInfo(graph->mutable_output(), "Y", onnx::TensorProto_DataType_FLOAT, {1, 2});
+    AddValueInfo(graph->mutable_value_info(), "matmul_1_output", onnx::TensorProto_DataType_FLOAT, {1, 4});
+    AddValueInfo(graph->mutable_value_info(), "fast_gelu_output", onnx::TensorProto_DataType_FLOAT, {1, 4});
+
+    {
+        const std::vector<float> weights = {1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
+                                            0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F};
+
+        auto* tensor = graph->add_initializer();
+        tensor->set_name("W1");
+        tensor->set_data_type(onnx::TensorProto_DataType_FLOAT);
+        tensor->add_dims(4);
+        tensor->add_dims(4);
+        tensor->set_raw_data(weights.data(), weights.size() * sizeof(float));
+    }
+    {
+        const std::vector<float> weights = {1.0F, 0.5F, -1.0F, 2.0F, 0.25F, -0.75F, 1.5F, -1.5F};
+
+        auto* tensor = graph->add_initializer();
+        tensor->set_name("W2");
+        tensor->set_data_type(onnx::TensorProto_DataType_FLOAT);
+        tensor->add_dims(4);
+        tensor->add_dims(2);
+        tensor->set_raw_data(weights.data(), weights.size() * sizeof(float));
+    }
+
+    AddNode(graph, "matmul_1", "MatMul", {"X", "W1"}, {"matmul_1_output"});
+    AddNode(graph, "fast_gelu", "FastGelu", {"matmul_1_output"}, {"fast_gelu_output"}, "com.microsoft");
+    AddNode(graph, "matmul_2", "MatMul", {"fast_gelu_output", "W2"}, {"Y"});
+    SaveModel(model, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -118,12 +302,9 @@ inline void SaveModel(const onnx::ModelProto& model,
 // Dynamic dims: -1 becomes a symbolic dim parameter.
 // dtype: one of onnx::TensorProto_DataType values (FLOAT, FLOAT16, etc.)
 //
-inline void CreateBaseModel(
-    const std::string& path,
-    const std::string& graph_name,
-    const std::vector<int>& dims,
-    bool add_fast_gelu = false,
-    int32_t dtype = onnx::TensorProto_DataType_FLOAT) {
+inline void CreateBaseModel(const std::string& path, const std::string& graph_name, const std::vector<int>& dims,
+                            bool add_fast_gelu = false, int32_t dtype = onnx::TensorProto_DataType_FLOAT)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
 
@@ -131,7 +312,8 @@ inline void CreateBaseModel(
     opset->set_domain("");
     opset->set_version(13);
 
-    if (add_fast_gelu) {
+    if (add_fast_gelu)
+    {
         auto* ms_opset = model.add_opset_import();
         ms_opset->set_domain("com.microsoft");
         ms_opset->set_version(1);
@@ -157,10 +339,10 @@ inline void CreateBaseModel(
 
     std::string last_output = "node_2_out_1";
 
-    if (add_fast_gelu) {
+    if (add_fast_gelu)
+    {
         // node_3: FastGelu(node_2_out_1) -> node_3_out_1  (com.microsoft domain)
-        AddNode(graph, "node_3", "FastGelu", {"node_2_out_1"}, {"node_3_out_1"},
-                "com.microsoft");
+        AddNode(graph, "node_3", "FastGelu", {"node_2_out_1"}, {"node_3_out_1"}, "com.microsoft");
         last_output = "node_3_out_1";
     }
 
@@ -188,9 +370,8 @@ inline void CreateBaseModel(
 // Expected compiled model shape:
 //   [EPContext] -> FastGelu
 //
-inline void CreateAsymmetricDqMatMulFastGeluModel(
-    const std::string& path,
-    const std::string& graph_name) {
+inline void CreateAsymmetricDqMatMulFastGeluModel(const std::string& path, const std::string& graph_name)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
 
@@ -209,14 +390,10 @@ inline void CreateAsymmetricDqMatMulFastGeluModel(
     constexpr int kInner = 3;
     constexpr int kCols = 2;
 
-    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT,
-                 {kRows, kInner});
-    AddValueInfo(graph->mutable_output(), "O", onnx::TensorProto_DataType_FLOAT,
-                 {kRows, kCols});
-    AddValueInfo(graph->mutable_value_info(), "dequantizedWeights",
-                 onnx::TensorProto_DataType_FLOAT, {kInner, kCols});
-    AddValueInfo(graph->mutable_value_info(), "matmulOutput",
-                 onnx::TensorProto_DataType_FLOAT, {kRows, kCols});
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {kRows, kInner});
+    AddValueInfo(graph->mutable_output(), "O", onnx::TensorProto_DataType_FLOAT, {kRows, kCols});
+    AddValueInfo(graph->mutable_value_info(), "dequantizedWeights", onnx::TensorProto_DataType_FLOAT, {kInner, kCols});
+    AddValueInfo(graph->mutable_value_info(), "matmulOutput", onnx::TensorProto_DataType_FLOAT, {kRows, kCols});
 
     {
         auto* t = graph->add_initializer();
@@ -225,8 +402,7 @@ inline void CreateAsymmetricDqMatMulFastGeluModel(
         t->add_dims(kInner);
         t->add_dims(kCols);
         const std::vector<int8_t> weights = {16, -8, 5, 12, -3, 9};
-        t->set_raw_data(weights.data(),
-                        static_cast<int>(weights.size() * sizeof(int8_t)));
+        t->set_raw_data(weights.data(), static_cast<int>(weights.size() * sizeof(int8_t)));
     }
     {
         auto* t = graph->add_initializer();
@@ -244,13 +420,9 @@ inline void CreateAsymmetricDqMatMulFastGeluModel(
         t->set_raw_data(&zero_point, sizeof(zero_point));
     }
 
-    AddNode(graph, "dq_weights", "DequantizeLinear",
-            {"Wq", "weightScale", "weightZeroPoint"},
-            {"dequantizedWeights"});
-    AddNode(graph, "matmul", "MatMul", {"X", "dequantizedWeights"},
-            {"matmulOutput"});
-    AddNode(graph, "fast_gelu", "FastGelu", {"matmulOutput"}, {"O"},
-            "com.microsoft");
+    AddNode(graph, "dq_weights", "DequantizeLinear", {"Wq", "weightScale", "weightZeroPoint"}, {"dequantizedWeights"});
+    AddNode(graph, "matmul", "MatMul", {"X", "dequantizedWeights"}, {"matmulOutput"});
+    AddNode(graph, "fast_gelu", "FastGelu", {"matmulOutput"}, {"O"}, "com.microsoft");
 
     SaveModel(model, path);
 }
@@ -271,9 +443,8 @@ inline void CreateAsymmetricDqMatMulFastGeluModel(
 // Expected compiled / runtime shape:
 //   [Q/DQ lowering + MatMul on TRT-RTX] -> FastGelu on CPU
 //
-inline void CreateAsymmetricQdqMatMulFastGeluModel(
-    const std::string& path,
-    const std::string& graph_name) {
+inline void CreateAsymmetricQdqMatMulFastGeluModel(const std::string& path, const std::string& graph_name)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
 
@@ -292,16 +463,11 @@ inline void CreateAsymmetricQdqMatMulFastGeluModel(
     constexpr int kInner = 3;
     constexpr int kCols = 2;
 
-    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT,
-                 {kRows, kInner});
-    AddValueInfo(graph->mutable_output(), "O", onnx::TensorProto_DataType_FLOAT,
-                 {kRows, kCols});
-    AddValueInfo(graph->mutable_value_info(), "quantizedX",
-                 onnx::TensorProto_DataType_INT8, {kRows, kInner});
-    AddValueInfo(graph->mutable_value_info(), "dequantizedX",
-                 onnx::TensorProto_DataType_FLOAT, {kRows, kInner});
-    AddValueInfo(graph->mutable_value_info(), "matmulOutput",
-                 onnx::TensorProto_DataType_FLOAT, {kRows, kCols});
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {kRows, kInner});
+    AddValueInfo(graph->mutable_output(), "O", onnx::TensorProto_DataType_FLOAT, {kRows, kCols});
+    AddValueInfo(graph->mutable_value_info(), "quantizedX", onnx::TensorProto_DataType_INT8, {kRows, kInner});
+    AddValueInfo(graph->mutable_value_info(), "dequantizedX", onnx::TensorProto_DataType_FLOAT, {kRows, kInner});
+    AddValueInfo(graph->mutable_value_info(), "matmulOutput", onnx::TensorProto_DataType_FLOAT, {kRows, kCols});
 
     {
         auto* t = graph->add_initializer();
@@ -324,25 +490,18 @@ inline void CreateAsymmetricQdqMatMulFastGeluModel(
         t->set_data_type(onnx::TensorProto_DataType_FLOAT);
         t->add_dims(kInner);
         t->add_dims(kCols);
-        const std::vector<float> weights = {
-            1.25f, -0.75f,
-            0.50f,  2.00f,
-           -1.50f,  0.25f};
-        for (float w : weights) {
+        const std::vector<float> weights = {1.25f, -0.75f, 0.50f, 2.00f, -1.50f, 0.25f};
+        for (float w : weights)
+        {
             t->add_float_data(w);
         }
     }
 
-    AddNode(graph, "quantize_x", "QuantizeLinear",
-            {"X", "activationScale", "activationZeroPoint"},
-            {"quantizedX"});
-    AddNode(graph, "dequantize_x", "DequantizeLinear",
-            {"quantizedX", "activationScale", "activationZeroPoint"},
+    AddNode(graph, "quantize_x", "QuantizeLinear", {"X", "activationScale", "activationZeroPoint"}, {"quantizedX"});
+    AddNode(graph, "dequantize_x", "DequantizeLinear", {"quantizedX", "activationScale", "activationZeroPoint"},
             {"dequantizedX"});
-    AddNode(graph, "matmul", "MatMul", {"dequantizedX", "W"},
-            {"matmulOutput"});
-    AddNode(graph, "fast_gelu", "FastGelu", {"matmulOutput"}, {"O"},
-            "com.microsoft");
+    AddNode(graph, "matmul", "MatMul", {"dequantizedX", "W"}, {"matmulOutput"});
+    AddNode(graph, "fast_gelu", "FastGelu", {"matmulOutput"}, {"O"}, "com.microsoft");
 
     SaveModel(model, path);
 }
@@ -357,7 +516,8 @@ inline void CreateAsymmetricQdqMatMulFastGeluModel(
 // outputs: "scores" (float), "Less_output_0" (bool),
 //          "Div_17_output_0" (int64), "labels" (int64)
 //
-inline void CreateTopkAndMultipleGraphOutputsModel(const std::string& path) {
+inline void CreateTopkAndMultipleGraphOutputsModel(const std::string& path)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
     auto* opset = model.add_opset_import();
@@ -449,7 +609,8 @@ inline void CreateTopkAndMultipleGraphOutputsModel(const std::string& path) {
 // output: "Y" (float)
 // Dropout produces two outputs; the mask is unused.
 //
-inline void CreateNodeOutputNotUsedModel(const std::string& path) {
+inline void CreateNodeOutputNotUsedModel(const std::string& path)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
     auto* opset = model.add_opset_import();
@@ -460,14 +621,11 @@ inline void CreateNodeOutputNotUsedModel(const std::string& path) {
     graph->set_name("DropoutMatMulGraph");
 
     // Inputs
-    AddValueInfo(graph->mutable_input(), "X",
-                 onnx::TensorProto_DataType_FLOAT, {3, 2});
-    AddValueInfo(graph->mutable_input(), "W",
-                 onnx::TensorProto_DataType_FLOAT, {2, 3});
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {3, 2});
+    AddValueInfo(graph->mutable_input(), "W", onnx::TensorProto_DataType_FLOAT, {2, 3});
 
     // Output
-    AddValueInfo(graph->mutable_output(), "Y",
-                 onnx::TensorProto_DataType_FLOAT, {3, 3});
+    AddValueInfo(graph->mutable_output(), "Y", onnx::TensorProto_DataType_FLOAT, {3, 3});
 
     // Dropout(X) -> dropout_out, dropout_mask  (mask unused)
     AddNode(graph, "DropoutNode", "Dropout", {"X"}, {"dropout_out", "dropout_mask"});
@@ -490,8 +648,8 @@ inline void CreateNodeOutputNotUsedModel(const std::string& path) {
 // The TRT RTX EP registers the "trt" domain custom ops at EP creation time;
 // the raw protobuf references them by name + domain without needing a schema.
 //
-inline void CreateFP8CustomOpModel(const std::string& path,
-                                   const std::string& graph_name) {
+inline void CreateFP8CustomOpModel(const std::string& path, const std::string& graph_name)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
     auto* onnx_opset = model.add_opset_import();
@@ -506,9 +664,9 @@ inline void CreateFP8CustomOpModel(const std::string& path,
 
     const std::vector<int> dims = {4, 64};
     constexpr int32_t kFP16 = onnx::TensorProto_DataType_FLOAT16;
-    constexpr int32_t kFP8  = onnx::TensorProto_DataType_FLOAT8E4M3FN;
+    constexpr int32_t kFP8 = onnx::TensorProto_DataType_FLOAT8E4M3FN;
 
-    AddValueInfo(graph->mutable_input(),  "X", kFP16, dims);
+    AddValueInfo(graph->mutable_input(), "X", kFP16, dims);
     AddValueInfo(graph->mutable_output(), "Y", kFP16, dims);
 
     // scale (FP16 scalar, 0.0078125f)
@@ -521,10 +679,8 @@ inline void CreateFP8CustomOpModel(const std::string& path,
         t->set_raw_data(&v, sizeof(v));
     }
 
-    AddNode(graph, "trt_fp8_quantize_node",   "TRT_FP8QuantizeLinear",
-            {"X", "scale"}, {"X_quantized"}, "trt");
-    AddNode(graph, "trt_fp8_dequantize_node", "TRT_FP8DequantizeLinear",
-            {"X_quantized", "scale"}, {"Y"}, "trt");
+    AddNode(graph, "trt_fp8_quantize_node", "TRT_FP8QuantizeLinear", {"X", "scale"}, {"X_quantized"}, "trt");
+    AddNode(graph, "trt_fp8_dequantize_node", "TRT_FP8DequantizeLinear", {"X_quantized", "scale"}, {"Y"}, "trt");
 
     // Intermediate value info for the FP8 tensor (helps some parsers).
     {
@@ -532,7 +688,8 @@ inline void CreateFP8CustomOpModel(const std::string& path,
         vi->set_name("X_quantized");
         auto* tt = vi->mutable_type()->mutable_tensor_type();
         tt->set_elem_type(kFP8);
-        for (int d : dims) tt->mutable_shape()->add_dim()->set_dim_value(d);
+        for (int d : dims)
+            tt->mutable_shape()->add_dim()->set_dim_value(d);
     }
 
     SaveModel(model, path);
@@ -549,8 +706,8 @@ inline void CreateFP8CustomOpModel(const std::string& path,
 //   X_quantized, X_scale_dequantized -> DequantizeLinear (axis=-1, block_size=16)
 //        -> X_dequantized (FP16 [64,64])
 //
-inline void CreateFP4CustomOpModel(const std::string& path,
-                                   const std::string& graph_name) {
+inline void CreateFP4CustomOpModel(const std::string& path, const std::string& graph_name)
+{
     onnx::ModelProto model;
     model.set_ir_version(10);
     auto* onnx_opset = model.add_opset_import();
@@ -564,12 +721,12 @@ inline void CreateFP4CustomOpModel(const std::string& path,
     graph->set_name(graph_name);
 
     constexpr int32_t kFP16 = onnx::TensorProto_DataType_FLOAT16;
-    constexpr int32_t kFP8  = onnx::TensorProto_DataType_FLOAT8E4M3FN;
-    constexpr int32_t kFP4  = onnx::TensorProto_DataType_FLOAT4E2M1;
-    const std::vector<int> input_dims  = {64, 64};
-    const std::vector<int> scale_dims  = {64, 4};
+    constexpr int32_t kFP8 = onnx::TensorProto_DataType_FLOAT8E4M3FN;
+    constexpr int32_t kFP4 = onnx::TensorProto_DataType_FLOAT4E2M1;
+    const std::vector<int> input_dims = {64, 64};
+    const std::vector<int> scale_dims = {64, 4};
 
-    AddValueInfo(graph->mutable_input(),  "X",             kFP16, input_dims);
+    AddValueInfo(graph->mutable_input(), "X", kFP16, input_dims);
     AddValueInfo(graph->mutable_output(), "X_dequantized", kFP16, input_dims);
 
     // scale (FP16 scalar, 0.1234f)
@@ -593,11 +750,8 @@ inline void CreateFP4CustomOpModel(const std::string& path,
 
     // TRT_FP4DynamicQuantize(X, scale) -> X_quantized, X_scale
     {
-        auto* node = AddNode(graph, "trt_fp4_dyn_quant",
-                             "TRT_FP4DynamicQuantize",
-                             {"X", "scale"},
-                             {"X_quantized", "X_scale"},
-                             "trt");
+        auto* node = AddNode(graph, "trt_fp4_dyn_quant", "TRT_FP4DynamicQuantize", {"X", "scale"},
+                             {"X_quantized", "X_scale"}, "trt");
 
         auto* a_axis = node->add_attribute();
         a_axis->set_name("axis");
@@ -616,14 +770,12 @@ inline void CreateFP4CustomOpModel(const std::string& path,
     }
 
     // DequantizeLinear(X_scale, dequant_scale) -> X_scale_dequantized
-    AddNode(graph, "dequantize_scale_node", "DequantizeLinear",
-            {"X_scale", "dequant_scale"}, {"X_scale_dequantized"});
+    AddNode(graph, "dequantize_scale_node", "DequantizeLinear", {"X_scale", "dequant_scale"}, {"X_scale_dequantized"});
 
     // DequantizeLinear(X_quantized, X_scale_dequantized) -> X_dequantized
     // (axis=-1, block_size=16)
     {
-        auto* node = AddNode(graph, "dequantize_data_node", "DequantizeLinear",
-                             {"X_quantized", "X_scale_dequantized"},
+        auto* node = AddNode(graph, "dequantize_data_node", "DequantizeLinear", {"X_quantized", "X_scale_dequantized"},
                              {"X_dequantized"});
 
         auto* a_axis = node->add_attribute();
@@ -638,16 +790,17 @@ inline void CreateFP4CustomOpModel(const std::string& path,
     }
 
     // Intermediate value info (optional, but helpful for downstream tools).
-    auto add_vi = [&](const std::string& name, int32_t dtype,
-                      const std::vector<int>& shape) {
+    auto add_vi = [&](const std::string& name, int32_t dtype, const std::vector<int>& shape)
+    {
         auto* vi = graph->mutable_value_info()->Add();
         vi->set_name(name);
         auto* tt = vi->mutable_type()->mutable_tensor_type();
         tt->set_elem_type(dtype);
-        for (int d : shape) tt->mutable_shape()->add_dim()->set_dim_value(d);
+        for (int d : shape)
+            tt->mutable_shape()->add_dim()->set_dim_value(d);
     };
-    add_vi("X_quantized",         kFP4,  input_dims);
-    add_vi("X_scale",             kFP8,  scale_dims);
+    add_vi("X_quantized", kFP4, input_dims);
+    add_vi("X_scale", kFP8, scale_dims);
     add_vi("X_scale_dequantized", kFP16, scale_dims);
 
     SaveModel(model, path);
@@ -668,10 +821,9 @@ inline void CreateFP4CustomOpModel(const std::string& path,
 // Size control: num_layers * hidden * hidden * 2 bytes.
 // Default: 8 layers of [1024,1024] FP16 weights ~= 16 MB of weights.
 //
-inline void CreateLargeModel(const std::string& model_path,
-                             const std::string& external_data_path,
-                             int num_layers = 8,
-                             int hidden     = 1024) {
+inline void CreateLargeModel(const std::string& model_path, const std::string& external_data_path, int num_layers = 8,
+                             int hidden = 1024)
+{
     // ---- 1. Build the weight data file ------------------------------------
     // All per-layer weights are concatenated in a single binary file.
     // Each weight is hidden*hidden FP16 values.
@@ -679,9 +831,9 @@ inline void CreateLargeModel(const std::string& model_path,
     const size_t per_layer_bytes = per_layer_elems * sizeof(uint16_t);
 
     std::ofstream data_out(external_data_path, std::ios::binary);
-    if (!data_out.is_open()) {
-        throw std::runtime_error(
-            "Cannot open external data file for writing: " + external_data_path);
+    if (!data_out.is_open())
+    {
+        throw std::runtime_error("Cannot open external data file for writing: " + external_data_path);
     }
 
     // Deterministic pseudo-random fp16 values (small magnitude, bounded).
@@ -689,14 +841,15 @@ inline void CreateLargeModel(const std::string& model_path,
     std::uniform_int_distribution<int> dist(0, 0x2800);  // small fp16 magnitudes
 
     std::vector<uint16_t> buffer(per_layer_elems);
-    for (int l = 0; l < num_layers; ++l) {
-        for (auto& v : buffer) v = static_cast<uint16_t>(dist(rng));
-        data_out.write(reinterpret_cast<const char*>(buffer.data()),
-                       static_cast<std::streamsize>(per_layer_bytes));
+    for (int l = 0; l < num_layers; ++l)
+    {
+        for (auto& v : buffer)
+            v = static_cast<uint16_t>(dist(rng));
+        data_out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(per_layer_bytes));
     }
-    if (!data_out.good()) {
-        throw std::runtime_error(
-            "Failed to write external data to: " + external_data_path);
+    if (!data_out.good())
+    {
+        throw std::runtime_error("Failed to write external data to: " + external_data_path);
     }
     data_out.close();
 
@@ -712,23 +865,23 @@ inline void CreateLargeModel(const std::string& model_path,
 
     constexpr int32_t kFP16 = onnx::TensorProto_DataType_FLOAT16;
 
-    AddValueInfo(graph->mutable_input(),  "X", kFP16, {1, hidden});
+    AddValueInfo(graph->mutable_input(), "X", kFP16, {1, hidden});
     AddValueInfo(graph->mutable_output(), "O", kFP16, {1, hidden});
 
     // Extract the filename (location inside ONNX must be a relative path).
     std::string location = external_data_path;
     {
         const auto pos = location.find_last_of("/\\");
-        if (pos != std::string::npos) location = location.substr(pos + 1);
+        if (pos != std::string::npos)
+            location = location.substr(pos + 1);
     }
 
     std::string prev = "X";
-    for (int l = 0; l < num_layers; ++l) {
-        const std::string w_name   = "W" + std::to_string(l);
-        const std::string mm_out   = "mm" + std::to_string(l);
-        const std::string relu_out = (l == num_layers - 1)
-                                         ? std::string("O")
-                                         : ("r" + std::to_string(l));
+    for (int l = 0; l < num_layers; ++l)
+    {
+        const std::string w_name = "W" + std::to_string(l);
+        const std::string mm_out = "mm" + std::to_string(l);
+        const std::string relu_out = (l == num_layers - 1) ? std::string("O") : ("r" + std::to_string(l));
 
         // Weight initializer — stored as external data.
         auto* t = graph->add_initializer();
@@ -745,8 +898,7 @@ inline void CreateLargeModel(const std::string& model_path,
         {
             auto* e = t->add_external_data();
             e->set_key("offset");
-            e->set_value(std::to_string(
-                static_cast<long long>(static_cast<size_t>(l) * per_layer_bytes)));
+            e->set_value(std::to_string(static_cast<long long>(static_cast<size_t>(l) * per_layer_bytes)));
         }
         {
             auto* e = t->add_external_data();
@@ -755,11 +907,9 @@ inline void CreateLargeModel(const std::string& model_path,
         }
 
         // X @ W -> mm
-        AddNode(graph, "mm_" + std::to_string(l), "MatMul",
-                {prev, w_name}, {mm_out});
+        AddNode(graph, "mm_" + std::to_string(l), "MatMul", {prev, w_name}, {mm_out});
         // Relu(mm) -> next
-        AddNode(graph, "relu_" + std::to_string(l), "Relu",
-                {mm_out}, {relu_out});
+        AddNode(graph, "relu_" + std::to_string(l), "Relu", {mm_out}, {relu_out});
         prev = relu_out;
     }
 
@@ -774,9 +924,9 @@ inline void CreateLargeModel(const std::string& model_path,
 // with an optional "source" attribute. Used to test that the TRT RTX EP
 // correctly skips EPContext nodes whose source belongs to a different EP.
 //
-inline void CreateSyntheticEPContextModel(const std::string& model_path,
-                                          const std::string& source_attr,
-                                          bool include_source_attr = true) {
+inline void CreateSyntheticEPContextModel(const std::string& model_path, const std::string& source_attr,
+                                          bool include_source_attr = true)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
     auto* onnx_opset = model.add_opset_import();
@@ -789,13 +939,10 @@ inline void CreateSyntheticEPContextModel(const std::string& model_path,
     auto* graph = model.mutable_graph();
     graph->set_name("EPContextSourceTest");
 
-    AddValueInfo(graph->mutable_input(),  "input",
-                 onnx::TensorProto_DataType_FLOAT, {1, 3});
-    AddValueInfo(graph->mutable_output(), "output",
-                 onnx::TensorProto_DataType_FLOAT, {1, 3});
+    AddValueInfo(graph->mutable_input(), "input", onnx::TensorProto_DataType_FLOAT, {1, 3});
+    AddValueInfo(graph->mutable_output(), "output", onnx::TensorProto_DataType_FLOAT, {1, 3});
 
-    auto* node = AddNode(graph, "ep_context_node", "EPContext",
-                         {"input"}, {"output"}, "com.microsoft");
+    auto* node = AddNode(graph, "ep_context_node", "EPContext", {"input"}, {"output"}, "com.microsoft");
 
     // embed_mode attribute
     {
@@ -812,7 +959,8 @@ inline void CreateSyntheticEPContextModel(const std::string& model_path,
         a->set_s("dummy_context_data");
     }
     // source attribute (optional)
-    if (include_source_attr) {
+    if (include_source_attr)
+    {
         auto* a = node->add_attribute();
         a->set_name("source");
         a->set_type(onnx::AttributeProto_AttributeType_STRING);
@@ -866,10 +1014,8 @@ inline void CreateSyntheticEPContextModel(const std::string& model_path,
 // memory alignment; the unit tests print the observed cudaMemGetInfo delta
 // so the caller can tune M for their device.
 //
-inline void CreateLargeScratchModel(
-    const std::string& path,
-    int M,
-    int K = 16) {
+inline void CreateLargeScratchModel(const std::string& path, int M, int K = 16)
+{
     onnx::ModelProto model;
     model.set_ir_version(7);
     auto* opset = model.add_opset_import();
@@ -879,28 +1025,26 @@ inline void CreateLargeScratchModel(
     auto* graph = model.mutable_graph();
     graph->set_name("LargeScratchGraph");
 
-    AddValueInfo(graph->mutable_input(), "X",
-                 onnx::TensorProto_DataType_FLOAT, {1, M, K});
-    AddValueInfo(graph->mutable_output(), "Y",
-                 onnx::TensorProto_DataType_FLOAT, {1, M, K});
+    AddValueInfo(graph->mutable_input(), "X", onnx::TensorProto_DataType_FLOAT, {1, M, K});
+    AddValueInfo(graph->mutable_output(), "Y", onnx::TensorProto_DataType_FLOAT, {1, M, K});
 
     // Zero-filled weights: TRT only cares about shape/dtype at load time. We
     // keep K small so each weight is only a few MB regardless of M.
-    auto add_weight = [&](const std::string& name, int d0, int d1) {
+    auto add_weight = [&](const std::string& name, int d0, int d1)
+    {
         auto* init = graph->add_initializer();
         init->set_name(name);
         init->set_data_type(onnx::TensorProto_DataType_FLOAT);
         init->add_dims(d0);
         init->add_dims(d1);
-        const size_t num_bytes = static_cast<size_t>(d0) *
-                                 static_cast<size_t>(d1) * sizeof(float);
+        const size_t num_bytes = static_cast<size_t>(d0) * static_cast<size_t>(d1) * sizeof(float);
         init->mutable_raw_data()->assign(num_bytes, '\0');
     };
     add_weight("W1", K, M);
     add_weight("W2", M, K);
 
-    AddNode(graph, "matmul_1", "MatMul", {"X",  "W1"}, {"T1"});
-    AddNode(graph, "relu_1",   "Relu",   {"T1"},       {"T2"});
+    AddNode(graph, "matmul_1", "MatMul", {"X", "W1"}, {"T1"});
+    AddNode(graph, "relu_1", "Relu", {"T1"}, {"T2"});
     AddNode(graph, "matmul_2", "MatMul", {"T2", "W2"}, {"Y"});
 
     SaveModel(model, path);
