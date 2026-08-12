@@ -226,6 +226,9 @@ for ep_device in ep_devices:
         trt_device = ep_device
         break
 
+if trt_device is None:
+    raise RuntimeError("TensorRT RTX EP device not found")
+
 # 3. Add EP device to session options with provider options
 session_options = ort.SessionOptions()
 session_options.add_provider_for_devices(
