@@ -15,9 +15,10 @@
 
 #pragma once
 
+#include "onnxruntime_cxx_api.h"
+
 #include "base.h"
 #include "utils.h"
-#include "onnxruntime_cxx_api.h"
 
 namespace trt_rtx_ep
 {
@@ -27,15 +28,17 @@ namespace trt_rtx_ep
 //!
 class MemcpyFromHost : public BaseKernelImpl
 {
- private:
-  struct PrivateTag {};
+private:
+    struct PrivateTag
+    {
+    };
 
- public:
-  static OrtStatus* Create(const OrtKernelInfo* info, void* state, /*out*/ std::unique_ptr<MemcpyFromHost>& kernel);
-  MemcpyFromHost(const OrtKernelInfo* info, void* state, PrivateTag);
+public:
+    static OrtStatus* Create(const OrtKernelInfo* info, void* state, /*out*/ std::unique_ptr<MemcpyFromHost>& kernel);
+    MemcpyFromHost(const OrtKernelInfo* info, void* state, PrivateTag);
 
- private:
-  OrtStatus* DoCompute(OrtKernelContext* kernel_ctx) override;
+private:
+    OrtStatus* DoCompute(OrtKernelContext* kernel_ctx) override;
 };
 
 //!
@@ -43,15 +46,17 @@ class MemcpyFromHost : public BaseKernelImpl
 //!
 class MemcpyToHost : public BaseKernelImpl
 {
- private:
-  struct PrivateTag {};
+private:
+    struct PrivateTag
+    {
+    };
 
- public:
-  static OrtStatus* Create(const OrtKernelInfo* info, void* state, /*out*/ std::unique_ptr<MemcpyToHost>& kernel);
-  MemcpyToHost(const OrtKernelInfo* info, void* state, PrivateTag);
+public:
+    static OrtStatus* Create(const OrtKernelInfo* info, void* state, /*out*/ std::unique_ptr<MemcpyToHost>& kernel);
+    MemcpyToHost(const OrtKernelInfo* info, void* state, PrivateTag);
 
- private:
-  OrtStatus* DoCompute(OrtKernelContext* kernel_ctx) override;
+private:
+    OrtStatus* DoCompute(OrtKernelContext* kernel_ctx) override;
 };
 
-} // namespace trt_rtx_ep
+}  // namespace trt_rtx_ep

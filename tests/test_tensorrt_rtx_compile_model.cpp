@@ -61,17 +61,16 @@ constexpr int kNumThreads = 5;
 
 struct CompileConfig
 {
-    bool embed_mode;        ///< passed to SetEpContextEmbedMode
-    bool input_from_buffer; ///< use SetInputModelFromBuffer instead of SetInputModelPath
-    bool output_to_buffer;  ///< use SetOutputModelBuffer instead of SetOutputModelPath
+    bool embed_mode;         ///< passed to SetEpContextEmbedMode
+    bool input_from_buffer;  ///< use SetInputModelFromBuffer instead of SetInputModelPath
+    bool output_to_buffer;   ///< use SetOutputModelBuffer instead of SetOutputModelPath
 };
 
 /// Short human-readable label used as the GTest parameter suffix.
 std::string config_name(const CompileConfig& c)
 {
-    return std::string(c.embed_mode ? "EmbedOn" : "EmbedOff")
-        + "_In" + (c.input_from_buffer ? "Buf" : "File")
-        + "_Out" + (c.output_to_buffer ? "Buf" : "File");
+    return std::string(c.embed_mode ? "EmbedOn" : "EmbedOff") + "_In" + (c.input_from_buffer ? "Buf" : "File") +
+           "_Out" + (c.output_to_buffer ? "Buf" : "File");
 }
 
 // ---------------------------------------------------------------------------
@@ -106,16 +105,22 @@ inline std::string toOrtDirString(const std::filesystem::path& dir_path)
 
 struct CompileResult
 {
-    std::filesystem::path path;           ///< non-empty when output went to a file
-    std::vector<char>     buffer;         ///< non-empty when output went to a buffer
+    std::filesystem::path path;  ///< non-empty when output went to a file
+    std::vector<char> buffer;    ///< non-empty when output went to a buffer
     /// Always set by compile_model_flexible() to the user's intended output path.
     /// For buffer output + embed_mode=false this also tells the EP where to find the
     /// external engine binary when the compiled buffer is later loaded into a session
     /// (passed through kOrtSessionOptionEpContextFilePath in make_session_from_result).
     std::filesystem::path intended_ctx_path;
 
-    bool is_file()   const { return !path.empty(); }
-    bool is_buffer() const { return !buffer.empty(); }
+    bool is_file() const
+    {
+        return !path.empty();
+    }
+    bool is_buffer() const
+    {
+        return !buffer.empty();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -129,7 +134,7 @@ Ort::SessionOptions make_session_options()
     //     cudaStreamCreate(&stream);
 
     Ort::SessionOptions so;
-    Ort::KeyValuePairs  ep_opts;
+    Ort::KeyValuePairs ep_opts;
     ep_opts.Add("enable_cuda_graph", "1");
     ep_opts.Add("nv_runtime_cache_path", "./rt_cache");
     // ep_opts.Add("has_user_compute_stream", "1");
@@ -163,17 +168,15 @@ std::vector<char> read_file_bytes(const std::filesystem::path& p)
 // Throws std::runtime_error on failure.
 // ---------------------------------------------------------------------------
 
-CompileResult compile_model_flexible(
-    const std::filesystem::path& input_path,
-    const std::filesystem::path& output_path,
-    const CompileConfig&         cfg)
+CompileResult compile_model_flexible(const std::filesystem::path& input_path, const std::filesystem::path& output_path,
+                                     const CompileConfig& cfg)
 {
-    auto                         so = make_session_options();
+    auto so = make_session_options();
     Ort::ModelCompilationOptions opts(*ort_env, so);
     opts.SetEpContextEmbedMode(cfg.embed_mode);
 
     // -- input --
-    std::vector<char> input_bytes; // must outlive Ort::CompileModel
+    std::vector<char> input_bytes;  // must outlive Ort::CompileModel
     if (cfg.input_from_buffer)
     {
         input_bytes = read_file_bytes(input_path);
@@ -186,7 +189,7 @@ CompileResult compile_model_flexible(
 
     // -- output --
     Ort::AllocatorWithDefaultOptions allocator;
-    void*  out_ptr  = nullptr;
+    void* out_ptr = nullptr;
     size_t out_size = 0;
 
     if (cfg.output_to_buffer)
@@ -197,9 +200,8 @@ CompileResult compile_model_flexible(
         {
             const auto ctx_dir = output_path.parent_path();
             std::filesystem::create_directories(ctx_dir);
-            opts.SetEpContextBinaryInformation(
-                toOrtDirString(ctx_dir).c_str(),
-                toOrtString(output_path.stem()).c_str());
+            opts.SetEpContextBinaryInformation(toOrtDirString(ctx_dir).c_str(),
+                                               toOrtString(output_path.stem()).c_str());
         }
     }
     else
@@ -217,9 +219,7 @@ CompileResult compile_model_flexible(
     {
         if (out_ptr != nullptr && out_size > 0)
         {
-            result.buffer.assign(
-                static_cast<char*>(out_ptr),
-                static_cast<char*>(out_ptr) + out_size);
+            result.buffer.assign(static_cast<char*>(out_ptr), static_cast<char*>(out_ptr) + out_size);
         }
         allocator.Free(out_ptr);
     }
@@ -259,7 +259,7 @@ Ort::Session make_session_from_result(const CompileResult& result)
     return Ort::Session(*ort_env, result.buffer.data(), result.buffer.size(), so);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // Parameterized fixture – inherits SetUp checks from CompileModelTest.
@@ -268,7 +268,8 @@ Ort::Session make_session_from_result(const CompileResult& result)
 class CompileModelParamTest
     : public CompileModelTest
     , public ::testing::WithParamInterface<CompileConfig>
-{};
+{
+};
 
 // ---------------------------------------------------------------------------
 // Test 1: single-threaded compile then session load + shape check.
@@ -276,8 +277,8 @@ class CompileModelParamTest
 
 TEST_P(CompileModelParamTest, CompilesModel)
 {
-    const auto& cfg         = GetParam();
-    const auto  output_path = kModelPath.parent_path() / "context.onnx";
+    const auto& cfg = GetParam();
+    const auto output_path = kModelPath.parent_path() / "context.onnx";
     std::filesystem::remove(output_path);
 
     CompileResult result;
@@ -285,8 +286,7 @@ TEST_P(CompileModelParamTest, CompilesModel)
 
     if (result.is_file())
     {
-        ASSERT_TRUE(std::filesystem::is_regular_file(result.path))
-            << "Compiled model not found at: " << result.path;
+        ASSERT_TRUE(std::filesystem::is_regular_file(result.path)) << "Compiled model not found at: " << result.path;
     }
     else
     {
@@ -296,7 +296,7 @@ TEST_P(CompileModelParamTest, CompilesModel)
     // Verify the compiled model loads into a valid session.
     Ort::Session session{nullptr};
     ASSERT_NO_THROW(session = make_session_from_result(result));
-    EXPECT_EQ(session.GetInputCount(),  1u);
+    EXPECT_EQ(session.GetInputCount(), 1u);
     EXPECT_EQ(session.GetOutputCount(), 1u);
 }
 
@@ -312,15 +312,14 @@ TEST_P(CompileModelParamTest, ConcurrentCompile)
     std::vector<std::filesystem::path> output_paths(kNumThreads);
     for (int i = 0; i < kNumThreads; ++i)
     {
-        output_paths[i] =
-            kModelPath.parent_path() / ("context_thread_" + std::to_string(i) + ".onnx");
+        output_paths[i] = kModelPath.parent_path() / ("context_thread_" + std::to_string(i) + ".onnx");
         std::filesystem::remove(output_paths[i]);
     }
 
 #if USE_STD_THREAD
-    std::vector<CompileResult>      results(kNumThreads);
+    std::vector<CompileResult> results(kNumThreads);
     std::vector<std::exception_ptr> exceptions(kNumThreads);
-    std::vector<std::thread>        threads;
+    std::vector<std::thread> threads;
     threads.reserve(kNumThreads);
 
     for (int i = 0; i < kNumThreads; ++i)
@@ -350,8 +349,7 @@ TEST_P(CompileModelParamTest, ConcurrentCompile)
                 EXPECT_TRUE(std::filesystem::is_regular_file(results[i].path))
                     << "Thread " << i << " output file missing: " << results[i].path;
             else
-                EXPECT_FALSE(results[i].buffer.empty())
-                    << "Thread " << i << " output buffer is empty";
+                EXPECT_FALSE(results[i].buffer.empty()) << "Thread " << i << " output buffer is empty";
         }
     }
 #else
@@ -360,10 +358,10 @@ TEST_P(CompileModelParamTest, ConcurrentCompile)
     for (int i = 0; i < kNumThreads; ++i)
     {
         futures.push_back(std::async(std::launch::async,
-            [&output_paths, &cfg, i]()
-            {
-                return compile_model_flexible(kModelPath, output_paths[i], cfg);
-            }));
+                                     [&output_paths, &cfg, i]()
+                                     {
+                                         return compile_model_flexible(kModelPath, output_paths[i], cfg);
+                                     }));
     }
 
     for (int i = 0; i < kNumThreads; ++i)
@@ -374,8 +372,7 @@ TEST_P(CompileModelParamTest, ConcurrentCompile)
             EXPECT_TRUE(std::filesystem::is_regular_file(result.path))
                 << "Thread " << i << " output file missing: " << result.path;
         else
-            EXPECT_FALSE(result.buffer.empty())
-                << "Thread " << i << " output buffer is empty";
+            EXPECT_FALSE(result.buffer.empty()) << "Thread " << i << " output buffer is empty";
     }
 #endif
 }
@@ -455,23 +452,15 @@ TEST_P(CompileModelParamTest, ConcurrentSessionInstantiationAndSequentialInferen
 // Instantiate all 8 combinations: embed × input-mode × output-mode
 // ---------------------------------------------------------------------------
 
-INSTANTIATE_TEST_SUITE_P(
-    TensorRTRTXEpTest_AllModes,
-    CompileModelParamTest,
-    ::testing::Values(
-        CompileConfig{false, false, false},
-        CompileConfig{false, false, true },
-        CompileConfig{false, true,  false},
-        CompileConfig{false, true,  true },
-        CompileConfig{true,  false, false},
-        CompileConfig{true,  false, true },
-        CompileConfig{true,  true,  false},
-        CompileConfig{true,  true,  true }
-    ),
-    [](const ::testing::TestParamInfo<CompileConfig>& info)
-    {
-        return config_name(info.param);
-    });
+INSTANTIATE_TEST_SUITE_P(TensorRTRTXEpTest_AllModes, CompileModelParamTest,
+                         ::testing::Values(CompileConfig{false, false, false}, CompileConfig{false, false, true},
+                                           CompileConfig{false, true, false}, CompileConfig{false, true, true},
+                                           CompileConfig{true, false, false}, CompileConfig{true, false, true},
+                                           CompileConfig{true, true, false}, CompileConfig{true, true, true}),
+                         [](const ::testing::TestParamInfo<CompileConfig>& info)
+                         {
+                             return config_name(info.param);
+                         });
 
 // ---------------------------------------------------------------------------
 // Special-character and runtime-cache path tests
@@ -492,13 +481,12 @@ namespace
 struct SpecialCharsCase
 {
     std::filesystem::path subdir_name;
-    const char*           label;
+    const char* label;
 };
 
 // Returns the subdirectory under the model directory rooted at the supplied
 // subdir name. Used by the parameterized special-chars tests below.
-inline std::filesystem::path special_chars_base_dir(
-    const std::filesystem::path& subdir)
+inline std::filesystem::path special_chars_base_dir(const std::filesystem::path& subdir)
 {
     return kModelPath.parent_path() / subdir;
 }
@@ -515,15 +503,15 @@ inline std::vector<SpecialCharsCase> cp1252_mappable_cases()
     return {
 #ifdef _WIN32
         // The original case carried through from the pre-MR test.
-        { std::filesystem::path{L"special (chars) r\u00e9sum\u00e9"},   "EAcuteResume" },
-        { std::filesystem::path{L"Verd\u00fa2"},                        "VerduTwo"     },  // u-acute U+00FA
-        { std::filesystem::path{L"M\u00fcnchen"},                       "Muenchen"     },  // u-umlaut U+00FC
-        { std::filesystem::path{L"Caf\u00e9_Gr\u00f6\u00dfe"},          "CafeGroesse"  },  // e-acute, o-umlaut, sharp-s
+        {std::filesystem::path{L"special (chars) r\u00e9sum\u00e9"}, "EAcuteResume"},
+        {std::filesystem::path{L"Verd\u00fa2"}, "VerduTwo"},                   // u-acute U+00FA
+        {std::filesystem::path{L"M\u00fcnchen"}, "Muenchen"},                  // u-umlaut U+00FC
+        {std::filesystem::path{L"Caf\u00e9_Gr\u00f6\u00dfe"}, "CafeGroesse"},  // e-acute, o-umlaut, sharp-s
 #else
-        { std::filesystem::path{u8"special (chars) r\u00e9sum\u00e9"},  "EAcuteResume" },
-        { std::filesystem::path{u8"Verd\u00fa2"},                       "VerduTwo"     },
-        { std::filesystem::path{u8"M\u00fcnchen"},                      "Muenchen"     },
-        { std::filesystem::path{u8"Caf\u00e9_Gr\u00f6\u00dfe"},         "CafeGroesse"  },
+        {std::filesystem::path{u8"special (chars) r\u00e9sum\u00e9"}, "EAcuteResume"},
+        {std::filesystem::path{u8"Verd\u00fa2"}, "VerduTwo"},
+        {std::filesystem::path{u8"M\u00fcnchen"}, "Muenchen"},
+        {std::filesystem::path{u8"Caf\u00e9_Gr\u00f6\u00dfe"}, "CafeGroesse"},
 #endif
     };
 }
@@ -539,35 +527,32 @@ inline std::vector<SpecialCharsCase> all_special_chars_cases()
 {
     auto v = cp1252_mappable_cases();
 #ifdef _WIN32
-    v.push_back({ std::filesystem::path{L"\u0141ukasz"},                                  "Lukasz"          });
-    v.push_back({ std::filesystem::path{L"\u0141\u00f3d\u017a"},                          "Lodz"            });
-    v.push_back({ std::filesystem::path{L"\u017dlu\u0165ou\u010dk\u00fd"},                "Zlutoucky"       });
-    v.push_back({ std::filesystem::path{L"\u5c71\u7530"},                                 "Yamada_CJK"      });
-    v.push_back({ std::filesystem::path{L"\u041c\u043e\u0441\u043a\u0432\u0430"},         "Moskva_Cyrillic" });
-    v.push_back({ std::filesystem::path{L"test_\U0001F389_party"},                        "Party_Emoji"     });
-    v.push_back({ std::filesystem::path{L"\u00e9_\u6f22_\u03b1_\u03a9"},                  "MultiScript"     });
+    v.push_back({std::filesystem::path{L"\u0141ukasz"}, "Lukasz"});
+    v.push_back({std::filesystem::path{L"\u0141\u00f3d\u017a"}, "Lodz"});
+    v.push_back({std::filesystem::path{L"\u017dlu\u0165ou\u010dk\u00fd"}, "Zlutoucky"});
+    v.push_back({std::filesystem::path{L"\u5c71\u7530"}, "Yamada_CJK"});
+    v.push_back({std::filesystem::path{L"\u041c\u043e\u0441\u043a\u0432\u0430"}, "Moskva_Cyrillic"});
+    v.push_back({std::filesystem::path{L"test_\U0001F389_party"}, "Party_Emoji"});
+    v.push_back({std::filesystem::path{L"\u00e9_\u6f22_\u03b1_\u03a9"}, "MultiScript"});
 #else
-    v.push_back({ std::filesystem::path{u8"\u0141ukasz"},                                 "Lukasz"          });
-    v.push_back({ std::filesystem::path{u8"\u0141\u00f3d\u017a"},                         "Lodz"            });
-    v.push_back({ std::filesystem::path{u8"\u017dlu\u0165ou\u010dk\u00fd"},               "Zlutoucky"       });
-    v.push_back({ std::filesystem::path{u8"\u5c71\u7530"},                                "Yamada_CJK"      });
-    v.push_back({ std::filesystem::path{u8"\u041c\u043e\u0441\u043a\u0432\u0430"},        "Moskva_Cyrillic" });
-    v.push_back({ std::filesystem::path{u8"test_\U0001F389_party"},                       "Party_Emoji"     });
-    v.push_back({ std::filesystem::path{u8"\u00e9_\u6f22_\u03b1_\u03a9"},                 "MultiScript"     });
+    v.push_back({std::filesystem::path{u8"\u0141ukasz"}, "Lukasz"});
+    v.push_back({std::filesystem::path{u8"\u0141\u00f3d\u017a"}, "Lodz"});
+    v.push_back({std::filesystem::path{u8"\u017dlu\u0165ou\u010dk\u00fd"}, "Zlutoucky"});
+    v.push_back({std::filesystem::path{u8"\u5c71\u7530"}, "Yamada_CJK"});
+    v.push_back({std::filesystem::path{u8"\u041c\u043e\u0441\u043a\u0432\u0430"}, "Moskva_Cyrillic"});
+    v.push_back({std::filesystem::path{u8"test_\U0001F389_party"}, "Party_Emoji"});
+    v.push_back({std::filesystem::path{u8"\u00e9_\u6f22_\u03b1_\u03a9"}, "MultiScript"});
 #endif
     return v;
 }
 
 // Compile input_path ? output_path (embed_mode=true, file-to-file) and point
 // nv_runtime_cache_path at cache_dir.  Pass an empty cache_dir to omit the option.
-void compile_with_cache(
-    const std::filesystem::path& input_path,
-    const std::filesystem::path& output_path,
-    const std::filesystem::path& cache_dir = {},
-    const std::string& cache_dir_str = {})
+void compile_with_cache(const std::filesystem::path& input_path, const std::filesystem::path& output_path,
+                        const std::filesystem::path& cache_dir = {}, const std::string& cache_dir_str = {})
 {
     Ort::SessionOptions so;
-    Ort::KeyValuePairs  ep_opts;
+    Ort::KeyValuePairs ep_opts;
     ep_opts.Add("enable_cuda_graph", "1");
     if (!cache_dir.empty())
     {
@@ -590,12 +575,10 @@ void compile_with_cache(
 }
 
 // Create a session from a compiled context file with a specific runtime cache directory.
-Ort::Session make_session_with_cache(
-    const std::filesystem::path& ctx_path,
-    const std::filesystem::path& cache_dir)
+Ort::Session make_session_with_cache(const std::filesystem::path& ctx_path, const std::filesystem::path& cache_dir)
 {
     Ort::SessionOptions so;
-    Ort::KeyValuePairs  ep_opts;
+    Ort::KeyValuePairs ep_opts;
     ep_opts.Add("enable_cuda_graph", "1");
     // See note in compile_with_cache: the EP expects UTF-8 narrow on
     // nv_runtime_cache_path; path::string() returns CP_ACP on Windows.
@@ -614,9 +597,11 @@ bool dir_has_files(const std::filesystem::path& dir)
     return false;
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
-class TensorRTRTXEpTest_PathTest : public CompileModelTest {};
+class TensorRTRTXEpTest_PathTest : public CompileModelTest
+{
+};
 
 // Parameterized fixture for special-chars tests that go through path-load
 // (Ort::Session(env, wchar_t* path, opts)). Limited to CP1252-mappable cases
@@ -625,16 +610,17 @@ class TensorRTRTXEpTest_PathTest : public CompileModelTest {};
 // the NVIDIA EP. The full character matrix is exercised via buffer-load
 // in TensorRTRTXEpTest_BufferLoadPathTest below.
 class TensorRTRTXEpTest_PathTestP
-    : public CompileModelTest,
-      public ::testing::WithParamInterface<SpecialCharsCase>
-{};
+    : public CompileModelTest
+    , public ::testing::WithParamInterface<SpecialCharsCase>
+{
+};
 
 // -- Context input path: source ONNX lives on a path with special characters -
 
 TEST_P(TensorRTRTXEpTest_PathTestP, ContextInputPathSpecialChars)
 {
-    const auto base     = special_chars_base_dir(GetParam().subdir_name);
-    const auto src_dir  = base / "input";
+    const auto base = special_chars_base_dir(GetParam().subdir_name);
+    const auto src_dir = base / "input";
     const auto src_copy = src_dir / kModelPath.filename();
     const auto ctx_path = base / "ctx_from_special" / "context.onnx";
 
@@ -646,17 +632,15 @@ TEST_P(TensorRTRTXEpTest_PathTestP, ContextInputPathSpecialChars)
 
     std::filesystem::create_directories(src_dir);
     std::filesystem::create_directories(ctx_path.parent_path());
-    std::filesystem::copy_file(kModelPath, src_copy,
-                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(kModelPath, src_copy, std::filesystem::copy_options::overwrite_existing);
 
     CompileResult result;
-    ASSERT_NO_THROW(result = compile_model_flexible(src_copy, ctx_path,
-                                                    CompileConfig{true, false, false}));
+    ASSERT_NO_THROW(result = compile_model_flexible(src_copy, ctx_path, CompileConfig{true, false, false}));
     ASSERT_TRUE(std::filesystem::is_regular_file(result.path));
 
     Ort::Session session{nullptr};
     ASSERT_NO_THROW(session = make_session_from_result(result));
-    EXPECT_EQ(session.GetInputCount(),  1u);
+    EXPECT_EQ(session.GetInputCount(), 1u);
     EXPECT_EQ(session.GetOutputCount(), 1u);
 }
 
@@ -664,7 +648,7 @@ TEST_P(TensorRTRTXEpTest_PathTestP, ContextInputPathSpecialChars)
 
 TEST_P(TensorRTRTXEpTest_PathTestP, ContextOutputPathSpecialChars)
 {
-    const auto base     = special_chars_base_dir(GetParam().subdir_name);
+    const auto base = special_chars_base_dir(GetParam().subdir_name);
     const auto ctx_path = base / "ctx_to_special" / "context.onnx";
 
     // Clear any artifacts from prior runs.
@@ -674,13 +658,12 @@ TEST_P(TensorRTRTXEpTest_PathTestP, ContextOutputPathSpecialChars)
     std::filesystem::create_directories(ctx_path.parent_path());
 
     CompileResult result;
-    ASSERT_NO_THROW(result = compile_model_flexible(kModelPath, ctx_path,
-                                                    CompileConfig{true, false, false}));
+    ASSERT_NO_THROW(result = compile_model_flexible(kModelPath, ctx_path, CompileConfig{true, false, false}));
     ASSERT_TRUE(std::filesystem::is_regular_file(result.path));
 
     Ort::Session session{nullptr};
     ASSERT_NO_THROW(session = make_session_from_result(result));
-    EXPECT_EQ(session.GetInputCount(),  1u);
+    EXPECT_EQ(session.GetInputCount(), 1u);
     EXPECT_EQ(session.GetOutputCount(), 1u);
 }
 
@@ -689,7 +672,7 @@ TEST_P(TensorRTRTXEpTest_PathTestP, ContextOutputPathSpecialChars)
 TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheNormalPath)
 {
     const auto cache_dir = kModelPath.parent_path() / "rt_cache_normal_test";
-    const auto ctx_path  = kModelPath.parent_path() / "rt_cache_normal_ctx" / "context.onnx";
+    const auto ctx_path = kModelPath.parent_path() / "rt_cache_normal_ctx" / "context.onnx";
 
     // Clear any artifacts from prior runs so dir_has_files(cache_dir) below
     // reflects the current run's cache write, not stale files.
@@ -705,18 +688,17 @@ TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheNormalPath)
     // First session: EP creates the engine and writes the cache on destruction.
     {
         Ort::Session s = make_session_with_cache(ctx_path, cache_dir);
-        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetInputCount(), 1u);
         EXPECT_EQ(s.GetOutputCount(), 1u);
         ASSERT_NO_THROW(run_with_cpu_bindings(s, 1));
-    } // IExecutionContextDeleter fires here ? cache serialized
+    }  // IExecutionContextDeleter fires here ? cache serialized
 
-    EXPECT_TRUE(dir_has_files(cache_dir))
-        << "Expected runtime cache files in: " << cache_dir;
+    EXPECT_TRUE(dir_has_files(cache_dir)) << "Expected runtime cache files in: " << cache_dir;
 
     // Second session: EP should deserialize from the written cache.
     ASSERT_NO_THROW({
         Ort::Session s = make_session_with_cache(ctx_path, cache_dir);
-        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetInputCount(), 1u);
         EXPECT_EQ(s.GetOutputCount(), 1u);
     });
 }
@@ -725,9 +707,9 @@ TEST_F(TensorRTRTXEpTest_PathTest, RuntimeCacheNormalPath)
 
 TEST_P(TensorRTRTXEpTest_PathTestP, RuntimeCacheSpecialCharsPath)
 {
-    const auto base      = special_chars_base_dir(GetParam().subdir_name);
+    const auto base = special_chars_base_dir(GetParam().subdir_name);
     const auto cache_dir = base / "rt_cache";
-    const auto ctx_path  = base / "rt_cache_ctx" / "context.onnx";
+    const auto ctx_path = base / "rt_cache_ctx" / "context.onnx";
 
     // Clear any artifacts from prior runs so dir_has_files(cache_dir) below
     // reflects the current run's cache write, not stale files.
@@ -743,29 +725,26 @@ TEST_P(TensorRTRTXEpTest_PathTestP, RuntimeCacheSpecialCharsPath)
     // First session: EP creates the engine and writes the cache on destruction.
     {
         Ort::Session s = make_session_with_cache(ctx_path, cache_dir);
-        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetInputCount(), 1u);
         EXPECT_EQ(s.GetOutputCount(), 1u);
         ASSERT_NO_THROW(run_with_cpu_bindings(s, 1));
-    } // IExecutionContextDeleter fires here ? cache serialized
+    }  // IExecutionContextDeleter fires here ? cache serialized
 
-    EXPECT_TRUE(dir_has_files(cache_dir))
-        << "Expected runtime cache files in: " << cache_dir;
+    EXPECT_TRUE(dir_has_files(cache_dir)) << "Expected runtime cache files in: " << cache_dir;
 
     // Second session: EP should deserialize from the special-chars cache path.
     ASSERT_NO_THROW({
         Ort::Session s = make_session_with_cache(ctx_path, cache_dir);
-        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetInputCount(), 1u);
         EXPECT_EQ(s.GetOutputCount(), 1u);
     });
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    CP1252Mappable,
-    TensorRTRTXEpTest_PathTestP,
-    ::testing::ValuesIn(cp1252_mappable_cases()),
-    [](const ::testing::TestParamInfo<SpecialCharsCase>& info) {
-        return std::string(info.param.label);
-    });
+INSTANTIATE_TEST_SUITE_P(CP1252Mappable, TensorRTRTXEpTest_PathTestP, ::testing::ValuesIn(cp1252_mappable_cases()),
+                         [](const ::testing::TestParamInfo<SpecialCharsCase>& info)
+                         {
+                             return std::string(info.param.label);
+                         });
 
 // ===========================================================================
 // Buffer-load coverage: exercises the SAME EP code paths as the path-load
@@ -789,19 +768,18 @@ inline std::vector<uint8_t> read_all_bytes(const std::filesystem::path& p)
     std::ifstream f(p, std::ios::binary);
     if (!f)
         throw std::runtime_error("read_all_bytes: failed to open file");
-    return { std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 
 // Buffer-load counterpart of make_session_with_cache. Reads ctx bytes via
 // wide I/O (no narrow conversion of the model path), then opens the session
 // from those bytes.
-Ort::Session make_session_from_buffer_with_cache(
-    const std::filesystem::path& ctx_path,
-    const std::filesystem::path& cache_dir)
+Ort::Session make_session_from_buffer_with_cache(const std::filesystem::path& ctx_path,
+                                                 const std::filesystem::path& cache_dir)
 {
     auto bytes = read_all_bytes(ctx_path);
     Ort::SessionOptions so;
-    Ort::KeyValuePairs  ep_opts;
+    Ort::KeyValuePairs ep_opts;
     ep_opts.Add("enable_cuda_graph", "1");
     // UTF-8 narrow for the EP option (see compile_with_cache for why).
     ep_opts.Add("nv_runtime_cache_path", reinterpret_cast<const char*>(cache_dir.u8string().c_str()));
@@ -809,20 +787,21 @@ Ort::Session make_session_from_buffer_with_cache(
     return Ort::Session(*ort_env, bytes.data(), bytes.size(), so);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 class TensorRTRTXEpTest_BufferLoadPathTest
-    : public CompileModelTest,
-      public ::testing::WithParamInterface<SpecialCharsCase>
-{};
+    : public CompileModelTest
+    , public ::testing::WithParamInterface<SpecialCharsCase>
+{
+};
 
 // -- Buffer-load: nv_runtime_cache_path with full character-class coverage ---
 
 TEST_P(TensorRTRTXEpTest_BufferLoadPathTest, RuntimeCacheBufferLoad)
 {
-    const auto base      = special_chars_base_dir(GetParam().subdir_name);
+    const auto base = special_chars_base_dir(GetParam().subdir_name);
     const auto cache_dir = base / "rt_cache_buf";
-    const auto ctx_path  = base / "rt_cache_buf_ctx" / "context.onnx";
+    const auto ctx_path = base / "rt_cache_buf_ctx" / "context.onnx";
 
     // Clear any artifacts from prior runs so dir_has_files(cache_dir) below
     // reflects the current run's cache write, not stale files.
@@ -842,28 +821,25 @@ TEST_P(TensorRTRTXEpTest_BufferLoadPathTest, RuntimeCacheBufferLoad)
     // throw entirely (no wchar_t* path enters the session ctor).
     {
         Ort::Session s = make_session_from_buffer_with_cache(ctx_path, cache_dir);
-        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetInputCount(), 1u);
         EXPECT_EQ(s.GetOutputCount(), 1u);
         ASSERT_NO_THROW(run_with_cpu_bindings(s, 1));
-    } // IExecutionContextDeleter fires here ? cache serialized
+    }  // IExecutionContextDeleter fires here ? cache serialized
 
-    EXPECT_TRUE(dir_has_files(cache_dir))
-        << "Expected runtime cache files in: " << cache_dir;
+    EXPECT_TRUE(dir_has_files(cache_dir)) << "Expected runtime cache files in: " << cache_dir;
 
     // Second session: EP should deserialize from the special-chars cache
     // path (cache_dir is UTF-8-narrow on the EP option boundary).
     ASSERT_NO_THROW({
         Ort::Session s = make_session_from_buffer_with_cache(ctx_path, cache_dir);
-        EXPECT_EQ(s.GetInputCount(),  1u);
+        EXPECT_EQ(s.GetInputCount(), 1u);
         EXPECT_EQ(s.GetOutputCount(), 1u);
     });
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    AllCharClasses,
-    TensorRTRTXEpTest_BufferLoadPathTest,
-    ::testing::ValuesIn(all_special_chars_cases()),
-    [](const ::testing::TestParamInfo<SpecialCharsCase>& info) {
-        return std::string(info.param.label);
-    });
-
+INSTANTIATE_TEST_SUITE_P(AllCharClasses, TensorRTRTXEpTest_BufferLoadPathTest,
+                         ::testing::ValuesIn(all_special_chars_cases()),
+                         [](const ::testing::TestParamInfo<SpecialCharsCase>& info)
+                         {
+                             return std::string(info.param.label);
+                         });

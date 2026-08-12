@@ -31,15 +31,12 @@ namespace trt_rtx_ep
 // Construction / Destruction
 // ======================================================================
 
-CudaMempoolAllocator::CudaMempoolAllocator(
-    const OrtMemoryInfo* memory_info,
-    DeviceId device_id,
-    const OrtApi& api,
-    const OrtLogger& logger)
-    : memory_info_(memory_info),
-      device_id_(device_id),
-      api_(api),
-      logger_(logger)
+CudaMempoolAllocator::CudaMempoolAllocator(const OrtMemoryInfo* memory_info, DeviceId device_id, const OrtApi& api,
+                                           const OrtLogger& logger)
+    : memory_info_(memory_info)
+    , device_id_(device_id)
+    , api_(api)
+    , logger_(logger)
 {
     OrtAllocator::version = NegotiatedOrtApiVersion();
     OrtAllocator::Alloc = AllocImpl;
@@ -51,12 +48,8 @@ CudaMempoolAllocator::CudaMempoolAllocator(
 }
 
 // static
-OrtStatus* CudaMempoolAllocator::Create(
-    const OrtMemoryInfo* memory_info,
-    DeviceId device_id,
-    const OrtApi& api,
-    const OrtLogger& logger,
-    std::unique_ptr<CudaMempoolAllocator>& out)
+OrtStatus* CudaMempoolAllocator::Create(const OrtMemoryInfo* memory_info, DeviceId device_id, const OrtApi& api,
+                                        const OrtLogger& logger, std::unique_ptr<CudaMempoolAllocator>& out)
 {
     out.reset(new CudaMempoolAllocator(memory_info, device_id, api, logger));
 
@@ -84,69 +77,19 @@ OrtStatus* CudaMempoolAllocator::Create(
 
     {
         uint64_t max_threshold = UINT64_MAX;
-        RETURN_IF_ERROR(CUDA_CALL(
-            cudaMemPoolSetAttribute(out->pool_,
-                                    cudaMemPoolAttrReleaseThreshold,
-                                    &max_threshold)));
+        RETURN_IF_ERROR(
+            CUDA_CALL(cudaMemPoolSetAttribute(out->pool_, cudaMemPoolAttrReleaseThreshold, &max_threshold)));
     }
 
-    // Some configurations only report an unusable pool on the first allocation
-    // rather than at create. Probe with a 1-byte alloc to surface that here and
-    // fall back now (physical memory is still free) instead of at first inference.
-    // The freed probe is retained (release threshold UINT64_MAX) for real allocs.
-    {
-        // Save/restore the current CUDA context: under graphics interop (CIG) the
-        // app's context is current and must stay so; cudaSetDevice would switch it.
-        CUcontext prev_ctx = nullptr;
-        (void)cuCtxGetCurrent(&prev_ctx);
-
-        // Inability to select the device is a genuine error, not a fallback.
-        cudaError_t set_err = cudaSetDevice(static_cast<int>(device_id));
-        if (set_err != cudaSuccess)
-        {
-            (void)cuCtxSetCurrent(prev_ctx);
-            (void)cudaMemPoolDestroy(out->pool_);
-            out->pool_ = nullptr;
-            out.reset();
-            return CUDA_CALL(set_err);
-        }
-
-        constexpr cudaStream_t kDefaultStream = static_cast<cudaStream_t>(0);
-        void* probe = nullptr;
-        cudaError_t probe_err = cudaMallocFromPoolAsync(&probe, 1, out->pool_, kDefaultStream);
-        if (probe_err == cudaSuccess)
-        {
-            (void)cudaStreamSynchronize(kDefaultStream);
-            (void)cudaFreeAsync(probe, kDefaultStream);
-            (void)cudaStreamSynchronize(kDefaultStream);
-        }
-
-        (void)cuCtxSetCurrent(prev_ctx);  // restore exactly what was current before
-
-        if (probe_err != cudaSuccess)
-        {
-            (void)cudaGetLastError();  // clear the sticky error
-            (void)cudaMemPoolDestroy(out->pool_);
-            out->pool_ = nullptr;
-
-            // Only OOM (the fragmented-VA failure) is an expected fallback; any
-            // other error is a genuine bug and must propagate.
-            if (probe_err != cudaErrorMemoryAllocation)
-            {
-                out.reset();
-                return CUDA_CALL(probe_err);
-            }
-
-            std::ostringstream ss;
-            ss << "CudaMempoolAllocator: probe allocation out-of-memory on device " << device_id
-               << " (likely fragmented GPU virtual-address space). Falling back to the "
-                  "synchronous cudaMalloc allocator (higher VRAM use; CUDA graph capture unavailable).";
-            out->LogMessage(ORT_LOGGING_LEVEL_WARNING, ss.str().c_str());
-
-            out.reset();     // signal "unsupported" to the caller
-            return nullptr;  // not an error: caller falls back to the BFC arena
-        }
-    }
+    // Pool usability is probed lazily on the first allocation (EnsureProbedOnce), NOT here. A
+    // create-time probe needs a current CUDA context, but ORT calls CreateAllocator at EP
+    // registration when none exists yet — so cudaSetDevice would initialize the device PRIMARY
+    // context: a persistent ~200MB second context a CIG app does not want, and that the runtime
+    // will not release (so it cannot be made transient). Deferring the same
+    // probe to the first allocation runs it under the caller's already-current (CIG/user) context
+    // instead, so no cudaSetDevice and no spurious primary context. On probe failure DoAlloc
+    // returns null and the compute path latches the device to the synchronous arena via
+    // NoteAsyncMempoolFailure() — the identical graceful BFC fallback the eager probe produced.
 
     {
         std::ostringstream ss;
@@ -187,17 +130,18 @@ CudaMempoolAllocator::~CudaMempoolAllocator()
 // static
 void* ORT_API_CALL CudaMempoolAllocator::AllocImpl(OrtAllocator* this_, size_t size)
 {
-    if (this_ == nullptr) return nullptr;
+    if (this_ == nullptr)
+        return nullptr;
     auto& self = *static_cast<CudaMempoolAllocator*>(this_);
     constexpr cudaStream_t kDefaultStream = static_cast<cudaStream_t>(0);
     return self.DoAlloc(size, kDefaultStream);
 }
 
 // static
-void* ORT_API_CALL CudaMempoolAllocator::AllocOnStreamImpl(
-    OrtAllocator* this_, size_t size, OrtSyncStream* stream)
+void* ORT_API_CALL CudaMempoolAllocator::AllocOnStreamImpl(OrtAllocator* this_, size_t size, OrtSyncStream* stream)
 {
-    if (this_ == nullptr) return nullptr;
+    if (this_ == nullptr)
+        return nullptr;
     auto& self = *static_cast<CudaMempoolAllocator*>(this_);
     cudaStream_t cuda_stream = self.ResolveCudaStream(stream);
     return self.DoAlloc(size, cuda_stream);
@@ -214,26 +158,25 @@ void* ORT_API_CALL CudaMempoolAllocator::ReserveImpl(OrtAllocator* this_, size_t
 // static
 void ORT_API_CALL CudaMempoolAllocator::FreeImpl(OrtAllocator* this_, void* p)
 {
-    if (this_ == nullptr) return;
+    if (this_ == nullptr)
+        return;
     static_cast<CudaMempoolAllocator*>(this_)->DoFree(p);
 }
 
 // static
 const OrtMemoryInfo* ORT_API_CALL CudaMempoolAllocator::InfoImpl(const OrtAllocator* this_)
 {
-    if (this_ == nullptr) return nullptr;
+    if (this_ == nullptr)
+        return nullptr;
     return static_cast<const CudaMempoolAllocator*>(this_)->memory_info_;
 }
 
 // static
-OrtStatus* ORT_API_CALL CudaMempoolAllocator::GetStatsImpl(
-    const OrtAllocator* this_, OrtKeyValuePairs** out) noexcept
+OrtStatus* ORT_API_CALL CudaMempoolAllocator::GetStatsImpl(const OrtAllocator* this_, OrtKeyValuePairs** out) noexcept
 {
     if (this_ == nullptr || out == nullptr)
     {
-        return Ort::GetApi().CreateStatus(
-            ORT_INVALID_ARGUMENT,
-            "CudaMempoolAllocator::GetStatsImpl: null argument");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, "CudaMempoolAllocator::GetStatsImpl: null argument");
     }
 
     const auto& self = *static_cast<const CudaMempoolAllocator*>(this_);
@@ -254,9 +197,54 @@ OrtStatus* ORT_API_CALL CudaMempoolAllocator::GetStatsImpl(
 // Instance methods
 // ======================================================================
 
+void CudaMempoolAllocator::EnsureProbedOnce(cudaStream_t stream)
+{
+    // Deferred pool-usability probe, moved out of Create() so EP registration does not initialize
+    // the device primary context. Runs exactly once, under whatever context the caller already
+    // made current (the CIG/user context during compute) — so NO cudaSetDevice and no spurious
+    // second context. Mirrors the original create-time probe: a 1-byte allocation surfaces an
+    // unusable pool before the first real allocation, and freeing it warms the pool (the pool's
+    // release threshold is UINT64_MAX, so the backing is retained for real allocations).
+    std::call_once(probe_once_,
+                   [this, stream]()
+                   {
+                       void* probe = nullptr;
+                       cudaError_t probe_err = cudaMallocFromPoolAsync(&probe, 1, pool_, stream);
+                       if (probe_err == cudaSuccess)
+                       {
+                           (void)cudaStreamSynchronize(stream);
+                           (void)cudaFreeAsync(probe, stream);
+                           (void)cudaStreamSynchronize(stream);
+                           return;  // probe_usable_ stays true
+                       }
+
+                       // Any failure means the pool is unusable: DoAlloc returns null and the
+                       // compute path latches the device to the synchronous arena. Matches DoAlloc's
+                       // own policy of never throwing on a pool allocation failure.
+                       (void)cudaGetLastError();  // clear the sticky error
+                       probe_usable_ = false;
+                       std::ostringstream ss;
+                       ss << "CudaMempoolAllocator: deferred usability probe failed on device " << device_id_ << " ("
+                          << cudaGetErrorString(probe_err)
+                          << "). Falling back to the synchronous "
+                             "cudaMalloc arena (higher VRAM use; CUDA graph capture unavailable).";
+                       LogMessage(ORT_LOGGING_LEVEL_WARNING, ss.str().c_str());
+                   });
+}
+
 void* CudaMempoolAllocator::DoAlloc(size_t size, cudaStream_t cuda_stream)
 {
-    if (size == 0) return nullptr;
+    if (size == 0)
+        return nullptr;
+
+    // Probe the pool's usability the first time it is used (deferred from Create() to avoid
+    // initializing the device primary context at EP registration). If the deferred probe found
+    // the pool unusable, return null so the caller falls back to the synchronous arena.
+    EnsureProbedOnce(cuda_stream);
+    if (!probe_usable_)
+    {
+        return nullptr;
+    }
 
     void* p = nullptr;
     cudaError_t err = cudaMallocFromPoolAsync(&p, size, pool_, cuda_stream);
@@ -272,8 +260,7 @@ void* CudaMempoolAllocator::DoAlloc(size_t size, cudaStream_t cuda_stream)
             (void)cudaGetLastError();
             std::ostringstream ss;
             ss << "CudaMempoolAllocator::DoAlloc: cudaMallocFromPoolAsync failed after retry: "
-               << cudaGetErrorString(retry_err) << " (" << static_cast<int>(retry_err)
-               << "), size=" << size
+               << cudaGetErrorString(retry_err) << " (" << static_cast<int>(retry_err) << "), size=" << size
                << ", stream=" << reinterpret_cast<uintptr_t>(cuda_stream)
                << ". Returning nullptr; caller should fall back to a synchronous allocator.";
             LogMessage(ORT_LOGGING_LEVEL_ERROR, ss.str().c_str());
@@ -311,13 +298,9 @@ void* CudaMempoolAllocator::DoAlloc(size_t size, cudaStream_t cuda_stream)
         (void)cudaMemPoolGetAttribute(pool_, cudaMemPoolAttrUsedMemCurrent, &pool_used);
 
         std::ostringstream ss;
-        ss << "CudaMempoolAllocator::DoAlloc: ptr=" << p
-           << " size=" << size
-           << " stream=" << reinterpret_cast<uintptr_t>(cuda_stream)
-           << " | in_use=" << snap_in_use
-           << " total_allocated=" << snap_total
-           << " num_allocs=" << snap_num
-           << " pool_reserved=" << pool_reserved
+        ss << "CudaMempoolAllocator::DoAlloc: ptr=" << p << " size=" << size
+           << " stream=" << reinterpret_cast<uintptr_t>(cuda_stream) << " | in_use=" << snap_in_use
+           << " total_allocated=" << snap_total << " num_allocs=" << snap_num << " pool_reserved=" << pool_reserved
            << " pool_used=" << pool_used;
         LogMessage(ORT_LOGGING_LEVEL_INFO, ss.str().c_str());
     }
@@ -327,7 +310,8 @@ void* CudaMempoolAllocator::DoAlloc(size_t size, cudaStream_t cuda_stream)
 
 void CudaMempoolAllocator::DoFree(void* p)
 {
-    if (!p) return;
+    if (!p)
+        return;
 
     cudaStream_t s = static_cast<cudaStream_t>(0);
     size_t sz = 0;
@@ -339,8 +323,7 @@ void CudaMempoolAllocator::DoFree(void* p)
         if (it == alloc_map_.end())
         {
             std::ostringstream ss;
-            ss << "CudaMempoolAllocator::DoFree: pointer " << p
-               << " not found in allocation map; ignoring.";
+            ss << "CudaMempoolAllocator::DoFree: pointer " << p << " not found in allocation map; ignoring.";
             LogMessage(ORT_LOGGING_LEVEL_WARNING, ss.str().c_str());
             return;
         }
@@ -365,10 +348,8 @@ void CudaMempoolAllocator::DoFree(void* p)
 
     {
         std::ostringstream ss;
-        ss << "CudaMempoolAllocator::DoFree: ptr=" << p
-           << " size=" << sz
-           << " stream=" << reinterpret_cast<uintptr_t>(s)
-           << " | in_use_after=" << snap_in_use;
+        ss << "CudaMempoolAllocator::DoFree: ptr=" << p << " size=" << sz
+           << " stream=" << reinterpret_cast<uintptr_t>(s) << " | in_use_after=" << snap_in_use;
         LogMessage(ORT_LOGGING_LEVEL_INFO, ss.str().c_str());
     }
 
@@ -382,21 +363,18 @@ void CudaMempoolAllocator::DoFree(void* p)
 
         std::ostringstream ss;
         ss << "CudaMempoolAllocator::DoFree: cudaFreeAsync FAILED for ptr=" << p
-           << " stream=" << reinterpret_cast<uintptr_t>(s)
-           << " error=" << cudaGetErrorString(free_err)
-           << " (" << static_cast<int>(free_err) << ")";
+           << " stream=" << reinterpret_cast<uintptr_t>(s) << " error=" << cudaGetErrorString(free_err) << " ("
+           << static_cast<int>(free_err) << ")";
 
         if (attr_err == cudaSuccess)
         {
-            ss << " | pointer_attr: type=" << attr.type
-               << " device=" << attr.device
+            ss << " | pointer_attr: type=" << attr.type << " device=" << attr.device
                << " devicePointer=" << attr.devicePointer;
         }
         else
         {
-            ss << " | cudaPointerGetAttributes also failed: "
-               << cudaGetErrorString(attr_err)
-               << " (" << static_cast<int>(attr_err) << ")";
+            ss << " | cudaPointerGetAttributes also failed: " << cudaGetErrorString(attr_err) << " ("
+               << static_cast<int>(attr_err) << ")";
         }
 
         size_t pool_reserved = 0, pool_used = 0;
@@ -417,9 +395,8 @@ void CudaMempoolAllocator::DoFree(void* p)
                 return;
             }
             (void)cudaGetLastError();
-            ss << " | retry on default stream also failed: "
-               << cudaGetErrorString(retry_err)
-               << " (" << static_cast<int>(retry_err) << ")";
+            ss << " | retry on default stream also failed: " << cudaGetErrorString(retry_err) << " ("
+               << static_cast<int>(retry_err) << ")";
         }
 
         LogMessage(ORT_LOGGING_LEVEL_ERROR, ss.str().c_str());
@@ -454,7 +431,8 @@ OrtStatus* CudaMempoolAllocator::Shrink()
 
 cudaStream_t CudaMempoolAllocator::ResolveCudaStream(OrtSyncStream* stream) const
 {
-    if (!stream) return static_cast<cudaStream_t>(0);
+    if (!stream)
+        return static_cast<cudaStream_t>(0);
     return static_cast<cudaStream_t>(api_.SyncStream_GetHandle(stream));
 }
 
@@ -462,8 +440,10 @@ void CudaMempoolAllocator::MaybeRehashLocked()
 {
     const size_t alloc_sz = alloc_map_.size();
     const size_t stream_sz = stream_map_.size();
-    if (alloc_sz > 0) alloc_map_.reserve(alloc_sz);
-    if (stream_sz > 0) stream_map_.reserve(stream_sz);
+    if (alloc_sz > 0)
+        alloc_map_.reserve(alloc_sz);
+    if (stream_sz > 0)
+        stream_map_.reserve(stream_sz);
 }
 
 void CudaMempoolAllocator::SyncAllKnownStreams_NoThrow()

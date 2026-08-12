@@ -1,16 +1,20 @@
 # NVIDIA TensorRT RTX Execution Provider
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
+![Platform](https://img.shields.io/badge/platform-**Windows**%20%7C%20Linux%20%7C%20ARM64-lightgrey)
+
 The NVIDIA TensorRT RTX Execution Provider (EP) is an inference deployment solution designed specifically for NVIDIA RTX GPUs, optimized for client-centric use cases.
 
-This EP is built as a **standalone plugin** (`onnxruntime_providers_nv_tensorrt_rtx.dll`) that implements the ORT EP ABI interfaces (`OrtEpFactory`, `OrtEp`, `OrtNodeComputeInfo`, `OrtDataTransferImpl`, etc.) introduced in ORT 1.23.0. It does **not** need to be built together with ONNX Runtime.
+This EP is built as a standalone plugin (`onnxruntime_providers_nv_tensorrt_rtx.dll`) that implements the ORT EP ABI interfaces (`OrtEpFactory`, `OrtEp`, `OrtNodeComputeInfo`, `OrtDataTransferImpl`, etc.) introduced in ORT 1.23.0. It does not need to be built together with ONNX Runtime.
 
 The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvidia.com/tensorrt-rtx) engine to accelerate ONNX models on RTX GPUs. It supports RTX GPUs based on Ampere and later architectures (NVIDIA GeForce RTX 30xx and above).
 
-**Benefits:**
+Benefits:
 
-- **Small package footprint** — optimized resource usage on end-user systems at just under 200 MB.
-- **Faster model compile and load times** — leverages just-in-time compilation to build RTX hardware-optimized engines on end-user devices in seconds.
-- **Portability** — seamlessly use cached models across multiple RTX GPUs.
+- Small package footprint — optimized resource usage on end-user systems at just under 200 MB.
+- Faster model compile and load times — leverages just-in-time compilation to build RTX hardware-optimized engines on end-user devices in seconds.
+- Portability — seamlessly use cached models across multiple RTX GPUs.
 
 ## Contents
 
@@ -31,7 +35,7 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 
 | EP Version | ORT Version | TRT RTX Version | Notes |
 |------------|-------------|-----------------|-------|
-| 0.1 | 1.24.0+ | 1.4.x.x | Initial Windows Support |
+| 0.1 | 1.24.0+ | 1.4.x.x | Initial **Windows** Support |
 | 0.3 | 1.25.0+ | 1.5.x.x | Linux Support, Weight Streaming, CIG Interop, ORT Version Negotiation |
 
 ## Build from Source
@@ -41,7 +45,7 @@ The TensorRT RTX EP leverages NVIDIA's [TensorRT for RTX](https://developer.nvid
 | Dependency | Minimum Version | Platform | Notes |
 |------------|-----------------|----------|-------|
 | CMake | 3.15 | All | |
-| Visual Studio | 2019 or 2022 (Desktop C++ workload) | Windows | |
+| Visual Studio | 2019 or 2022 (Desktop C++ workload) | **Windows** | |
 | GCC / Clang | C++20-capable | Linux | |
 | CUDA Toolkit | 12.9+ | All | |
 | ONNX Runtime SDK | 1.24.0+ | All | |
@@ -162,7 +166,6 @@ Output:
 
 The meta wheel (`onnxruntime_ep_nv_tensorrt_rtx`) is a platform-independent package that declares a dependency on the appropriate CUDA-versioned wheel.
 
-
 ## Usage
 
 The TensorRT RTX EP uses the **V2 device-based EP API** introduced in ORT 1.23.0. The EP library is registered dynamically at runtime, then devices are enumerated and appended to the session.
@@ -208,6 +211,8 @@ Ort::Session session(env, ORT_TSTR("model.onnx"), session_options);
 
 ### Python
 
+> **Note:** If you have `onnxruntime-gpu` installed, uninstall it first — it ships a different version of the `onnxruntime` module.
+
 Register the EP plugin library, discover the EP device, and add it to session options with provider-specific options.
 
 ```python
@@ -244,6 +249,8 @@ ort.unregister_execution_provider_library("NvTensorRTRTXExecutionProvider")
 
 | Document | Description |
 |----------|-------------|
+| [Build Guide](doc/BUILD_GUIDE.md) | Full build guide with troubleshooting and integration instructions |
+| [Technical Notes](doc/TECHNICAL_NOTES.md) | In-depth notes on EP features and behaviors (e.g. synchronous GPU allocation / disabling async CUDA malloc) |
 | [Coding Guidelines](CODING-GUIDELINES.md) | Code style and conventions |
 
 ## Examples

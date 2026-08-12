@@ -18,6 +18,7 @@
 #include "utils/cuda/cuda_common.h"
 
 #include <cuda_runtime_api.h>
+
 #include <driver_types.h>
 
 namespace trt_rtx_ep
@@ -54,7 +55,8 @@ cudaGraphExec_t CudaGraphSet::Get(CudaGraphAnnotation_t cuda_graph_annotation_id
     return cuda_graphs_.at(cuda_graph_annotation_id);
 }
 
-CUDAGraphManager::CUDAGraphManager(cudaStream_t stream) : stream_(stream)
+CUDAGraphManager::CUDAGraphManager(cudaStream_t stream)
+    : stream_(stream)
 {
 }
 
@@ -67,9 +69,8 @@ void CUDAGraphManager::CaptureBegin(CudaGraphAnnotation_t cuda_graph_annotation_
 {
     ORT_ENFORCE(IsGraphCaptureAllowedOnRun(cuda_graph_annotation_id));
 
-    ORT_ENFORCE(!cuda_graph_set_.Contains(cuda_graph_annotation_id),
-                "Trying to capture a graph with annotation id ", cuda_graph_annotation_id,
-                " that already used. Please use a different annotation id.");
+    ORT_ENFORCE(!cuda_graph_set_.Contains(cuda_graph_annotation_id), "Trying to capture a graph with annotation id ",
+                cuda_graph_annotation_id, " that already used. Please use a different annotation id.");
 
     CUDA_CALL_THROW(cudaStreamSynchronize(stream_));
     // For now cuda graph can only work with a single thread. In the future, we
@@ -93,7 +94,7 @@ void CUDAGraphManager::CaptureEnd(CudaGraphAnnotation_t cuda_graph_annotation_id
     CUDA_CALL_THROW(cudaGraphDestroy(graph));
 
     // Currently all the captured graphs will be tied to the session's lifecycle
-    // TODO(wy): Addd an interface to free captured graphs
+    // TODO: Add an interface to free captured graphs
     cuda_graph_set_.Put(cuda_graph_annotation_id, graph_exec);
 }
 

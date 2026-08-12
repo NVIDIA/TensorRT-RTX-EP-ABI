@@ -67,7 +67,7 @@ private:
 //!
 struct TensorrtRtxPinnedAllocator : OrtAllocator
 {
-    TensorrtRtxPinnedAllocator(const OrtMemoryInfo* mem_info);
+    explicit TensorrtRtxPinnedAllocator(const OrtMemoryInfo* mem_info);
 
     // OrtAllocator Interface implementations
     void* Alloc(size_t size);

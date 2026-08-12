@@ -13,24 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <gtest/gtest.h>
-#include <onnxruntime_cxx_api.h>
-
 #include <filesystem>
 #include <memory>
 
 #include "test_tensorrt_rtx_utils.h"
+#include <gtest/gtest.h>
+#include <onnxruntime_cxx_api.h>
 
 extern std::unique_ptr<Ort::Env> ort_env;
 
-TEST(TensorRTRTXEpTest_LoadModel, ModelFileExists) {
-    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath))
-        << "Model not found at: " << kModelPath;
+TEST(TensorRTRTXEpTest_LoadModel, ModelFileExists)
+{
+    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 }
 
-TEST(TensorRTRTXEpTest_LoadModel, CreatesSessionSuccessfully) {
-    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath))
-        << "Model not found at: " << kModelPath;
+TEST(TensorRTRTXEpTest_LoadModel, CreatesSessionSuccessfully)
+{
+    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
     Ort::SessionOptions session_options;
     Ort::KeyValuePairs ep_options;

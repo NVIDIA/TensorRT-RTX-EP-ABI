@@ -15,22 +15,25 @@
 
 #include "tensorrt_rtx_provider_factory.h"
 
+#include "ep_arena.h"
+#include "tensorrt_rtx_allocator.h"
 #include "tensorrt_rtx_execution_provider.h"
+#include "tensorrt_rtx_execution_provider_custom_ops.h"
 #include "tensorrt_rtx_execution_provider_data_transfer.h"
 #include "tensorrt_rtx_execution_provider_stream_support.h"
-#include "tensorrt_rtx_execution_provider_custom_ops.h"
-#include "tensorrt_rtx_allocator.h"
 #include "tensorrt_rtx_provider_options.h"
-#include "cuda_mempool_arena.h"
-#include "ep_arena.h"
+
 #include "utils/cuda/cuda_common.h"
+#include "utils/cuda/cuda_context.h"
 #include "utils/ort_api_init.h"
-#include "kernel_registration.h"
 
 #include "onnxruntime_cxx_api.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include "cuda_mempool_arena.h"
+#include "kernel_registration.h"
 
 // NVML for driver version checking
 #include <nvml.h>
@@ -112,22 +115,523 @@ bool TryHexStringToBinary(const char* hex, std::vector<uint8_t>& out, std::strin
 }
 }  // namespace
 
+#if ORT_API_VERSION >= 26
+// External resource import (D3D12 shared resources + timeline fences) for the
+// NvTensorRTRTX EP. Ported from microsoft/onnxruntime PR #26948
+// (nv_provider_factory.cc / nv_scoped_context.h). Requires the importer ABI
+// added in ORT API v26.
+namespace
+{
+
+// The descriptor version is the caller's ORT API version. These descriptors are
+// forward-compatible, so accept any host we support and read only the fields we know.
+constexpr uint32_t kMinExternalResourceDescriptorVersion = kMinSupportedOrtApiVersion;
+
+//! \brief Derived handle for imported external memory from a D3D12 resource/heap to CUDA.
+struct NvTrtRtxExternalMemoryHandle : OrtExternalMemoryHandle
+{
+    CUexternalMemory ext_memory;  //!< CUDA external memory object
+    CUdeviceptr mapped_ptr;       //!< Mapped device pointer for tensor access
+    bool is_dedicated;            //!< Whether the D3D12 resource is a dedicated allocation
+
+    explicit NvTrtRtxExternalMemoryHandle(const OrtExternalMemoryDescriptor& descriptor_in)
+        : ext_memory(nullptr)
+        , mapped_ptr(0)
+        , is_dedicated(true)
+    {
+        version = ORT_API_VERSION;
+        descriptor = descriptor_in;
+        ep_device = nullptr;
+        Release = ReleaseCallback;
+    }
+
+    static void ORT_API_CALL ReleaseCallback(_In_ OrtExternalMemoryHandle* handle) noexcept
+    {
+        if (handle == nullptr)
+        {
+            return;
+        }
+        auto derived =
+            std::unique_ptr<NvTrtRtxExternalMemoryHandle>(static_cast<NvTrtRtxExternalMemoryHandle*>(handle));
+        if (derived->ext_memory != nullptr)
+        {
+            cuDestroyExternalMemory(derived->ext_memory);
+        }
+    }
+};
+
+//! \brief Derived handle for an imported external semaphore (D3D12 timeline fence) to CUDA.
+struct NvTrtRtxExternalSemaphoreHandle : OrtExternalSemaphoreHandle
+{
+    CUexternalSemaphore ext_semaphore;  //!< CUDA external semaphore object
+
+    explicit NvTrtRtxExternalSemaphoreHandle(const OrtExternalSemaphoreDescriptor& descriptor_in)
+        : ext_semaphore(nullptr)
+    {
+        version = ORT_API_VERSION;
+        descriptor = descriptor_in;
+        ep_device = nullptr;
+        Release = ReleaseCallback;
+    }
+
+    static void ORT_API_CALL ReleaseCallback(_In_ OrtExternalSemaphoreHandle* handle) noexcept
+    {
+        if (handle == nullptr)
+        {
+            return;
+        }
+        auto derived =
+            std::unique_ptr<NvTrtRtxExternalSemaphoreHandle>(static_cast<NvTrtRtxExternalSemaphoreHandle*>(handle));
+        if (derived->ext_semaphore != nullptr)
+        {
+            cuDestroyExternalSemaphore(derived->ext_semaphore);
+        }
+    }
+};
+
+//! \brief Implementation of OrtExternalResourceImporterImpl for the NvTensorRTRTX EP.
+//!
+//! Uses CUDA Driver APIs to import D3D12 shared resources and timeline fences for
+//! zero-copy interop. Unlike the in-tree ORT provider this plugin cannot dereference
+//! OrtEpDevice internals, so device id and the device OrtMemoryInfo are supplied by
+//! the factory at construction time.
+struct NvTrtRtxExternalResourceImporterImpl : OrtExternalResourceImporterImpl
+{
+    NvTrtRtxExternalResourceImporterImpl(const OrtEpDevice* ep_device, int device_id, const OrtMemoryInfo* memory_info,
+                                         const OrtApi& ort_api_in)
+        : ep_device_{ep_device}
+        , device_id_{device_id}
+        , memory_info_{memory_info}
+        , ort_api{ort_api_in}
+    {
+        ort_version_supported = ORT_API_VERSION;
+
+        // Memory operations
+        CanImportMemory = CanImportMemoryImpl;
+        ImportMemory = ImportMemoryImpl;
+        ReleaseMemory = ReleaseMemoryImpl;
+        CreateTensorFromMemory = CreateTensorFromMemoryImpl;
+
+        // Semaphore operations
+        CanImportSemaphore = CanImportSemaphoreImpl;
+        ImportSemaphore = ImportSemaphoreImpl;
+        ReleaseSemaphore = ReleaseSemaphoreImpl;
+        WaitSemaphore = WaitSemaphoreImpl;
+        SignalSemaphore = SignalSemaphoreImpl;
+
+        // Release
+        Release = ReleaseImpl;
+    }
+
+    static bool ORT_API_CALL CanImportMemoryImpl(_In_ const OrtExternalResourceImporterImpl* this_ptr,
+                                                 _In_ OrtExternalMemoryHandleType handle_type) noexcept
+    {
+        (void)this_ptr;
+#if defined(_WIN32)
+        return handle_type == ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE ||
+               handle_type == ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP ||
+               handle_type == ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_WIN32;
+#else
+        return handle_type == ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_OPAQUE_FD;
+#endif
+    }
+
+    static OrtStatus* ORT_API_CALL ImportMemoryImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                                    _In_ const OrtExternalMemoryDescriptor* desc,
+                                                    _Outptr_ OrtExternalMemoryHandle** out_handle) noexcept
+    {
+        auto& impl = *static_cast<NvTrtRtxExternalResourceImporterImpl*>(this_ptr);
+        try
+        {
+
+            if (desc == nullptr || out_handle == nullptr)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid arguments to ImportMemory");
+            }
+
+            if (desc->version < kMinExternalResourceDescriptorVersion)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "OrtExternalMemoryDescriptor version too old");
+            }
+
+            *out_handle = nullptr;
+
+            if (!CanImportMemoryImpl(this_ptr, desc->handle_type))
+            {
+                return impl.ort_api.CreateStatus(ORT_NOT_IMPLEMENTED,
+                                                 "Unsupported external memory handle type for CUDA import");
+            }
+
+            if (desc->offset_bytes > desc->size_bytes)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                                 "offset_bytes exceeds size_bytes in OrtExternalMemoryDescriptor");
+            }
+
+            // The imported external memory handle is associated with the device where it is
+            // imported and remains valid regardless of subsequent cudaSetDevice calls.
+            ScopedCudaContextPush ctx(impl.DeviceId());
+
+            // Map ORT handle type to CUDA handle type.
+            CUexternalMemoryHandleType cu_handle_type;
+            bool is_dedicated = true;
+            switch (desc->handle_type)
+            {
+            case ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE:
+                cu_handle_type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+                is_dedicated = true;  // D3D12 committed resources are dedicated
+                break;
+            case ORT_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP:
+                cu_handle_type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP;
+                is_dedicated = false;  // D3D12 heaps are not dedicated
+                break;
+            case ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_WIN32:
+                cu_handle_type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32;
+                is_dedicated = false;
+                break;
+            case ORT_EXTERNAL_MEMORY_HANDLE_TYPE_VK_MEMORY_OPAQUE_FD:
+                cu_handle_type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+                is_dedicated = false;
+                break;
+            default:
+                return impl.ort_api.CreateStatus(ORT_EP_FAIL, "Unexpected external memory handle type");
+            }
+
+            CUDA_EXTERNAL_MEMORY_HANDLE_DESC ext_mem_desc = {};
+            ext_mem_desc.type = cu_handle_type;
+#if defined(_WIN32)
+            ext_mem_desc.handle.win32.handle = desc->native_handle;
+#else
+            ext_mem_desc.handle.fd = static_cast<int>(reinterpret_cast<intptr_t>(desc->native_handle));
+#endif
+            ext_mem_desc.size = desc->size_bytes;
+            ext_mem_desc.flags = is_dedicated ? CUDA_EXTERNAL_MEMORY_DEDICATED : 0;
+
+            CUexternalMemory ext_memory = nullptr;
+            CUresult cu_result = cuImportExternalMemory(&ext_memory, &ext_mem_desc);
+            if (cu_result != CUDA_SUCCESS)
+            {
+                return CudaDriverStatus(impl.ort_api, cu_result, "cuImportExternalMemory failed");
+            }
+
+            CUDA_EXTERNAL_MEMORY_BUFFER_DESC buffer_desc = {};
+            buffer_desc.offset = desc->offset_bytes;
+            buffer_desc.size = desc->size_bytes - desc->offset_bytes;
+            buffer_desc.flags = 0;
+
+            CUdeviceptr mapped_ptr = 0;
+            cu_result = cuExternalMemoryGetMappedBuffer(&mapped_ptr, ext_memory, &buffer_desc);
+            if (cu_result != CUDA_SUCCESS)
+            {
+                cuDestroyExternalMemory(ext_memory);
+                return CudaDriverStatus(impl.ort_api, cu_result, "cuExternalMemoryGetMappedBuffer failed");
+            }
+
+            OrtExternalMemoryDescriptor descriptor = {};  // copy retained by the handle
+            descriptor.version = desc->version;
+            descriptor.handle_type = desc->handle_type;
+            descriptor.size_bytes = desc->size_bytes;
+            descriptor.offset_bytes = desc->offset_bytes;
+            auto handle = std::make_unique<NvTrtRtxExternalMemoryHandle>(descriptor);
+            handle->ep_device = impl.ep_device_;
+            handle->ext_memory = ext_memory;
+            handle->mapped_ptr = mapped_ptr;
+            handle->is_dedicated = is_dedicated;
+
+            *out_handle = handle.release();
+            return nullptr;
+        }
+        catch (const std::exception& e)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, e.what());
+        }
+        catch (...)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, "Unknown exception in ImportMemory");
+        }
+    }
+
+    static void ORT_API_CALL ReleaseMemoryImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                               _In_ OrtExternalMemoryHandle* handle) noexcept
+    {
+        (void)this_ptr;
+        if (handle == nullptr)
+        {
+            return;
+        }
+        auto mem_handle =
+            std::unique_ptr<NvTrtRtxExternalMemoryHandle>(static_cast<NvTrtRtxExternalMemoryHandle*>(handle));
+        if (mem_handle->ext_memory != nullptr)
+        {
+            cuDestroyExternalMemory(mem_handle->ext_memory);
+        }
+    }
+
+    static OrtStatus* ORT_API_CALL CreateTensorFromMemoryImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                                              _In_ const OrtExternalMemoryHandle* mem_handle,
+                                                              _In_ const OrtExternalTensorDescriptor* tensor_desc,
+                                                              _Outptr_ OrtValue** out_tensor) noexcept
+    {
+        auto& impl = *static_cast<NvTrtRtxExternalResourceImporterImpl*>(this_ptr);
+
+        if (mem_handle == nullptr || tensor_desc == nullptr || out_tensor == nullptr)
+        {
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid arguments to CreateTensorFromMemory");
+        }
+
+        if (tensor_desc->version < kMinExternalResourceDescriptorVersion)
+        {
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "OrtExternalTensorDescriptor version too old");
+        }
+
+        *out_tensor = nullptr;
+
+        auto* handle = static_cast<const NvTrtRtxExternalMemoryHandle*>(mem_handle);
+
+        size_t available_size = handle->descriptor.size_bytes - handle->descriptor.offset_bytes;
+        if (tensor_desc->offset_bytes > available_size)
+        {
+            return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "tensor offset_bytes exceeds available imported memory size");
+        }
+
+        void* data_ptr = reinterpret_cast<void*>(handle->mapped_ptr + tensor_desc->offset_bytes);
+
+        // Memory info for the EP's device (supplied by the factory; this plugin cannot
+        // read OrtEpDevice internals). The tensor references the imported memory without
+        // owning it; the user keeps the handle alive while the tensor is in use.
+        const OrtMemoryInfo* memory_info = impl.memory_info_;
+
+        return impl.ort_api.CreateTensorWithDataAsOrtValue(
+            memory_info, data_ptr, available_size - tensor_desc->offset_bytes, tensor_desc->shape, tensor_desc->rank,
+            tensor_desc->element_type, out_tensor);
+    }
+
+    static bool ORT_API_CALL CanImportSemaphoreImpl(_In_ const OrtExternalResourceImporterImpl* this_ptr,
+                                                    _In_ OrtExternalSemaphoreType type) noexcept
+    {
+        (void)this_ptr;
+#if defined(_WIN32)
+        return type == ORT_EXTERNAL_SEMAPHORE_D3D12_FENCE || type == ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_WIN32;
+#else
+        return type == ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_OPAQUE_FD;
+#endif
+    }
+
+    static OrtStatus* ORT_API_CALL ImportSemaphoreImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                                       _In_ const OrtExternalSemaphoreDescriptor* desc,
+                                                       _Outptr_ OrtExternalSemaphoreHandle** out_handle) noexcept
+    {
+        auto& impl = *static_cast<NvTrtRtxExternalResourceImporterImpl*>(this_ptr);
+        try
+        {
+
+            if (desc == nullptr || out_handle == nullptr)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid arguments to ImportSemaphore");
+            }
+
+            if (desc->version < kMinExternalResourceDescriptorVersion)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                                 "OrtExternalSemaphoreDescriptor version too old");
+            }
+
+            *out_handle = nullptr;
+
+            if (!CanImportSemaphoreImpl(this_ptr, desc->type))
+            {
+                return impl.ort_api.CreateStatus(ORT_NOT_IMPLEMENTED,
+                                                 "Unsupported external semaphore type for CUDA import");
+            }
+
+            ScopedCudaContextPush ctx(impl.DeviceId());
+
+            CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC ext_sem_desc = {};
+            switch (desc->type)
+            {
+            case ORT_EXTERNAL_SEMAPHORE_D3D12_FENCE:
+                ext_sem_desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
+                break;
+            case ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_WIN32:
+                ext_sem_desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_WIN32;
+                break;
+            case ORT_EXTERNAL_SEMAPHORE_VK_TIMELINE_SEMAPHORE_OPAQUE_FD:
+                ext_sem_desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD;
+                break;
+            default:
+                return impl.ort_api.CreateStatus(ORT_EP_FAIL, "Unexpected external semaphore type");
+            }
+#if defined(_WIN32)
+            ext_sem_desc.handle.win32.handle = desc->native_handle;
+#else
+            ext_sem_desc.handle.fd = static_cast<int>(reinterpret_cast<intptr_t>(desc->native_handle));
+#endif
+            ext_sem_desc.flags = 0;
+
+            CUexternalSemaphore ext_semaphore = nullptr;
+            CUresult cu_result = cuImportExternalSemaphore(&ext_semaphore, &ext_sem_desc);
+            if (cu_result != CUDA_SUCCESS)
+            {
+                return CudaDriverStatus(impl.ort_api, cu_result, "cuImportExternalSemaphore failed");
+            }
+
+            auto handle = std::make_unique<NvTrtRtxExternalSemaphoreHandle>(*desc);
+            handle->ep_device = impl.ep_device_;
+            handle->ext_semaphore = ext_semaphore;
+
+            *out_handle = handle.release();
+            return nullptr;
+        }
+        catch (const std::exception& e)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, e.what());
+        }
+        catch (...)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, "Unknown exception in ImportSemaphore");
+        }
+    }
+
+    static void ORT_API_CALL ReleaseSemaphoreImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                                  _In_ OrtExternalSemaphoreHandle* handle) noexcept
+    {
+        (void)this_ptr;
+        if (handle == nullptr)
+        {
+            return;
+        }
+        auto sem_handle =
+            std::unique_ptr<NvTrtRtxExternalSemaphoreHandle>(static_cast<NvTrtRtxExternalSemaphoreHandle*>(handle));
+        if (sem_handle->ext_semaphore != nullptr)
+        {
+            cuDestroyExternalSemaphore(sem_handle->ext_semaphore);
+        }
+    }
+
+    static OrtStatus* ORT_API_CALL WaitSemaphoreImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                                     _In_ OrtExternalSemaphoreHandle* handle,
+                                                     _In_ OrtSyncStream* stream, _In_ uint64_t value) noexcept
+    {
+        auto& impl = *static_cast<NvTrtRtxExternalResourceImporterImpl*>(this_ptr);
+        try
+        {
+
+            if (handle == nullptr || stream == nullptr)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid arguments to WaitSemaphore");
+            }
+
+            auto* sem_handle = static_cast<NvTrtRtxExternalSemaphoreHandle*>(handle);
+            cudaStream_t cuda_stream = static_cast<cudaStream_t>(impl.ort_api.SyncStream_GetHandle(stream));
+            CUcontext stream_context = nullptr;
+            RETURN_IF_ERROR(GetCudaStreamContext(impl.ort_api, cuda_stream, &stream_context));
+            ScopedCudaContextPush ctx(stream_context);
+
+            CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait_params = {};
+            wait_params.params.fence.value = value;
+            wait_params.flags = 0;
+
+            CUresult cu_result =
+                cuWaitExternalSemaphoresAsync(&sem_handle->ext_semaphore, &wait_params, 1, cuda_stream);
+            if (cu_result != CUDA_SUCCESS)
+            {
+                return CudaDriverStatus(impl.ort_api, cu_result, "cuWaitExternalSemaphoresAsync failed");
+            }
+
+            return nullptr;
+        }
+        catch (const std::exception& e)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, e.what());
+        }
+        catch (...)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, "Unknown exception in WaitSemaphore");
+        }
+    }
+
+    static OrtStatus* ORT_API_CALL SignalSemaphoreImpl(_In_ OrtExternalResourceImporterImpl* this_ptr,
+                                                       _In_ OrtExternalSemaphoreHandle* handle,
+                                                       _In_ OrtSyncStream* stream, _In_ uint64_t value) noexcept
+    {
+        auto& impl = *static_cast<NvTrtRtxExternalResourceImporterImpl*>(this_ptr);
+        try
+        {
+
+            if (handle == nullptr || stream == nullptr)
+            {
+                return impl.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid arguments to SignalSemaphore");
+            }
+
+            auto* sem_handle = static_cast<NvTrtRtxExternalSemaphoreHandle*>(handle);
+            cudaStream_t cuda_stream = static_cast<cudaStream_t>(impl.ort_api.SyncStream_GetHandle(stream));
+            CUcontext stream_context = nullptr;
+            RETURN_IF_ERROR(GetCudaStreamContext(impl.ort_api, cuda_stream, &stream_context));
+            ScopedCudaContextPush ctx(stream_context);
+
+            CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signal_params = {};
+            signal_params.params.fence.value = value;
+            signal_params.flags = 0;
+
+            CUresult cu_result =
+                cuSignalExternalSemaphoresAsync(&sem_handle->ext_semaphore, &signal_params, 1, cuda_stream);
+            if (cu_result != CUDA_SUCCESS)
+            {
+                return CudaDriverStatus(impl.ort_api, cu_result, "cuSignalExternalSemaphoresAsync failed");
+            }
+
+            return nullptr;
+        }
+        catch (const std::exception& e)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, e.what());
+        }
+        catch (...)
+        {
+            return impl.ort_api.CreateStatus(ORT_FAIL, "Unknown exception in SignalSemaphore");
+        }
+    }
+
+    static void ORT_API_CALL ReleaseImpl(_In_ OrtExternalResourceImporterImpl* this_ptr) noexcept
+    {
+        delete static_cast<NvTrtRtxExternalResourceImporterImpl*>(this_ptr);
+    }
+
+    //! \brief CUDA device id this importer is bound to.
+    int DeviceId() const
+    {
+        return device_id_;
+    }
+
+private:
+    const OrtEpDevice* ep_device_;      //!< Opaque; stored only to stamp on created handles.
+    int device_id_;                     //!< CUDA device id (parsed from ep_device by the factory).
+    const OrtMemoryInfo* memory_info_;  //!< Device memory info (owned by the factory).
+    const OrtApi& ort_api;
+};
+
+}  // namespace
+#endif  // ORT_API_VERSION >= 26
+
 //
 // Factory Constructor - Sets up OrtEpFactory interface function pointers
 //
 TensorrtRtxExecutionProviderFactory::TensorrtRtxExecutionProviderFactory(const char* ep_name,
-                                                                         const OrtLogger& default_logger,
-                                                                         ApiPtrs apis)
-    : OrtEpFactory{}, ApiPtrs(apis), default_logger_{default_logger}, ep_name_{ep_name}
+                                                                         const OrtLogger& default_logger, ApiPtrs apis)
+    : OrtEpFactory{}
+    , ApiPtrs(apis)
+    , default_logger_{default_logger}
+    , ep_name_{ep_name}
 {
-   // Set OrtEpFactory interface function pointers.
-   // ort_version_supported is the negotiated version, not the compile-time one,
-   // so a single DLL can declare itself compatible with whatever host loaded it
-   // (in [kMinSupportedOrtApiVersion, compile-time ORT_API_VERSION]).
-   //
-   // All callbacks are populated unconditionally — newer ones are gated by ORT
-   // host code via ort_version_supported < N checks, so the host will only
-   // invoke callbacks that exist at the negotiated version.
+    // Set OrtEpFactory interface function pointers.
+    // ort_version_supported is the negotiated version, not the compile-time one,
+    // so a single DLL can declare itself compatible with whatever host loaded it
+    // (in [kMinSupportedOrtApiVersion, compile-time ORT_API_VERSION]).
+    //
+    // All callbacks are populated unconditionally — newer ones are gated by ORT
+    // host code via ort_version_supported < N checks, so the host will only
+    // invoke callbacks that exist at the negotiated version.
     ort_version_supported = NegotiatedOrtApiVersion();
     GetName = GetNameImpl;
     GetVendor = GetVendorImpl;
@@ -155,6 +659,13 @@ TensorrtRtxExecutionProviderFactory::TensorrtRtxExecutionProviderFactory(const c
     DeinitGraphicsInterop = DeinitGraphicsInteropImpl;
 #endif
 
+#if ORT_API_VERSION >= 26
+    // External resource import (D3D12 shared resources + timeline fences), added in
+    // ORT API v26. Lets graphics apps import D3D12 buffers as CUDA memory and D3D12
+    // fences as CUDA external semaphores for zero-copy, GPU-side synchronized interop.
+    CreateExternalResourceImporterForDevice = CreateExternalResourceImporterForDeviceImpl;
+#endif
+
     // Register custom operations (FP4/FP8 quantization) with ONNX Runtime.
     // These operations are recognized by ONNX Runtime but executed by TensorRT's inference engine.
     // Registration must succeed for the EP to function properly with quantized models.
@@ -164,8 +675,8 @@ TensorrtRtxExecutionProviderFactory::TensorrtRtxExecutionProviderFactory(const c
         // Extract error details and log before releasing the status object.
         const char* error_msg = ort_api.GetErrorMessage(status);
         ort_api.Logger_LogMessage(&default_logger, ORT_LOGGING_LEVEL_ERROR,
-                                   error_msg ? error_msg : "Failed to initialize custom op domains",
-                                   ORT_FILE, __LINE__, __FUNCTION__);
+                                  error_msg ? error_msg : "Failed to initialize custom op domains", ORT_FILE, __LINE__,
+                                  __FUNCTION__);
         ort_api.ReleaseStatus(status);
         // Factory creation must fail if custom operations cannot be registered.
         throw std::runtime_error("Failed to initialize custom op domains for TensorRT RTX EP");
@@ -185,12 +696,11 @@ TensorrtRtxExecutionProviderFactory::~TensorrtRtxExecutionProviderFactory() noex
             }
             catch (...)
             {
-
             }
         }
     }
     custom_op_domains_.clear();
-    
+
     if (kernel_registry_ != nullptr)
     {
         try
@@ -206,6 +716,7 @@ TensorrtRtxExecutionProviderFactory::~TensorrtRtxExecutionProviderFactory() noex
 
 OrtStatus* TensorrtRtxExecutionProviderFactory::ShrinkCudaMempoolAllocators(uint32_t device_id)
 {
+    std::lock_guard<std::mutex> lock(mempool_state_mutex_);
     auto it_mempool = device_mempool_allocators.find(device_id);
     if (it_mempool != device_mempool_allocators.end())
     {
@@ -243,6 +754,62 @@ CudaMempoolAllocator* TensorrtRtxExecutionProviderFactory::GetActiveMempoolForDe
     return it->second.get();
 }
 
+OrtStatus* TensorrtRtxExecutionProviderFactory::CreateBfcArenaForDevice(const OrtMemoryInfo* memory_info,
+                                                                        uint32_t device_id,
+                                                                        const OrtKeyValuePairs* options,
+                                                                        std::unique_ptr<ArenaAllocator>& out)
+{
+    auto cuda_allocator_raw = new TensorrtRtxAllocator(memory_info, static_cast<DeviceId>(device_id));
+    AllocatorUniquePtr<OrtAllocator> cuda_allocator(static_cast<OrtAllocator*>(cuda_allocator_raw),
+                                                    [](OrtAllocator* p)
+                                                    {
+                                                        delete static_cast<TensorrtRtxAllocator*>(p);
+                                                    });
+
+    return ArenaAllocator::CreateOrtArenaAllocator(std::move(cuda_allocator), options, ort_api, default_logger_, out);
+}
+
+OrtAllocator* TensorrtRtxExecutionProviderFactory::GetOrCreateDeviceArena(uint32_t device_id)
+{
+    std::lock_guard<std::mutex> lock(device_arena_mutex_);
+
+    // Reuse the per-device BFC arena if ORT (CreateAllocatorImpl) or a prior call already created it.
+    auto it = device_allocators.find(device_id);
+    if (it != device_allocators.end())
+    {
+        return it->second.get();
+    }
+
+    // Not created yet (the EP constructor can run before ORT requests the allocator). Create it now
+    // via the shared helper and store it in device_allocators so ORT reuses this same instance later.
+    auto info_it = device_memory_infos.find(device_id);
+    if (info_it == device_memory_infos.end() || info_it->second == nullptr)
+    {
+        std::ostringstream ss;
+        ss << "[NvTensorRTRTX EP] Cannot create device arena: no device memory info for device " << device_id << ".";
+        (void)ort_api.Logger_LogMessage(&default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, ss.str().c_str(),
+                                        ORT_FILE, __LINE__, __FUNCTION__);
+        return nullptr;
+    }
+
+    std::unique_ptr<ArenaAllocator> arena_allocator = nullptr;
+    OrtStatus* status = CreateBfcArenaForDevice(info_it->second.get(), device_id, /*options=*/nullptr, arena_allocator);
+    if (status != nullptr)
+    {
+        std::ostringstream ss;
+        ss << "[NvTensorRTRTX EP] Failed to create device arena for device " << device_id << ": "
+           << ort_api.GetErrorMessage(status);
+        (void)ort_api.Logger_LogMessage(&default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, ss.str().c_str(),
+                                        ORT_FILE, __LINE__, __FUNCTION__);
+        ort_api.ReleaseStatus(status);
+        return nullptr;
+    }
+
+    OrtAllocator* result = arena_allocator.get();
+    device_allocators[device_id] = std::move(arena_allocator);
+    return result;
+}
+
 void TensorrtRtxExecutionProviderFactory::NoteAsyncMempoolFailure(uint32_t device_id)
 {
     bool newly_disabled = false;
@@ -254,17 +821,16 @@ void TensorrtRtxExecutionProviderFactory::NoteAsyncMempoolFailure(uint32_t devic
     if (newly_disabled)
     {
         std::ostringstream ss;
-        ss << "[NvTensorRTRTX EP] CUDA async memory pool allocation failed at run time on device "
-           << device_id << "; latching to the synchronous cudaMalloc arena for the rest of this "
+        ss << "[NvTensorRTRTX EP] CUDA async memory pool allocation failed at run time on device " << device_id
+           << "; latching to the synchronous cudaMalloc arena for the rest of this "
               "process. Expect higher VRAM usage and reduced performance; CUDA graph capture, if "
               "enabled, is unavailable while the synchronous arena is active.";
-        (void)ort_api.Logger_LogMessage(&default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                        ss.str().c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+        (void)ort_api.Logger_LogMessage(&default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, ss.str().c_str(),
+                                        ORT_FILE, __LINE__, __FUNCTION__);
     }
 }
 
-OrtStatus* TensorrtRtxExecutionProviderFactory::GetKernelRegistryForEp(
-    const OrtKernelRegistry** out_kernel_registry)
+OrtStatus* TensorrtRtxExecutionProviderFactory::GetKernelRegistryForEp(const OrtKernelRegistry** out_kernel_registry)
 {
     *out_kernel_registry = nullptr;
 
@@ -338,41 +904,29 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::CreateMemoryInfoForDevices(int n
     {
         // Create device memory info (OrtDeviceMemoryType_DEFAULT)
         OrtMemoryInfo* device_memory_info = nullptr;
-        RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2(
-            "TensorRTRTX",
-            OrtMemoryInfoDeviceType_GPU,
-            vendor_id_,
-            device_id,
-            OrtDeviceMemoryType_DEFAULT,
-            0,  // alignment
-            OrtAllocatorType::OrtDeviceAllocator,
-            &device_memory_info));
+        RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("TensorRTRTX", OrtMemoryInfoDeviceType_GPU, vendor_id_, device_id,
+                                                    OrtDeviceMemoryType_DEFAULT,
+                                                    0,  // alignment
+                                                    OrtAllocatorType::OrtDeviceAllocator, &device_memory_info));
 
-        device_memory_infos[device_id] = MemoryInfoUniquePtr(
-            device_memory_info,
-            [this](OrtMemoryInfo* ptr)
-            {
-                ort_api.ReleaseMemoryInfo(ptr);
-            });
+        device_memory_infos[device_id] = MemoryInfoUniquePtr(device_memory_info,
+                                                             [this](OrtMemoryInfo* ptr)
+                                                             {
+                                                                 ort_api.ReleaseMemoryInfo(ptr);
+                                                             });
 
         // Create pinned/host-accessible memory info (OrtDeviceMemoryType_HOST_ACCESSIBLE)
         OrtMemoryInfo* pinned_memory_info = nullptr;
-        RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2(
-            "TensorRTRTX host accessible",
-            OrtMemoryInfoDeviceType_GPU,
-            vendor_id_,
-            device_id,
-            OrtDeviceMemoryType_HOST_ACCESSIBLE,
-            0,  // alignment
-            OrtAllocatorType::OrtDeviceAllocator,
-            &pinned_memory_info));
+        RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("TensorRTRTX host accessible", OrtMemoryInfoDeviceType_GPU,
+                                                    vendor_id_, device_id, OrtDeviceMemoryType_HOST_ACCESSIBLE,
+                                                    0,  // alignment
+                                                    OrtAllocatorType::OrtDeviceAllocator, &pinned_memory_info));
 
-        pinned_memory_infos[device_id] = MemoryInfoUniquePtr(
-            pinned_memory_info,
-            [this](OrtMemoryInfo* ptr)
-            {
-                ort_api.ReleaseMemoryInfo(ptr);
-            });
+        pinned_memory_infos[device_id] = MemoryInfoUniquePtr(pinned_memory_info,
+                                                             [this](OrtMemoryInfo* ptr)
+                                                             {
+                                                                 ort_api.ReleaseMemoryInfo(ptr);
+                                                             });
     }
 
     return nullptr;
@@ -398,7 +952,8 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::CreateMemoryInfoForDevices(int n
 //! \param minor Optional output parameter for the minor compute capability version.
 //! \return True if the device is a supported NVIDIA GPU, false otherwise.
 //!
-static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const OrtApi& ort_api, int* major = nullptr, int* minor = nullptr)
+static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const OrtApi& ort_api, int* major = nullptr,
+                                         int* minor = nullptr)
 {
 #if defined(_WIN32)
     // Get device metadata using API
@@ -567,8 +1122,10 @@ static bool CompareNVMLDriverVersion(const std::string& driver_version_str, cons
     }
 
     // Compare versions numerically: major first, then minor.
-    if (driver_major > min_major) return true;
-    if (driver_major < min_major) return false;
+    if (driver_major > min_major)
+        return true;
+    if (driver_major < min_major)
+        return false;
     return driver_minor >= min_minor;
 }
 
@@ -591,30 +1148,26 @@ static bool CompareNVMLDriverVersion(const std::string& driver_version_str, cons
 //! \return nullptr on success (compatible or details set), OrtStatus on error.
 //!
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIncompatibilityDetailsImpl(
-    OrtEpFactory* this_ptr,
-    const OrtHardwareDevice* hw,
-    OrtDeviceEpIncompatibilityDetails* details) noexcept
+    OrtEpFactory* this_ptr, const OrtHardwareDevice* hw, OrtDeviceEpIncompatibilityDetails* details) noexcept
 {
     auto* factory = static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
 
     if (hw == nullptr || details == nullptr)
     {
         return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
-                                            "[NvTensorRTRTX EP] Invalid arguments: hw or details is null");
+                                             "[NvTensorRTRTX EP] Invalid arguments: hw or details is null");
     }
 
     // Check if the device is a GPU from NVIDIA vendor
     OrtHardwareDeviceType device_type = factory->ort_api.HardwareDevice_Type(hw);
     uint32_t vendor_id = factory->ort_api.HardwareDevice_VendorId(hw);
 
-    if (device_type != OrtHardwareDeviceType::OrtHardwareDeviceType_GPU ||
-        vendor_id != factory->vendor_id_)
+    if (device_type != OrtHardwareDeviceType::OrtHardwareDeviceType_GPU || vendor_id != factory->vendor_id_)
     {
         // Not a NVIDIA GPU - device type/vendor incompatible
         uint32_t reasons = OrtDeviceEpIncompatibility_DEVICE_INCOMPATIBLE;
         return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
-            details,
-            reasons,
+            details, reasons,
             0,  // error_code
             "NvTensorRTRTX EP only supports NVIDIA GPU devices");
     }
@@ -633,22 +1186,20 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
         if (compute_capability_major == 0 && compute_capability_minor == 0)
         {
             return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
-                details,
-                reasons,
+                details, reasons,
                 0,  // error_code
                 "NvTensorRTRTX EP could not resolve the GPU device properties via CUDA. "
                 "Ensure the NVIDIA driver and CUDA runtime are correctly installed.");
         }
 
         // Device was found but its architecture is below the minimum requirement.
-        std::string cc_string = std::to_string(compute_capability_major) + "." + std::to_string(compute_capability_minor);
+        std::string cc_string =
+            std::to_string(compute_capability_major) + "." + std::to_string(compute_capability_minor);
         std::string msg = "NvTensorRTRTX EP does not support GPU with Compute Capability " + cc_string +
                           ". Minimum required: Compute Capability 8.0 (Ampere architecture or newer).";
-        return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
-            details,
-            reasons,
-            0,  // error_code
-            msg.c_str());
+        return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(details, reasons,
+                                                                         0,  // error_code
+                                                                         msg.c_str());
     }
 
     // Determine minimum driver version based on GPU architecture
@@ -679,11 +1230,9 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
         uint32_t reasons = OrtDeviceEpIncompatibility_DRIVER_INCOMPATIBLE;
         std::string msg = "Failed to initialize NVML: " + std::string(nvmlErrorString(nvml_result)) +
                           ". NVIDIA driver may not be properly installed.";
-        return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
-            details,
-            reasons,
-            0,  // error_code
-            msg.c_str());
+        return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(details, reasons,
+                                                                         0,  // error_code
+                                                                         msg.c_str());
     }
 
     char driver_version_str[NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE] = {0};
@@ -696,11 +1245,9 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
     {
         uint32_t reasons = OrtDeviceEpIncompatibility_DRIVER_INCOMPATIBLE;
         std::string msg = "Failed to query NVIDIA driver version: " + std::string(nvmlErrorString(nvml_result));
-        return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
-            details,
-            reasons,
-            0,  // error_code
-            msg.c_str());
+        return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(details, reasons,
+                                                                         0,  // error_code
+                                                                         msg.c_str());
     }
 
     // Compare driver version with minimum required
@@ -711,8 +1258,7 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
                           " is too old. Minimum required: " + min_driver_version + " or higher";
 
         return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
-            details,
-            reasons,
+            details, reasons,
             0,  // error_code (could store parsed version if needed)
             msg.c_str());
     }
@@ -722,17 +1268,14 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevicesImpl(
-    OrtEpFactory* this_ptr,
-    const OrtHardwareDevice* const* devices,
-    size_t num_devices,
-    OrtEpDevice** ep_devices,
-    size_t max_ep_devices,
-    size_t* p_num_ep_devices) noexcept
+    OrtEpFactory* this_ptr, const OrtHardwareDevice* const* devices, size_t num_devices, OrtEpDevice** ep_devices,
+    size_t max_ep_devices, size_t* p_num_ep_devices) noexcept
 {
     // Security check: validate this_ptr is not null
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: this_ptr is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] GetSupportedDevicesImpl: this_ptr is null");
     }
 
     auto* factory = static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
@@ -740,15 +1283,18 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
     // Security check: validate remaining input parameters
     if (num_devices > 0 && devices == nullptr)
     {
-        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: devices array is null");
+        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] GetSupportedDevicesImpl: devices array is null");
     }
     if (ep_devices == nullptr)
     {
-        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: ep_devices output is null");
+        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] GetSupportedDevicesImpl: ep_devices output is null");
     }
     if (p_num_ep_devices == nullptr)
     {
-        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: p_num_ep_devices output is null");
+        return factory->ort_api.CreateStatus(
+            ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: p_num_ep_devices output is null");
     }
 
     size_t& num_ep_devices = *p_num_ep_devices;
@@ -792,7 +1338,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
                 const OrtMemoryInfo* host_accessible_mem_info = factory->pinned_memory_infos[device_id].get();
 
                 RETURN_IF_ERROR(factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], gpu_mem_info));
-                RETURN_IF_ERROR(factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], host_accessible_mem_info));
+                RETURN_IF_ERROR(
+                    factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], host_accessible_mem_info));
                 num_ep_devices++;
                 device_id++;
             }
@@ -806,13 +1353,9 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
-    OrtEpFactory* this_ptr,
-    _In_reads_(num_devices) const OrtHardwareDevice* const* devices,
-    _In_reads_(num_devices) const OrtKeyValuePairs* const* ep_metadata,
-    _In_ size_t num_devices,
-    _In_ const OrtSessionOptions* session_options,
-    _In_ const OrtLogger* logger,
-    _Out_ OrtEp** ep) noexcept
+    OrtEpFactory* this_ptr, _In_reads_(num_devices) const OrtHardwareDevice* const* devices,
+    _In_reads_(num_devices) const OrtKeyValuePairs* const* ep_metadata, _In_ size_t num_devices,
+    _In_ const OrtSessionOptions* session_options, _In_ const OrtLogger* logger, _Out_ OrtEp** ep) noexcept
 {
     // Security check: validate this_ptr is not null
     if (this_ptr == nullptr)
@@ -825,7 +1368,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
     // Security check: validate remaining input parameters
     if (session_options == nullptr)
     {
-        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateEpImpl: session_options is null");
+        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] CreateEpImpl: session_options is null");
     }
     if (logger == nullptr)
     {
@@ -833,26 +1377,25 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
     }
     if (ep == nullptr)
     {
-        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateEpImpl: ep output is null");
+        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "[NvTensorRTRTX EP] CreateEpImpl: ep output is null");
     }
     *ep = nullptr;
 
     if (num_devices != 1)
     {
-        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
-                                             "EP only supports selection for one device.");
+        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "EP only supports selection for one device.");
     }
 
     // Log creation
-    RETURN_IF_ERROR(factory->ort_api.Logger_LogMessage(logger,
-                                                       OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
-                                                       "Creating Execution Provider",
-                                                       ORT_FILE, __LINE__, __FUNCTION__));
+    RETURN_IF_ERROR(factory->ort_api.Logger_LogMessage(logger, OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+                                                       "Creating Execution Provider", ORT_FILE, __LINE__,
+                                                       __FUNCTION__));
 
     try
     {
-        auto execution_provider = std::make_unique<TensorrtRtxExecutionProvider>(
-            *factory, factory->ep_name_, *session_options, *logger);
+        auto execution_provider =
+            std::make_unique<TensorrtRtxExecutionProvider>(*factory, factory->ep_name_, *session_options, *logger);
         *ep = execution_provider.release();
     }
     catch (const std::exception& e)
@@ -861,8 +1404,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
     }
     catch (...)
     {
-        return factory->ort_api.CreateStatus(
-            ORT_FAIL, "[NvTensorRTRTX EP] CreateEpImpl failed with an unknown exception.");
+        return factory->ort_api.CreateStatus(ORT_FAIL,
+                                             "[NvTensorRTRTX EP] CreateEpImpl failed with an unknown exception.");
     }
 
     return nullptr;
@@ -880,15 +1423,14 @@ void ORT_API_CALL TensorrtRtxExecutionProviderFactory::ReleaseEpImpl(OrtEpFactor
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl(
-    OrtEpFactory* this_ptr,
-    const OrtMemoryInfo* memory_info,
-    const OrtKeyValuePairs* allocator_options,
+    OrtEpFactory* this_ptr, const OrtMemoryInfo* memory_info, const OrtKeyValuePairs* allocator_options,
     OrtAllocator** allocator) noexcept
 {
     // Security check: validate this_ptr is not null
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateAllocatorImpl: this_ptr is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] CreateAllocatorImpl: this_ptr is null");
     }
 
     auto& factory = *static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
@@ -896,11 +1438,13 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl
     // Security check: validate remaining input parameters
     if (memory_info == nullptr)
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateAllocatorImpl: memory_info is null");
+        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                            "[NvTensorRTRTX EP] CreateAllocatorImpl: memory_info is null");
     }
     if (allocator == nullptr)
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateAllocatorImpl: allocator output is null");
+        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                            "[NvTensorRTRTX EP] CreateAllocatorImpl: allocator output is null");
     }
     // Note: allocator_options can be null, so we don't check it
 
@@ -921,12 +1465,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl
         // (below) and graph capture is off. Create() logs the fallback WARNING.
         {
             std::unique_ptr<CudaMempoolAllocator> mempool_allocator;
-            RETURN_IF_ERROR(CudaMempoolAllocator::Create(
-                memory_info,
-                static_cast<DeviceId>(device_id),
-                factory.ort_api,
-                factory.default_logger_,
-                mempool_allocator));
+            RETURN_IF_ERROR(CudaMempoolAllocator::Create(memory_info, static_cast<DeviceId>(device_id), factory.ort_api,
+                                                         factory.default_logger_, mempool_allocator));
 
             if (mempool_allocator)
             {
@@ -939,17 +1479,9 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl
 
         // Create BFC arena allocator for non-shared activation memory allocation.
         {
-            // Fall back to BFC arena
-            auto cuda_allocator_raw = new TensorrtRtxAllocator(memory_info, static_cast<DeviceId>(device_id));
-            AllocatorUniquePtr<OrtAllocator> cuda_allocator(
-                static_cast<OrtAllocator*>(cuda_allocator_raw),
-                [](OrtAllocator* p)
-                {
-                    delete static_cast<TensorrtRtxAllocator*>(p);
-                });
-
             std::unique_ptr<ArenaAllocator> arena_allocator = nullptr;
-            RETURN_IF_ERROR(ArenaAllocator::CreateOrtArenaAllocator(std::move(cuda_allocator), allocator_options, factory.ort_api, factory.default_logger_, arena_allocator));
+            RETURN_IF_ERROR(
+                factory.CreateBfcArenaForDevice(memory_info, device_id, allocator_options, arena_allocator));
 
             *allocator = arena_allocator.get();
             factory.device_allocators[device_id] = std::move(arena_allocator);
@@ -966,32 +1498,32 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl
 
         // Create a CUDA pinned allocator
         auto cuda_pinned_allocator_raw = new TensorrtRtxPinnedAllocator(memory_info);
-        AllocatorUniquePtr<OrtAllocator> cuda_pinned_allocator(
-            static_cast<OrtAllocator*>(cuda_pinned_allocator_raw),
-            [](OrtAllocator* p)
-            {
-                delete static_cast<TensorrtRtxPinnedAllocator*>(p);
-            });
+        AllocatorUniquePtr<OrtAllocator> cuda_pinned_allocator(static_cast<OrtAllocator*>(cuda_pinned_allocator_raw),
+                                                               [](OrtAllocator* p)
+                                                               {
+                                                                   delete static_cast<TensorrtRtxPinnedAllocator*>(p);
+                                                               });
 
         std::unique_ptr<ArenaAllocator> arena_allocator = nullptr;
-        RETURN_IF_ERROR(ArenaAllocator::CreateOrtArenaAllocator(std::move(cuda_pinned_allocator), allocator_options, factory.ort_api, factory.default_logger_, arena_allocator));
+        RETURN_IF_ERROR(ArenaAllocator::CreateOrtArenaAllocator(std::move(cuda_pinned_allocator), allocator_options,
+                                                                factory.ort_api, factory.default_logger_,
+                                                                arena_allocator));
 
         *allocator = arena_allocator.get();
         factory.pinned_allocators[device_id] = std::move(arena_allocator);
     }
     else
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
-                                            "INTERNAL ERROR! Unknown memory info provided to CreateAllocator. "
-                                            "Value did not come directly from an OrtEpDevice returned by this factory.");
+        return factory.ort_api.CreateStatus(
+            ORT_INVALID_ARGUMENT, "INTERNAL ERROR! Unknown memory info provided to CreateAllocator. "
+                                  "Value did not come directly from an OrtEpDevice returned by this factory.");
     }
 
     return nullptr;
 }
 
-void ORT_API_CALL TensorrtRtxExecutionProviderFactory::ReleaseAllocatorImpl(
-    OrtEpFactory* /*this_ptr*/,
-    OrtAllocator* allocator) noexcept
+void ORT_API_CALL TensorrtRtxExecutionProviderFactory::ReleaseAllocatorImpl(OrtEpFactory* /*this_ptr*/,
+                                                                            OrtAllocator* allocator) noexcept
 {
     // TODO: Release allocator if it's not shared.
     // If using shared allocators across sessions, this can be a no-op.
@@ -1000,13 +1532,13 @@ void ORT_API_CALL TensorrtRtxExecutionProviderFactory::ReleaseAllocatorImpl(
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateDataTransferImpl(
-    OrtEpFactory* this_ptr,
-    OrtDataTransferImpl** data_transfer) noexcept
+    OrtEpFactory* this_ptr, OrtDataTransferImpl** data_transfer) noexcept
 {
     // Security check: validate this_ptr is not null
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateDataTransferImpl: this_ptr is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] CreateDataTransferImpl: this_ptr is null");
     }
 
     auto& factory = *static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
@@ -1014,16 +1546,15 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateDataTransferI
     // Security check: validate output parameter is not null
     if (data_transfer == nullptr)
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateDataTransferImpl: data_transfer output is null");
+        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                            "[NvTensorRTRTX EP] CreateDataTransferImpl: data_transfer output is null");
     }
 
     if (factory.data_transfer_impl == nullptr)
     {
-        factory.data_transfer_impl = std::make_unique<TensorrtRtxDataTransfer>(
-            static_cast<const ApiPtrs&>(factory),
-            factory.device_mem_devices,
-            factory.pinned_mem_devices,
-            factory.vendor_id_);
+        factory.data_transfer_impl =
+            std::make_unique<TensorrtRtxDataTransfer>(static_cast<const ApiPtrs&>(factory), factory.device_mem_devices,
+                                                      factory.pinned_mem_devices, factory.vendor_id_);
     }
     *data_transfer = factory.data_transfer_impl.get();
     return nullptr;
@@ -1040,15 +1571,15 @@ bool ORT_API_CALL TensorrtRtxExecutionProviderFactory::IsStreamAwareImpl(const O
     return true;
 }
 
-OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateSyncStreamForDeviceImpl(OrtEpFactory* this_ptr,
-                                                                                           const OrtMemoryDevice* memory_device,
-                                                                                           const OrtKeyValuePairs* stream_options,
-                                                                                           OrtSyncStreamImpl** ort_stream) noexcept
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateSyncStreamForDeviceImpl(
+    OrtEpFactory* this_ptr, const OrtMemoryDevice* memory_device, const OrtKeyValuePairs* stream_options,
+    OrtSyncStreamImpl** ort_stream) noexcept
 {
     // Security check: validate this_ptr is not null
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] Factory CreateSyncStreamForDeviceImpl: this_ptr is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] Factory CreateSyncStreamForDeviceImpl: this_ptr is null");
     }
 
     auto& factory = *static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
@@ -1056,11 +1587,14 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateSyncStreamFor
     // Security check: validate remaining input parameters
     if (memory_device == nullptr)
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] Factory CreateSyncStreamForDeviceImpl: memory_device is null");
+        return factory.ort_api.CreateStatus(
+            ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] Factory CreateSyncStreamForDeviceImpl: memory_device is null");
     }
     if (ort_stream == nullptr)
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] Factory CreateSyncStreamForDeviceImpl: ort_stream output is null");
+        return factory.ort_api.CreateStatus(
+            ORT_INVALID_ARGUMENT,
+            "[NvTensorRTRTX EP] Factory CreateSyncStreamForDeviceImpl: ort_stream output is null");
     }
     // Note: stream_options can be null, so we don't check it
     auto device_id = factory.ep_api.MemoryDevice_GetDeviceId(memory_device);
@@ -1072,7 +1606,7 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateSyncStreamFor
 }
 
 //
-// Custom Op Domain Support 
+// Custom Op Domain Support
 //
 
 //!
@@ -1091,85 +1625,81 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::InitializeCustomOpDomains()
     // Create a custom operation domain named "trt" to namespace TensorRT-specific operations.
     OrtCustomOpDomain* trt_domain = nullptr;
     RETURN_IF_ERROR(ort_api.CreateCustomOpDomain(kTrtCustomOpDomain, &trt_domain));
-    
+
     // Static storage ensures custom operation objects remain valid for the application lifetime.
     // ONNX Runtime holds pointers to these objects, so they must not be destroyed prematurely.
     static std::vector<std::unique_ptr<TensorRTRtxCustomOp>> custom_ops;
-    
+
     // Register each TensorRT custom operation (e.g., TRT_FP4DynamicQuantize, TRT_FP8QuantizeLinear).
-    for (const char* name : kTrtCustomOpNames) {
+    for (const char* name : kTrtCustomOpNames)
+    {
         auto op = std::make_unique<TensorRTRtxCustomOp>(ep_name_.c_str(), /* compute_stream = */ nullptr);
         op->SetName(name);
-        
+
         // Add the operation to the domain so ONNX Runtime can route it to this execution provider.
         RETURN_IF_ERROR(ort_api.CustomOpDomain_Add(trt_domain, op.get()));
         custom_ops.push_back(std::move(op));
     }
-    
+
     custom_op_domains_.push_back(trt_domain);
     return nullptr;
 }
 
-OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetNumCustomOpDomainsImpl(
-    OrtEpFactory* this_ptr,
-    size_t* num_domains) noexcept
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetNumCustomOpDomainsImpl(OrtEpFactory* this_ptr,
+                                                                                       size_t* num_domains) noexcept
 {
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, 
-                                         "[NvTensorRTRTX EP] GetNumCustomOpDomainsImpl: this_ptr is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] GetNumCustomOpDomainsImpl: this_ptr is null");
     }
-    
+
     if (num_domains == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, 
-                                         "[NvTensorRTRTX EP] GetNumCustomOpDomainsImpl: num_domains is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] GetNumCustomOpDomainsImpl: num_domains is null");
     }
-    
+
     auto* factory = static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
     *num_domains = factory->custom_op_domains_.size();
     return nullptr;
 }
 
-OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetCustomOpDomainsImpl(
-    OrtEpFactory* this_ptr,
-    OrtCustomOpDomain** domains,
-    size_t num_domains) noexcept
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetCustomOpDomainsImpl(OrtEpFactory* this_ptr,
+                                                                                    OrtCustomOpDomain** domains,
+                                                                                    size_t num_domains) noexcept
 {
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, 
-                                         "[NvTensorRTRTX EP] GetCustomOpDomainsImpl: this_ptr is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] GetCustomOpDomainsImpl: this_ptr is null");
     }
-    
+
     if (domains == nullptr && num_domains > 0)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT, 
-                                         "[NvTensorRTRTX EP] GetCustomOpDomainsImpl: domains is null");
+        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
+                                          "[NvTensorRTRTX EP] GetCustomOpDomainsImpl: domains is null");
     }
-    
+
     auto* factory = static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
-    
+
     for (size_t i = 0; i < num_domains && i < factory->custom_op_domains_.size(); i++)
     {
         domains[i] = factory->custom_op_domains_[i];
     }
-    
+
     return nullptr;
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledModelCompatibilityInfoImpl(
-    OrtEpFactory* this_ptr,
-    const OrtHardwareDevice* const* devices,
-    size_t num_devices,
-    const char* compatibility_info,
+    OrtEpFactory* this_ptr, const OrtHardwareDevice* const* devices, size_t num_devices, const char* compatibility_info,
     OrtCompiledModelCompatibility* model_compatibility) noexcept
 {
-    auto log_message = [](const OrtApi& ort_api, const OrtLogger& logger,
-                          OrtLoggingLevel level, const std::string& message) noexcept
+    auto log_message =
+        [](const OrtApi& ort_api, const OrtLogger& logger, OrtLoggingLevel level, const std::string& message) noexcept
     {
-        OrtStatus* status = ort_api.Logger_LogMessage(&logger, level, message.c_str(),
-                                                      ORT_FILE, __LINE__, __FUNCTION__);
+        OrtStatus* status =
+            ort_api.Logger_LogMessage(&logger, level, message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
         if (status != nullptr)
         {
             ort_api.ReleaseStatus(status);
@@ -1178,15 +1708,16 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledMod
 
     if (this_ptr == nullptr)
     {
-        return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
-                                          "[NvTensorRTRTX EP] ValidateCompiledModelCompatibilityInfoImpl: null OrtEpFactory");
+        return Ort::GetApi().CreateStatus(
+            ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] ValidateCompiledModelCompatibilityInfoImpl: null OrtEpFactory");
     }
     auto& factory = *static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
 
     if (compatibility_info == nullptr || model_compatibility == nullptr)
     {
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
-                                            "[NvTensorRTRTX EP] Invalid arguments: compatibility_info or model_compatibility is null");
+        return factory.ort_api.CreateStatus(
+            ORT_INVALID_ARGUMENT,
+            "[NvTensorRTRTX EP] Invalid arguments: compatibility_info or model_compatibility is null");
     }
 
     (void)devices;
@@ -1212,8 +1743,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledMod
 
         if (engine_header.size() != kTensorRTEngineHeaderSize)
         {
-            std::string message = "[NvTensorRTRTX EP] Invalid header size: " +
-                                  std::to_string(engine_header.size()) + " bytes (expected 64)";
+            std::string message = "[NvTensorRTRTX EP] Invalid header size: " + std::to_string(engine_header.size()) +
+                                  " bytes (expected 64)";
             log_message(factory.ort_api, factory.default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, message);
             *model_compatibility = OrtCompiledModelCompatibility_EP_UNSUPPORTED;
             return nullptr;
@@ -1236,8 +1767,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledMod
         }
 
         uint64_t diagnostics = 0;
-        nvinfer1::EngineValidity validity = runtime->getEngineValidity(engine_header.data(), engine_header.size(),
-                                                                       &diagnostics);
+        nvinfer1::EngineValidity validity =
+            runtime->getEngineValidity(engine_header.data(), engine_header.size(), &diagnostics);
 
         switch (validity)
         {
@@ -1280,16 +1811,14 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledMod
     catch (const std::exception& ex)
     {
         std::string error_msg = std::string("[NvTensorRTRTX EP] Exception during validation: ") + ex.what();
-        (void)factory.ort_api.Logger_LogMessage(&factory.default_logger_,
-                                                OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+        (void)factory.ort_api.Logger_LogMessage(&factory.default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
                                                 error_msg.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
         return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
     }
     catch (...)
     {
         std::string error_msg = "[NvTensorRTRTX EP] Unknown exception during validation";
-        (void)factory.ort_api.Logger_LogMessage(&factory.default_logger_,
-                                                OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+        (void)factory.ort_api.Logger_LogMessage(&factory.default_logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
                                                 error_msg.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
         return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
     }
@@ -1304,9 +1833,7 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledMod
 // so the cig_contexts_ map stays empty and GetCigContext returns nullptr.
 #if ORT_API_VERSION >= 25
 static OrtStatus* ParseDeviceIdFromEpDevice(const TensorrtRtxExecutionProviderFactory& factory,
-                                            const OrtEpDevice* ep_device,
-                                            const char* caller,
-                                            int32_t* out_device_id)
+                                            const OrtEpDevice* ep_device, const char* caller, int32_t* out_device_id)
 {
     const OrtKeyValuePairs* ep_options = factory.ort_api.EpDevice_EpOptions(ep_device);
     const char* device_id_str = factory.ort_api.GetKeyValue(ep_options, "device_id");
@@ -1340,9 +1867,7 @@ CUcontext TensorrtRtxExecutionProviderFactory::GetCigContext(int32_t device_id) 
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInteropImpl(
-    OrtEpFactory* this_ptr,
-    const OrtEpDevice* ep_device,
-    const OrtGraphicsInteropConfig* config) noexcept
+    OrtEpFactory* this_ptr, const OrtEpDevice* ep_device, const OrtGraphicsInteropConfig* config) noexcept
 {
     if (this_ptr == nullptr)
     {
@@ -1368,7 +1893,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInterop
     if (config->version < kGraphicsInteropIntroducedAtVersion)
     {
         return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,
-                                          "[NvTensorRTRTX EP] InitGraphicsInterop: config version predates graphics-interop API (introduced in ORT 1.25)");
+                                          "[NvTensorRTRTX EP] InitGraphicsInterop: config version predates "
+                                          "graphics-interop API (introduced in ORT 1.25)");
     }
 
     auto& factory = *static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
@@ -1387,8 +1913,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInterop
         std::lock_guard<std::mutex> lock(factory.cig_contexts_mutex_);
         if (factory.cig_contexts_.find(device_id) != factory.cig_contexts_.end())
         {
-            return factory.ort_api.CreateStatus(ORT_FAIL,
-                                                "[NvTensorRTRTX EP] InitGraphicsInterop: CIG context already exists for this device");
+            return factory.ort_api.CreateStatus(
+                ORT_FAIL, "[NvTensorRTRTX EP] InitGraphicsInterop: CIG context already exists for this device");
         }
     }
 
@@ -1407,11 +1933,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInterop
         CUresult cu_result = cuInit(0);
         if (cu_result != CUDA_SUCCESS)
         {
-            const char* error_str = nullptr;
-            cuGetErrorString(cu_result, &error_str);
-            std::string error_msg = "[NvTensorRTRTX EP] Failed to initialize CUDA driver API: ";
-            error_msg += error_str ? error_str : "unknown error";
-            return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
+            return CudaDriverStatus(factory.ort_api, cu_result,
+                                    "[NvTensorRTRTX EP] Failed to initialize CUDA driver API", ORT_FAIL);
         }
 
         // Get CUDA device properties
@@ -1431,15 +1954,14 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInterop
         HRESULT hr = d3d12_queue->GetDevice(IID_PPV_ARGS(&d3d12_device));
         if (FAILED(hr) || d3d12_device == nullptr)
         {
-            return factory.ort_api.CreateStatus(ORT_FAIL,
-                                                "[NvTensorRTRTX EP] InitGraphicsInterop: failed to get D3D12 device from command queue");
+            return factory.ort_api.CreateStatus(
+                ORT_FAIL, "[NvTensorRTRTX EP] InitGraphicsInterop: failed to get D3D12 device from command queue");
         }
 
         if (cuda_prop.luidDeviceNodeMask == 0)
         {
             d3d12_device->Release();
-            return factory.ort_api.CreateStatus(ORT_FAIL,
-                                                "[NvTensorRTRTX EP] CUDA device does not have a valid LUID");
+            return factory.ort_api.CreateStatus(ORT_FAIL, "[NvTensorRTRTX EP] CUDA device does not have a valid LUID");
         }
 
         uint64_t cuda_luid;
@@ -1455,27 +1977,87 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInterop
                                                 "[NvTensorRTRTX EP] D3D12 device LUID does not match CUDA device LUID");
         }
 
+        CUctxCreateParams ctx_params = {nullptr, 0};
         CUctxCigParam cig_param = {CIG_DATA_TYPE_D3D12_COMMAND_QUEUE, d3d12_queue};
-        CUctxCreateParams ctx_params = {nullptr, 0, &cig_param};
-
+        if (d3d12_queue != nullptr)
+        {
+            ctx_params.cigParams = &cig_param;
+        }
         cu_result = cuCtxCreate_v4(&cig_context, &ctx_params, 0, device_id);
         if (cu_result != CUDA_SUCCESS)
         {
-            const char* error_str = nullptr;
-            cuGetErrorString(cu_result, &error_str);
-            std::string error_msg = "[NvTensorRTRTX EP] Failed to create CIG context for D3D12: ";
-            error_msg += error_str ? error_str : "unknown error";
-            return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
+            return CudaDriverStatus(factory.ort_api, cu_result,
+                                    "[NvTensorRTRTX EP] Failed to create CIG context for D3D12", ORT_FAIL);
         }
 #else
-        return factory.ort_api.CreateStatus(ORT_NOT_IMPLEMENTED,
-                                            "[NvTensorRTRTX EP] D3D12 CIG context creation not supported on this platform");
+        return factory.ort_api.CreateStatus(
+            ORT_NOT_IMPLEMENTED, "[NvTensorRTRTX EP] D3D12 CIG context creation not supported on this platform");
 #endif
     }
     else if (config->graphics_api == ORT_GRAPHICS_API_VULKAN)
     {
-        return factory.ort_api.CreateStatus(ORT_NOT_IMPLEMENTED,
-                                            "[NvTensorRTRTX EP] Vulkan CIG context not yet implemented");
+        CUresult cu_result = cuInit(0);
+        if (cu_result != CUDA_SUCCESS)
+        {
+            return CudaDriverStatus(factory.ort_api, cu_result,
+                                    "[NvTensorRTRTX EP] Failed to initialize CUDA driver API", ORT_FAIL);
+        }
+
+        int cig_supported = 0;
+        cudaError_t cuda_err = cudaDeviceGetAttribute(&cig_supported, cudaDevAttrVulkanCigSupported, device_id);
+        if (cuda_err != cudaSuccess)
+        {
+            std::string error_msg = "[NvTensorRTRTX EP] Could not determine Vulkan CIG support for CUDA device: ";
+            error_msg += cudaGetErrorString(cuda_err);
+            return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
+        }
+        if (cig_supported == 0)
+        {
+            factory.ort_api.Logger_LogMessage(
+                &factory.default_logger_, ORT_LOGGING_LEVEL_INFO,
+                "[NvTensorRTRTX EP] Vulkan CIG is not supported on this device; using the default CUDA tcontext",
+                ORT_FILE, __LINE__, __FUNCTION__);
+            return nullptr;
+        }
+
+        const char* nv_blob_ptr_str = nullptr;
+        if (config->additional_options != nullptr)
+        {
+            nv_blob_ptr_str = factory.ort_api.GetKeyValue(
+                config->additional_options,
+                onnxruntime::tensorrt_rtx::provider_option_names::kExternalComputeQueueDataParamNV_data);
+        }
+        if (nv_blob_ptr_str == nullptr)
+        {
+            factory.ort_api.Logger_LogMessage(&factory.default_logger_, ORT_LOGGING_LEVEL_WARNING,
+                                              "[NvTensorRTRTX EP] InitGraphicsInterop: Vulkan CIG requires "
+                                              "VkExternalComputeQueueDataParamsNV_data; using the default CUDA context",
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+            return nullptr;
+        }
+
+        errno = 0;
+        char* parse_end = nullptr;
+        unsigned long long nv_blob_ptr = std::strtoull(nv_blob_ptr_str, &parse_end, 10);
+        if (parse_end == nv_blob_ptr_str || *parse_end != '\0' || errno == ERANGE || nv_blob_ptr == 0)
+        {
+            return factory.ort_api.CreateStatus(
+                ORT_INVALID_ARGUMENT,
+                "[NvTensorRTRTX EP] InitGraphicsInterop: invalid VkExternalComputeQueueDataParamsNV_data pointer");
+        }
+
+        CUctxCigParam cig_param = {};
+        cig_param.sharedDataType = CIG_DATA_TYPE_NV_BLOB;
+        cig_param.sharedData = reinterpret_cast<void*>(static_cast<uintptr_t>(nv_blob_ptr));
+
+        CUctxCreateParams ctx_params = {};
+        ctx_params.cigParams = &cig_param;
+        cu_result = cuCtxCreate_v4(&cig_context, &ctx_params, 0, device_id);
+        if (cu_result != CUDA_SUCCESS)
+        {
+            return CudaDriverStatus(factory.ort_api, cu_result,
+                                    "[NvTensorRTRTX EP] Failed to create CIG context for Vulkan", ORT_FAIL);
+        }
     }
     else
     {
@@ -1496,19 +2078,17 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::InitGraphicsInterop
     CUresult destroy_result = cuCtxDestroy(cig_context);
     if (destroy_result != CUDA_SUCCESS)
     {
-        const char* error_str = nullptr;
-        cuGetErrorString(destroy_result, &error_str);
-        std::string error_msg = "[NvTensorRTRTX EP] InitGraphicsInterop: cuCtxDestroy failed for raced context: ";
-        error_msg += error_str ? error_str : "unknown error";
-        return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
+        return CudaDriverStatus(factory.ort_api, destroy_result,
+                                "[NvTensorRTRTX EP] InitGraphicsInterop: cuCtxDestroy failed for raced context",
+                                ORT_FAIL);
     }
-    return factory.ort_api.CreateStatus(ORT_FAIL,
-                                        "[NvTensorRTRTX EP] InitGraphicsInterop: CIG context already exists for this device (concurrent init)");
+    return factory.ort_api.CreateStatus(
+        ORT_FAIL,
+        "[NvTensorRTRTX EP] InitGraphicsInterop: CIG context already exists for this device (concurrent init)");
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::DeinitGraphicsInteropImpl(
-    OrtEpFactory* this_ptr,
-    const OrtEpDevice* ep_device) noexcept
+    OrtEpFactory* this_ptr, const OrtEpDevice* ep_device) noexcept
 {
     if (this_ptr == nullptr)
     {
@@ -1542,17 +2122,67 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::DeinitGraphicsInter
         CUresult cu_result = cuCtxDestroy(cig_context);
         if (cu_result != CUDA_SUCCESS)
         {
-            const char* error_str = nullptr;
-            cuGetErrorString(cu_result, &error_str);
-            std::string error_msg = "[NvTensorRTRTX EP] DeinitGraphicsInterop: cuCtxDestroy failed: ";
-            error_msg += error_str ? error_str : "unknown error";
-            return factory.ort_api.CreateStatus(ORT_FAIL, error_msg.c_str());
+            return CudaDriverStatus(factory.ort_api, cu_result,
+                                    "[NvTensorRTRTX EP] DeinitGraphicsInterop: cuCtxDestroy failed", ORT_FAIL);
         }
     }
 
     return nullptr;
 }
 #endif  // ORT_API_VERSION >= 25
+
+#if ORT_API_VERSION >= 26
+//
+// CreateExternalResourceImporterForDevice - factory entry point for the external
+// resource importer (D3D12 shared resources + timeline fences). Resolves the device
+// id and memory info this plugin owns, then hands them to the importer (the in-tree
+// ORT provider reads these from OrtEpDevice internals, which a plugin cannot).
+//
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateExternalResourceImporterForDeviceImpl(
+    OrtEpFactory* this_ptr, const OrtEpDevice* ep_device, OrtExternalResourceImporterImpl** out_importer) noexcept
+{
+    if (this_ptr == nullptr)
+    {
+        return Ort::GetApi().CreateStatus(
+            ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateExternalResourceImporterForDevice: this_ptr is null");
+    }
+    if (ep_device == nullptr)
+    {
+        return Ort::GetApi().CreateStatus(
+            ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateExternalResourceImporterForDevice: ep_device is null");
+    }
+
+    auto& factory = *static_cast<TensorrtRtxExecutionProviderFactory*>(this_ptr);
+
+    if (out_importer == nullptr)
+    {
+        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "out_importer cannot be nullptr");
+    }
+
+    *out_importer = nullptr;
+
+    // Resolve the CUDA device id from the EP device options (OrtEpDevice is opaque to plugins).
+    int32_t device_id = 0;
+    RETURN_IF_ERROR(
+        ParseDeviceIdFromEpDevice(factory, ep_device, "CreateExternalResourceImporterForDevice", &device_id));
+
+    // The importer needs the device's OrtMemoryInfo to build tensors from imported memory.
+    // The factory owns these, created during device enumeration.
+    auto it = factory.device_memory_infos.find(static_cast<uint32_t>(device_id));
+    if (it == factory.device_memory_infos.end() || it->second == nullptr)
+    {
+        return factory.ort_api.CreateStatus(
+            ORT_EP_FAIL, "CreateExternalResourceImporterForDevice: no device memory info for device");
+    }
+    const OrtMemoryInfo* memory_info = it->second.get();
+
+    auto importer =
+        std::make_unique<NvTrtRtxExternalResourceImporterImpl>(ep_device, device_id, memory_info, factory.ort_api);
+    *out_importer = importer.release();
+
+    return nullptr;
+}
+#endif  // ORT_API_VERSION >= 26
 
 }  // namespace trt_rtx_ep
 
@@ -1568,13 +2198,9 @@ extern "C"
     //
     // Public C API - Entry point for ORT to create the factory
     //
-    EXPORT_SYMBOL OrtStatus* CreateEpFactories(
-        const char* registration_name,
-        const OrtApiBase* ort_api_base,
-        const OrtLogger* default_logger,
-        OrtEpFactory** factories,
-        size_t max_factories,
-        size_t* num_factories)
+    EXPORT_SYMBOL OrtStatus* CreateEpFactories(const char* registration_name, const OrtApiBase* ort_api_base,
+                                               const OrtLogger* default_logger, OrtEpFactory** factories,
+                                               size_t max_factories, size_t* num_factories)
     {
         // Security check: validate critical input parameters are not null
         // Note: We must check ort_api_base first before we can use OrtApi to create error statuses
@@ -1610,19 +2236,23 @@ extern "C"
         // Now we can create proper error statuses
         if (registration_name == nullptr)
         {
-            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateEpFactories: registration_name is null");
+            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                         "[NvTensorRTRTX EP] CreateEpFactories: registration_name is null");
         }
         if (default_logger == nullptr)
         {
-            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateEpFactories: default_logger is null");
+            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                         "[NvTensorRTRTX EP] CreateEpFactories: default_logger is null");
         }
         if (factories == nullptr)
         {
-            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateEpFactories: factories output array is null");
+            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                         "[NvTensorRTRTX EP] CreateEpFactories: factories output array is null");
         }
         if (num_factories == nullptr)
         {
-            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] CreateEpFactories: num_factories output is null");
+            return ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                         "[NvTensorRTRTX EP] CreateEpFactories: num_factories output is null");
         }
 
         const OrtEpApi* ort_ep_api = &trt_rtx_ep::NegotiatedApi().ep_api;
@@ -1631,79 +2261,91 @@ extern "C"
         // Load external tensorrt_plugins library from EP directory
         // This library contains GroupQueryAttention and RotaryEmbedding plugins for transformer models
         static std::once_flag plugins_load_flag;
-        std::call_once(plugins_load_flag, [&]()
-                       {
-            try
+        std::call_once(
+            plugins_load_flag,
+            [&]()
             {
+                try
+                {
 #if defined(_WIN32)
-                // Get EP DLL path using GetModuleHandleExW (wide string version)
-                HMODULE hModule = NULL;
-                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | 
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                       (LPCWSTR)&CreateEpFactories, &hModule))
-                {
-                    wchar_t path[MAX_PATH];
-                    GetModuleFileNameW(hModule, path, MAX_PATH);
-                    std::filesystem::path ep_dir = std::filesystem::path(path).parent_path();
-                    auto plugin_path = ep_dir / L"tensorrt_plugins.dll";
-                    
-                    //Use LoadLibraryExW to use search path control flags
-                    HMODULE plugin_dll = LoadLibraryExW(plugin_path.wstring().c_str(), nullptr,
-                                                       LOAD_WITH_ALTERED_SEARCH_PATH);
-                    if (plugin_dll)
+                    // Get EP DLL path using GetModuleHandleExW (wide string version)
+                    HMODULE hModule = NULL;
+                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           (LPCWSTR)&CreateEpFactories, &hModule))
                     {
-                        //Log success
-                        std::string msg = "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins";
-                        ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO,
-                                                   msg.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
-                    }
-                    else
-                    {
-                        // Log failure
-                        DWORD error_code = GetLastError();
-                        LPWSTR error_msg = nullptr;
-                        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                                       nullptr, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                                       (LPWSTR)&error_msg, 0, nullptr);
-                        
-                        std::wstring wide_path = plugin_path.wstring();
-                        std::string path_str(wide_path.begin(), wide_path.end());
-                        std::string msg = "[NvTensorRTRTX EP] Failed to load tensorrt_plugins " + path_str +
-                                          " (Error " + std::to_string(error_code) + ")";
-                        if (error_msg)
+                        wchar_t path[MAX_PATH];
+                        GetModuleFileNameW(hModule, path, MAX_PATH);
+                        std::filesystem::path ep_dir = std::filesystem::path(path).parent_path();
+                        auto plugin_path = ep_dir / L"tensorrt_plugins.dll";
+
+                        // Use LoadLibraryExW to use search path control flags
+                        HMODULE plugin_dll =
+                            LoadLibraryExW(plugin_path.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+                        if (plugin_dll)
                         {
-                            std::wstring wide_err(error_msg);
-                            std::string err_str(wide_err.begin(), wide_err.end());
-                            msg += ": " + err_str;
-                            LocalFree(error_msg);
+                            // Pin the plugin DLL permanently — same rationale as dll_main.cc:
+                            // plugin static registrations must outlive any FreeLibrary call
+                            // from ORT teardown or the host. PIN makes subsequent FreeLibrary
+                            // calls no-ops at the OS level, so the local handle going out of
+                            // scope here is safe.
+                            HMODULE pinned = nullptr;
+                            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                               reinterpret_cast<LPCWSTR>(plugin_dll), &pinned);
+                            // Log success
+                            std::string msg = "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins";
+                            ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO, msg.c_str(), ORT_FILE,
+                                                       __LINE__, __FUNCTION__);
                         }
-                        ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_WARNING,
-                                                   msg.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+                        else
+                        {
+                            // Log failure
+                            DWORD error_code = GetLastError();
+                            LPWSTR error_msg = nullptr;
+                            FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                                               FORMAT_MESSAGE_IGNORE_INSERTS,
+                                           nullptr, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                                           (LPWSTR)&error_msg, 0, nullptr);
+
+                            std::wstring wide_path = plugin_path.wstring();
+                            std::string path_str(wide_path.begin(), wide_path.end());
+                            std::string msg = "[NvTensorRTRTX EP] Failed to load tensorrt_plugins " + path_str +
+                                              " (Error " + std::to_string(error_code) + ")";
+                            if (error_msg)
+                            {
+                                std::wstring wide_err(error_msg);
+                                std::string err_str(wide_err.begin(), wide_err.end());
+                                msg += ": " + err_str;
+                                LocalFree(error_msg);
+                            }
+                            ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO, msg.c_str(), ORT_FILE,
+                                                       __LINE__, __FUNCTION__);
+                        }
                     }
-                }
 #else
-                // Linux: Use dladdr to get .so path
-                Dl_info dl_info;
-                if (dladdr((void*)CreateEpFactories, &dl_info))
-                {
-                    std::filesystem::path ep_dir = std::filesystem::path(dl_info.dli_fname).parent_path();
-                    auto plugin_path = ep_dir / "libtensorrt_plugins.so";
-                    
-                    void* plugin_handle = dlopen(plugin_path.string().c_str(), RTLD_LAZY);
-                    if (plugin_handle)
+                    // Linux: Use dladdr to get .so path
+                    Dl_info dl_info;
+                    if (dladdr((void*)CreateEpFactories, &dl_info))
                     {
-                        // Log success
-                        std::string msg = "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins";
-                        ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO,
-                                                   msg.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+                        std::filesystem::path ep_dir = std::filesystem::path(dl_info.dli_fname).parent_path();
+                        auto plugin_path = ep_dir / "libtensorrt_plugins.so";
+
+                        void* plugin_handle = dlopen(plugin_path.string().c_str(), RTLD_LAZY);
+                        if (plugin_handle)
+                        {
+                            // Log success
+                            std::string msg = "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins";
+                            ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO, msg.c_str(), ORT_FILE,
+                                                       __LINE__, __FUNCTION__);
+                        }
                     }
-                }
 #endif
-            }
-            catch (...)
-            {
-                // Silently ignore - plugin loading is optional
-            } });
+                }
+                catch (...)
+                {
+                    // Silently ignore - plugin loading is optional
+                }
+            });
 
         // Create factory instance
         std::unique_ptr<OrtEpFactory> factory = std::make_unique<trt_rtx_ep::TensorrtRtxExecutionProviderFactory>(

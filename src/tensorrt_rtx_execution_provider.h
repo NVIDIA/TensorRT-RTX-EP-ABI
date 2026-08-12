@@ -15,26 +15,31 @@
 
 #pragma once
 
-#include "tensorrt_rtx_provider_factory.h"
-#include "tensorrt_rtx_execution_provider_info.h"
-#include "utils/ep_utils.h"
-#include "utils/filesystem_utils.h"
 #include "cuda_graph.h"
+#include "tensorrt_rtx_execution_provider_info.h"
+#include "tensorrt_rtx_profiler.h"
+#include "tensorrt_rtx_provider_factory.h"
+
 #include "nv_includes.h"
+#include "utils/ep_utils.h"
 
 #include "onnxruntime_cxx_api.h"
 
+#include <filesystem>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <numeric>
 #include <set>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "gpu_sync_allocator.h"
+#include "weightless_refit.h"
 
 #ifdef _WIN32
 #define EXPORT_API __declspec(dllexport)
@@ -45,8 +50,8 @@
 using HashValue = uint64_t;
 
 // Import CUDA Graph types from trt_rtx_ep namespace
-using trt_rtx_ep::CudaGraphAnnotation_t;
 using trt_rtx_ep::CUDAGraph;
+using trt_rtx_ep::CudaGraphAnnotation_t;
 using trt_rtx_ep::kCudaGraphAnnotationDefault;
 using trt_rtx_ep::kCudaGraphAnnotationSkip;
 
@@ -77,7 +82,8 @@ class OutputAllocator : public nvinfer1::IOutputAllocator
 {
 public:
     OutputAllocator() = delete;
-    OutputAllocator(OrtAllocator* allocator) : alloc_(allocator)
+    OutputAllocator(OrtAllocator* allocator)
+        : alloc_(allocator)
     {
         if (alloc_ == nullptr)
         {
@@ -109,14 +115,16 @@ public:
     {
         if (alloc_ != nullptr)
         {
-            alloc_->Free(alloc_, outputPtr);
+            // Free the original (base) allocation, not the aligned pointer handed to TRT.
+            alloc_->Free(alloc_, outputPtrBase);
         }
     }
 
 private:
     OrtAllocator* alloc_;
-    void* outputPtr{nullptr};
-    uint64_t allocated_size = 0;
+    void* outputPtr{nullptr};      // alignment-adjusted pointer returned to TRT / exposed via getBuffer()
+    void* outputPtrBase{nullptr};  // original allocation base (used for Free)
+    uint64_t allocated_size = 0;   // size of the raw (base) allocation
     std::vector<int64_t> output_shapes;
 };
 
@@ -188,11 +196,13 @@ public:
             std::shared_lock lock(logger_mutex_);
             if (ort_api_ && ort_default_logger_)
             {
-                try {
-                    ort_api_->Logger_LogMessage(ort_default_logger_, ort_severity,
-                        message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+                try
+                {
+                    ort_api_->Logger_LogMessage(ort_default_logger_, ort_severity, message.c_str(), ORT_FILE, __LINE__,
+                                                __FUNCTION__);
                 }
-                catch (const Ort::Exception& ex) {
+                catch (const Ort::Exception& ex)
+                {
                     fprintf(stderr, "[TensorRT Logger] Ort::Exception: %s\n", ex.what());
                 }
             }
@@ -219,36 +229,48 @@ TensorrtRtxLogger& GetTensorrtRtxLogger(bool verbose_log);
 namespace tensorrt_ptr
 {
 //!
-//! \brief Custom deleter that will dump the optimized runtime cache when the execution context is destructed.
+//! \brief Owns the objects required by an execution context and persists its optimized runtime cache.
+//!
+//! TensorRT keeps a non-owning pointer to IRuntimeConfig for the complete lifetime of IExecutionContext. The
+//! deleter therefore owns both IRuntimeConfig and IRuntimeCache and destroys them only after the execution context.
+//! The provider activates its captured compute-stream CUDA context before clearing execution contexts.
 //!
 struct IExecutionContextDeleter
 {
-    IExecutionContextDeleter() = default;
-    IExecutionContextDeleter(const std::filesystem::path& runtime_cache_path, std::unique_ptr<nvinfer1::IRuntimeCache>&& runtime_cache,
-                             const OrtLogger& logger, const OrtApi& ort_api)
-        : runtime_cache_path_(runtime_cache_path), runtime_cache_(std::move(runtime_cache)), logger_(logger), ort_api_(ort_api)
-    {
-    }
-    IExecutionContextDeleter(const std::string&, std::unique_ptr<nvinfer1::IRuntimeCache>&&,
-                             const OrtLogger&, const OrtApi&) = delete;
+    //!
+    //! \brief Creates a deleter that owns an execution context's runtime dependencies.
+    //!
+    //! \param runtime_cache_path File to which the final optimized cache is persisted.
+    //! \param runtime_cache Cache attached to runtime_config, if caching is enabled.
+    //! \param runtime_config Runtime configuration referenced non-owningly by the execution context.
+    //! \param ort_api ORT API used if final cache persistence fails.
+    //!
+    IExecutionContextDeleter(const std::filesystem::path& runtime_cache_path,
+                             std::unique_ptr<nvinfer1::IRuntimeCache>&& runtime_cache,
+                             std::unique_ptr<nvinfer1::IRuntimeConfig>&& runtime_config, const OrtApi& ort_api);
 
-    void operator()(nvinfer1::IExecutionContext* context)
-    {
-        if (context != nullptr)
-        {
-            if (!runtime_cache_path_.empty())
-            {
-                auto serialized_cache_data = std::unique_ptr<nvinfer1::IHostMemory>(runtime_cache_->serialize());
-                utils::WriteFile(runtime_cache_path_, serialized_cache_data->data(), serialized_cache_data->size(), logger_, ort_api_);
-            }
-            delete context;
-        }
-    }
+    //! \brief Prevents narrow-string paths from bypassing explicit filesystem path handling.
+    IExecutionContextDeleter(const std::string&, std::unique_ptr<nvinfer1::IRuntimeCache>&&,
+                             std::unique_ptr<nvinfer1::IRuntimeConfig>&&, const OrtApi&) = delete;
+
+    //!
+    //! \brief Destroys an execution context and then persists its final optimized runtime cache.
+    //!
+    //! \param context Execution context to destroy; nullptr is accepted as a no-op.
+    //!
+    void operator()(nvinfer1::IExecutionContext* context) noexcept;
 
 private:
+    //!
+    //! \brief Serializes and writes the owned runtime cache without allowing failures to escape teardown.
+    //!
+    void SaveCache() noexcept;
+
     std::filesystem::path runtime_cache_path_;
+    // Declaration order is intentional: reverse destruction releases the config before its cache if no execution
+    // context was ever created.
     std::unique_ptr<nvinfer1::IRuntimeCache> runtime_cache_;
-    const OrtLogger& logger_;
+    std::unique_ptr<nvinfer1::IRuntimeConfig> runtime_config_;
     const OrtApi& ort_api_;
 };
 
@@ -291,6 +313,12 @@ struct TensorParams
         // Initialize data and dims from the Ort::ConstValue
         data = data_ptr;
 
+        // nvinfer1::Dims holds at most nvinfer1::Dims::MAX_DIMS (8) dimensions in a
+        // fixed inline array. An untrusted model/EPContext can present a higher-rank
+        // input; reject it here instead of writing past dims.d[] (stack overflow).
+        ENFORCE(shape.size() <= static_cast<size_t>(nvinfer1::Dims::MAX_DIMS), "[NvTensorRTRTX EP] input tensor rank ",
+                shape.size(), " exceeds TensorRT maximum of ", nvinfer1::Dims::MAX_DIMS);
+
         dims.nbDims = static_cast<int32_t>(shape.size());
         for (int i = 0; i < dims.nbDims; ++i)
         {
@@ -331,12 +359,18 @@ class TensorrtUserWeights
 {
 public:
     TensorrtUserWeights(const std::string& name, const std::string& data)
-        : name_(name), data_cpy_(data), data_(nullptr), size_(0)
+        : name_(name)
+        , data_cpy_(data)
+        , data_(nullptr)
+        , size_(0)
     {
     }
 
     TensorrtUserWeights(const std::string& name, const void* data, size_t size)
-        : name_(name), data_cpy_(), data_(data), size_(size)
+        : name_(name)
+        , data_cpy_()
+        , data_(data)
+        , size_(size)
     {
     }
 
@@ -435,15 +469,28 @@ struct TensorrtRtxEpContextNodeComputeState
 //!
 //! This is a boilerplate that you can customize for your own execution provider.
 //!
-struct TensorrtRtxExecutionProvider : public OrtEp, public ApiPtrs
+struct TensorrtRtxExecutionProvider
+    : public OrtEp
+    , public ApiPtrs
 {
     // Constructor - Initialize your EP here
-    TensorrtRtxExecutionProvider(TensorrtRtxExecutionProviderFactory& factory,
-                                 const std::string& name,
-                                 const OrtSessionOptions& session_options,
-                                 const OrtLogger& logger);
+    TensorrtRtxExecutionProvider(TensorrtRtxExecutionProviderFactory& factory, const std::string& name,
+                                 const OrtSessionOptions& session_options, const OrtLogger& logger);
 
     ~TensorrtRtxExecutionProvider();
+
+    // Optional synchronous GPU allocator. When set (non-null), it is installed on runtime_ and
+    // builder_ via setGpuAllocator(), forcing TensorRT RTX to use cudaMalloc/cudaFree instead of
+    // its default cudaMallocAsync path. Its presence is the single source of truth for whether
+    // the sync allocator is enabled.
+    //
+    // Declared as the first data member on purpose: it must outlive every TRT object that holds a
+    // raw pointer to it (runtime_, builder_, engines, contexts, ...). Members are destroyed in
+    // reverse declaration order, so declaring it first guarantees it is destroyed last on *every*
+    // path -- including a partially-constructed object when the constructor throws after
+    // setGpuAllocator() has already installed it on runtime_ (at which point the explicit
+    // destructor body does not run). The destructor still resets it last as belt-and-suspenders.
+    std::unique_ptr<trt_rtx_ep::GpuSyncAllocator> sync_gpu_allocator_ = nullptr;
 
     TensorrtRtxExecutionProviderFactory& factory_;
     std::string name_;
@@ -451,30 +498,62 @@ struct TensorrtRtxExecutionProvider : public OrtEp, public ApiPtrs
     const OrtLogger& logger_;
     bool external_stream_ = false;
     cudaStream_t stream_ = nullptr;
+    CUcontext compute_stream_context_ = nullptr;
 
     //!< Call cudaStreamSynchronize() after TRT enqueueV3().
     mutable bool sync_stream_after_enqueue_ = true;
+
+    //!< Profiling members - accessed from ComputeImpl static functions in sibling structs.
+    bool profiling_enable_ = false;
+    std::string profiling_output_file_;
+    std::unique_ptr<TrtRtxProfiler> profiler_;
 
     //!< The OrtAllocator object will be obtained during EP compute time.
     OrtAllocator* alloc_ = nullptr;
 
     std::unordered_map<std::string, std::unique_ptr<TensorrtRtxComputeState>> compute_states_;
-    std::unordered_map<std::string, std::unique_ptr<TensorrtRtxEpContextNodeComputeState>> compute_states_for_ep_context_;
+    std::unordered_map<std::string, std::unique_ptr<TensorrtRtxEpContextNodeComputeState>>
+        compute_states_for_ep_context_;
     std::unordered_map<std::string, DDSOutputAllocatorMap> dds_output_allocator_maps_;
+
+    int auxiliary_streams_ = -1;  //!< Max TensorRT auxiliary streams (nv_length_aux_stream_array).
+    //! Caller-provided TensorRT auxiliary streams (via the user_aux_stream_array provider option). When
+    //! set, they are bound on the execution context (setAuxStreams) so TensorRT does not create its own
+    //! context/streams — required for correct CIG graphics interop. Lifetime is owned by the caller.
+    cudaStream_t* aux_streams_ = nullptr;
+    bool external_aux_streams_ = false;
 
     // Refit engine with new weights from ONNX model
     OrtStatus* RefitEngineImpl(_In_ const std::filesystem::path& onnx_model_filename,
-                               _In_ const std::filesystem::path& onnx_model_folder_path,
-                               _In_ bool path_check,
-                               _In_ const void* onnx_model_bytestream,
-                               _In_ size_t onnx_model_bytestream_size,
+                               _In_ const std::filesystem::path& onnx_model_folder_path, _In_ bool path_check,
+                               _In_ const void* onnx_model_bytestream, _In_ size_t onnx_model_bytestream_size,
                                _In_ const void* onnx_external_data_bytestream,
-                               _In_ size_t onnx_external_data_bytestream_size,
-                               _In_ nvinfer1::ICudaEngine* trt_engine,
+                               _In_ size_t onnx_external_data_bytestream_size, _In_ nvinfer1::ICudaEngine* trt_engine,
                                _In_ bool detailed_build_log) noexcept;
-    OrtStatus* RefitEngineImpl(std::string, std::string, bool,
-                               const void*, size_t, const void*, size_t,
+    OrtStatus* RefitEngineImpl(std::string, std::string, bool, const void*, size_t, const void*, size_t,
                                nvinfer1::ICudaEngine*, bool) = delete;
+
+    // Refit a weight-stripped engine directly from a captured RefitRecord table, resolving each
+    // record's source data from the runtime weight tensors ORT already supplied (keyed by ONNX
+    // initializer name) or, for kCONSTANT_NODE/kCONSTANT_OF_SHAPE, from the table's own fixed_data.
+    // No original ONNX model bytes are needed -- this is the weightless replay path.
+    OrtStatus* WeightlessRefitEngineImpl(
+        _In_ const std::vector<trt_rtx_ep::WeightlessRefitRecord>& records,
+        _In_ const std::unordered_map<std::string, std::pair<const void*, size_t>>& weight_data_by_name,
+        _In_ nvinfer1::ICudaEngine* trt_engine, _In_ bool detailed_build_log) noexcept;
+
+    // Build-time counterpart of WeightlessRefitEngineImpl: runs one real refit pass (via
+    // IParserRefitter, same shape as RefitEngineImpl) over the just-built weight-stripped
+    // `serialized_engine`, with an IRefitterObserver attached, and deep-copies every emitted
+    // RefitRecord. Called right after buildSerializedNetwork succeeds, while the original ONNX
+    // structure (`serialized_model_proto`) and weights (`user_weights`) are still in scope. The
+    // deserialized capture engine is discarded afterward -- it exists only to drive the observer
+    // callback, not for inference.
+    OrtStatus* CaptureWeightlessRefitTable(_In_ const nvinfer1::IHostMemory& serialized_engine,
+                                           _In_ const std::string& serialized_model_proto,
+                                           _In_ const std::vector<TensorrtUserWeights>& user_weights,
+                                           _In_ bool detailed_build_log,
+                                           _Out_ std::vector<trt_rtx_ep::WeightlessRefitRecord>& records) noexcept;
 
 private:
     // ========================================
@@ -484,22 +563,17 @@ private:
     static const char* ORT_API_CALL GetNameImpl(const OrtEp* this_ptr) noexcept;
 
     static OrtStatus* ORT_API_CALL GetKernelRegistryImpl(
-        _In_ OrtEp* this_ptr,
-        _Outptr_result_maybenull_ const OrtKernelRegistry** kernel_registry) noexcept;
+        _In_ OrtEp* this_ptr, _Outptr_result_maybenull_ const OrtKernelRegistry** kernel_registry) noexcept;
 
-    static OrtStatus* ORT_API_CALL GetCapabilityImpl(OrtEp* this_ptr,
-                                                     const OrtGraph* graph,
+    static OrtStatus* ORT_API_CALL GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
                                                      OrtEpGraphSupportInfo* graph_support_info) noexcept;
 
-    static OrtStatus* ORT_API_CALL CompileImpl(_In_ OrtEp* this_ptr,
-                                               _In_ const OrtGraph** graphs,
-                                               _In_ const OrtNode** fused_nodes,
-                                               _In_ size_t count,
+    static OrtStatus* ORT_API_CALL CompileImpl(_In_ OrtEp* this_ptr, _In_ const OrtGraph** graphs,
+                                               _In_ const OrtNode** fused_nodes, _In_ size_t count,
                                                _Out_writes_all_(count) OrtNodeComputeInfo** node_compute_infos,
                                                _Out_writes_(count) OrtNode** ep_context_nodes) noexcept;
 
-    static void ORT_API_CALL ReleaseNodeComputeInfosImpl(OrtEp* this_ptr,
-                                                         OrtNodeComputeInfo** node_compute_infos,
+    static void ORT_API_CALL ReleaseNodeComputeInfosImpl(OrtEp* this_ptr, OrtNodeComputeInfo** node_compute_infos,
                                                          size_t num_node_compute_infos) noexcept;
 
     static OrtStatus* ORT_API_CALL CreateSyncStreamForDeviceImpl(_In_ OrtEp* this_ptr,
@@ -509,11 +583,9 @@ private:
     static const char* ORT_API_CALL GetCompiledModelCompatibilityInfoImpl(_In_ OrtEp* this_ptr,
                                                                           _In_ const OrtGraph* graph) noexcept;
 
-    static OrtStatus* ORT_API_CALL OnRunStartImpl(_In_ OrtEp* this_ptr,
-                                                  _In_ const OrtRunOptions* run_options) noexcept;
+    static OrtStatus* ORT_API_CALL OnRunStartImpl(_In_ OrtEp* this_ptr, _In_ const OrtRunOptions* run_options) noexcept;
 
-    static OrtStatus* ORT_API_CALL OnRunEndImpl(_In_ OrtEp* this_ptr,
-                                                _In_ const OrtRunOptions* run_options,
+    static OrtStatus* ORT_API_CALL OnRunEndImpl(_In_ OrtEp* this_ptr, _In_ const OrtRunOptions* run_options,
                                                 _In_ bool sync_stream) noexcept;
 
     mutable TensorrtRtxExecutionProviderInfo info_;
@@ -534,7 +606,6 @@ private:
     const void* onnx_external_data_bytestream_ = nullptr;
     size_t onnx_external_data_bytestream_size_ = 0;
     bool sparsity_enable_ = false;
-    int auxiliary_streams_ = -1;
     std::filesystem::path cache_path_;
     std::string engine_decryption_lib_path_;
     std::unique_ptr<nvinfer1::IRuntime> trt_rtx_runtime_ = nullptr;
@@ -552,16 +623,21 @@ private:
     bool multi_profile_enable_ = false;
     int trt_profile_index_ = 0;
     bool dump_ep_context_model_ = false;
+    // Set when the EP is instantiated by OrtCompileAPI::CompileModel(). Causes
+    // CreateNodeComputeInfoFromGraph to skip GPU deserialization and context creation.
+    bool compile_only_mode_ = false;
     int ep_context_embed_mode_ = 0;
     std::string engine_cache_prefix_;
     std::string op_types_to_exclude_;
+    int64_t multi_rotary_cache_concat_offset_ = 0;
     std::filesystem::path runtime_cache_;
     std::string cache_prefix_;
 
     // Following maps that hold TRT objects will be accessible by different threads if ORT is using multithreading.
-    // In general, TensorRT objects are not thread safe; accesses to an object from different threads must be serialized by the client.
-    // But there are still some thread safe operations, please see here https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading
-    // For those non thread safe operations, TRT EP uses (1) lock_guard or (2) PerThreadContext to make sure synchronization.
+    // In general, TensorRT objects are not thread safe; accesses to an object from different threads must be serialized
+    // by the client. But there are still some thread safe operations, please see here
+    // https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading For those non thread safe
+    // operations, TRT EP uses (1) lock_guard or (2) PerThreadContext to make sure synchronization.
     std::unordered_map<std::string, std::unique_ptr<nvinfer1::ICudaEngine>> engines_;
     std::unordered_map<std::string, tensorrt_ptr::unique_pointer_exec_ctx> contexts_;
     std::unordered_map<std::string, std::unique_ptr<nvinfer1::IBuilder>> builders_;
@@ -569,7 +645,8 @@ private:
 
     std::unordered_map<std::string, std::vector<std::unordered_map<std::string, size_t>>> input_info_;
     std::unordered_map<std::string, std::vector<std::unordered_map<std::string, size_t>>> output_info_;
-    std::unordered_map<std::string, ShapeRangesMap> input_shape_ranges_;  //!< The profile shape ranges that the engine is built with
+    std::unordered_map<std::string, ShapeRangesMap>
+        input_shape_ranges_;  //!< The profile shape ranges that the engine is built with
     std::unordered_map<std::string, std::vector<nvinfer1::IOptimizationProfile*>> profiles_;
     std::unordered_map<std::string, std::vector<std::vector<int64_t>>> profile_min_shapes_;
     std::unordered_map<std::string, std::vector<std::vector<int64_t>>> profile_max_shapes_;
@@ -590,12 +667,14 @@ private:
     int regular_run_count_before_graph_capture_ = 0;
     // Current graph annotation ID for this run
     CudaGraphAnnotation_t current_graph_annotation_id_ = 0;
-    // There is chance (currently only happens in CUDA EP) that the second regular run allocates GPU memory for causes like:
-    // (1) memory pattern is enabled. (2) arena allocation for stream.
-    // Since no GPU memory allocation is allowed during graph capturing, we need at least two regular runs
-    // to allocate enough memory in Arena before graph capturing.
-    const int min_num_runs_before_cuda_graph_capture_ = 2;  //!< required min regular runs before graph capture for the necessary memory allocations.
-    // https://github.com/NVIDIA/TensorRT/blob/main/samples/common/sampleInference.cpp#L1258-L1291 Based on the trtexec code
+    // There is chance (currently only happens in CUDA EP) that the second regular run allocates GPU memory for causes
+    // like: (1) memory pattern is enabled. (2) arena allocation for stream. Since no GPU memory allocation is allowed
+    // during graph capturing, we need at least two regular runs to allocate enough memory in Arena before graph
+    // capturing.
+    const int min_num_runs_before_cuda_graph_capture_ =
+        2;  //!< required min regular runs before graph capture for the necessary memory allocations.
+    // https://github.com/NVIDIA/TensorRT/blob/main/samples/common/sampleInference.cpp#L1258-L1291 Based on the trtexec
+    // code
 
     // For create/dump EP context node model
     std::string ep_context_file_path_;
@@ -615,8 +694,9 @@ private:
     //!
     //! \brief Get a unique_lock object to control the concurrency behavior.
     //!
-    //! Every API call not in the thread-safe operations (https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading)
-    //! should be protected by a lock when invoked by multiple threads concurrently.
+    //! Every API call not in the thread-safe operations
+    //! (https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading) should be protected by a
+    //! lock when invoked by multiple threads concurrently.
     //!
     std::unique_lock<std::mutex> GetApiLock() const;
 
@@ -625,8 +705,9 @@ private:
 
     bool AllNodesAssignedToSpecificEP(const OrtGraph* graph, const std::string& provider_type) const;
 
-    SubGraphCollection_t GetSupportedList(SubGraphCollection_t nodes_vector_input, int iterations, const int max_iterations,
-                                          const OrtGraph* graph, bool* early_termination) const;
+    SubGraphCollection_t GetSupportedList(SubGraphCollection_t nodes_vector_input, int iterations,
+                                          const int max_iterations, const OrtGraph* graph,
+                                          bool* early_termination) const;
 
     bool DetectTensorRTGraphCycles(SubGraphCollection_t& supported_nodes_vector, const Ort::ConstGraph& graph,
                                    const HashValue& model_hash, bool remove_cycles = true) const;
@@ -646,15 +727,15 @@ private:
     OrtStatus* CreateNodeComputeInfoFromGraph(OrtEp* this_ptr, const OrtGraph* graph, const OrtNode* fused_node,
                                               std::unordered_map<std::string, size_t>& input_map,
                                               std::unordered_map<std::string, size_t>& output_map,
-                                              OrtNodeComputeInfo** node_compute_info,
-                                              OrtNode** ep_context_node);
+                                              OrtNodeComputeInfo** node_compute_info, OrtNode** ep_context_node);
 
     nvinfer1::IBuilder* GetBuilder(TensorrtRtxLogger& trt_logger) const;
 
 public:
     // CUDA Graph related functions
-    void HandleCudaGraphStart(cudaStream_t stream, bool require_io_binding, CudaGraphAnnotation_t cuda_graph_annotation_id,
-                              bool& graph_replay_on_this_run, bool& should_start_capture);
+    void HandleCudaGraphStart(cudaStream_t stream, bool require_io_binding,
+                              CudaGraphAnnotation_t cuda_graph_annotation_id, bool& graph_replay_on_this_run,
+                              bool& should_start_capture);
     void SetCudaGraphStream(cudaStream_t stream)
     {
         cuda_graph_.SetStream(stream);
@@ -662,6 +743,13 @@ public:
     bool IsGraphCaptureEnabled() const
     {
         return cuda_graph_enable_;
+    }
+    //! \brief True when the opt-in synchronous GPU allocator (nv_use_sync_gpu_allocator) is
+    //! active. Compute-time allocation sites use this to skip the async CUDA mempool so that
+    //! execution context memory is also allocated synchronously.
+    bool IsSyncGpuAllocatorEnabled() const
+    {
+        return sync_gpu_allocator_ != nullptr;
     }
     bool IsGraphCaptureAllowed(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
     bool IsGraphCaptureAllowedOnRun(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
@@ -692,18 +780,36 @@ struct TensorRtRtxEpNodeComputeInfo : OrtNodeComputeInfo
     explicit TensorRtRtxEpNodeComputeInfo(TensorrtRtxExecutionProvider& ep);
 
     // OrtNodeComputeInfo Interface implementations.
-    static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr,
-                                                   OrtNodeComputeContext* compute_context,
+    static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr, OrtNodeComputeContext* compute_context,
                                                    void** compute_state);
 
-    static OrtStatus* ORT_API_CALL ComputeImpl(OrtNodeComputeInfo* this_ptr,
-                                               void* compute_state,
+    static OrtStatus* ORT_API_CALL ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
                                                OrtKernelContext* kernel_context);
 
-    static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr,
-                                              void* compute_state);
+    static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr, void* compute_state);
 
     TensorrtRtxExecutionProvider& ep;
+};
+
+//!
+//! \brief Stub OrtNodeComputeInfo returned when the EP runs in compile-only mode.
+//!
+//! In compile-only sessions (OrtCompileAPI::CompileModel), the EP builds and saves the
+//! serialized engine but never deserializes it onto the GPU. The session is destroyed
+//! immediately after compilation without running inference, so the compute function must
+//! never be invoked. If it is, return ORT_NOT_IMPLEMENTED to surface the misuse.
+//!
+struct TensorRtRtxCompileOnlyNodeComputeInfo : OrtNodeComputeInfo
+{
+    TensorRtRtxCompileOnlyNodeComputeInfo();
+
+    static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr, OrtNodeComputeContext* compute_context,
+                                                   void** compute_state);
+
+    static OrtStatus* ORT_API_CALL ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
+                                               OrtKernelContext* kernel_context);
+
+    static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr, void* compute_state);
 };
 
 //!
@@ -716,16 +822,13 @@ struct TensorRtRtxEpContextNodeComputeInfo : OrtNodeComputeInfo
 {
     explicit TensorRtRtxEpContextNodeComputeInfo(TensorrtRtxExecutionProvider& ep);
 
-    static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr,
-                                                   OrtNodeComputeContext* compute_context,
+    static OrtStatus* ORT_API_CALL CreateStateImpl(OrtNodeComputeInfo* this_ptr, OrtNodeComputeContext* compute_context,
                                                    void** compute_state);
 
-    static OrtStatus* ORT_API_CALL ComputeImpl(OrtNodeComputeInfo* this_ptr,
-                                               void* compute_state,
+    static OrtStatus* ORT_API_CALL ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
                                                OrtKernelContext* kernel_context);
 
-    static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr,
-                                              void* compute_state);
+    static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr, void* compute_state);
 
     TensorrtRtxExecutionProvider& ep;
 };

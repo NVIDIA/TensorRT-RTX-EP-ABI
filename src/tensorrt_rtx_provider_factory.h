@@ -15,9 +15,7 @@
 
 #pragma once
 
-#include "ep_utils.h"
 #include "ep_arena.h"
-#include "cuda_mempool_arena.h"
 #include "tensorrt_rtx_allocator.h"
 
 #include "onnxruntime_c_api.h"
@@ -31,6 +29,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "cuda_mempool_arena.h"
+#include "ep_utils.h"
 
 // Forward declarations for ORT types
 struct OrtEpFactory;
@@ -55,11 +56,14 @@ namespace trt_rtx_ep
 struct TensorrtRtxDataTransfer;
 
 //!
-//! \brief Plugin TensorRT RTX EP factory that can create an OrtEp and return information about the supported hardware devices.
+//! \brief Plugin TensorRT RTX EP factory that can create an OrtEp and return information about the supported hardware
+//! devices.
 //!
 //! \details This factory manages device enumeration, allocators, and EP instance creation.
 //!
-struct TensorrtRtxExecutionProviderFactory : public OrtEpFactory, public ApiPtrs
+struct TensorrtRtxExecutionProviderFactory
+    : public OrtEpFactory
+    , public ApiPtrs
 {
 public:
     TensorrtRtxExecutionProviderFactory(const char* ep_name, const OrtLogger& default_logger, ApiPtrs apis);
@@ -74,9 +78,11 @@ public:
     std::unordered_map<uint32_t, MemoryInfoUniquePtr> pinned_memory_infos;  //!< Device ID -> pinned memory info
 
     // Keeps allocators per EP device in factory so they can be shared across sessions.
-    std::unordered_map<uint32_t, std::unique_ptr<ArenaAllocator>> device_allocators;  //!< Device ID -> BFC arena allocator
-    // CUDA mempool allocators (used only for activation memory allocation.) 
-    std::unordered_map<uint32_t, std::unique_ptr<CudaMempoolAllocator>> device_mempool_allocators;  //!< Device ID -> mempool allocator
+    std::unordered_map<uint32_t, std::unique_ptr<ArenaAllocator>>
+        device_allocators;  //!< Device ID -> BFC arena allocator
+    // CUDA mempool allocators (used only for activation memory allocation.)
+    std::unordered_map<uint32_t, std::unique_ptr<CudaMempoolAllocator>>
+        device_mempool_allocators;  //!< Device ID -> mempool allocator
     std::unordered_map<uint32_t, std::unique_ptr<ArenaAllocator>> pinned_allocators;  //!< Device ID -> pinned allocator
 
     std::vector<const OrtMemoryDevice*> device_mem_devices;
@@ -102,6 +108,16 @@ public:
     //! pool is absent or latched off (caller then uses the BFC arena).
     //! \param[in]  device_id  GPU device ID.
     CudaMempoolAllocator* GetActiveMempoolForDevice(uint32_t device_id);
+
+    //! \brief Get (creating on first use) the per-device BFC arena in device_allocators. Lets the EP
+    //! reuse the same cudaMalloc/cudaFree arena ORT uses for the device (e.g. to wrap it in a
+    //! GpuSyncAllocator and install it via setGpuAllocator) even when the EP constructor runs before
+    //! ORT has requested the allocator. The arena is owned by the factory, so it outlives every
+    //! EP/runtime that uses it.
+    //! \param[in]  device_id  GPU device ID.
+    //! \return The arena as an OrtAllocator*, or nullptr if it could not be created (e.g. no memory
+    //!         info for the device or arena construction failed); a warning is logged in that case.
+    OrtAllocator* GetOrCreateDeviceArena(uint32_t device_id);
 
     //! \brief Latch the device's async mempool off after a runtime allocation
     //! failure, so subsequent runs use the synchronous cudaMalloc arena. Idempotent;
@@ -159,49 +175,64 @@ private:
                                                                  const OrtKeyValuePairs* stream_options,
                                                                  OrtSyncStreamImpl** ort_stream) noexcept;
     static OrtStatus* ORT_API_CALL ValidateCompiledModelCompatibilityInfoImpl(
-        OrtEpFactory* this_ptr,
-        const OrtHardwareDevice* const* devices,
-        size_t num_devices,
-        const char* compatibility_info,
-        OrtCompiledModelCompatibility* model_compatibility) noexcept;
+        OrtEpFactory* this_ptr, const OrtHardwareDevice* const* devices, size_t num_devices,
+        const char* compatibility_info, OrtCompiledModelCompatibility* model_compatibility) noexcept;
 
     static OrtStatus* ORT_API_CALL GetHardwareDeviceIncompatibilityDetailsImpl(
-        OrtEpFactory* this_ptr,
-        const OrtHardwareDevice* hw,
-        OrtDeviceEpIncompatibilityDetails* details) noexcept;
+        OrtEpFactory* this_ptr, const OrtHardwareDevice* hw, OrtDeviceEpIncompatibilityDetails* details) noexcept;
 
 #if ORT_API_VERSION >= 25
     // CIG graphics-interop callbacks (added in ORT API v25). Populated
     // on the factory v-table when built against 1.25+ headers; hosts
     // older than 1.25 ignore them because ort_version_supported gates
     // host-side invocation. OrtGraphicsInteropConfig is itself 1.25+.
-    static OrtStatus* ORT_API_CALL InitGraphicsInteropImpl(OrtEpFactory* this_ptr,
-                                                           const OrtEpDevice* ep_device,
+    static OrtStatus* ORT_API_CALL InitGraphicsInteropImpl(OrtEpFactory* this_ptr, const OrtEpDevice* ep_device,
                                                            const OrtGraphicsInteropConfig* config) noexcept;
 
     static OrtStatus* ORT_API_CALL DeinitGraphicsInteropImpl(OrtEpFactory* this_ptr,
                                                              const OrtEpDevice* ep_device) noexcept;
 #endif
 
-    static OrtStatus* ORT_API_CALL GetNumCustomOpDomainsImpl(OrtEpFactory* this_ptr,
-                                                              size_t* num_domains) noexcept;
-                                                              
-    static OrtStatus* ORT_API_CALL GetCustomOpDomainsImpl(OrtEpFactory* this_ptr,
-                                                          OrtCustomOpDomain** domains,
+#if ORT_API_VERSION >= 26
+    // External resource import callback (added in ORT API v26). Creates an
+    // OrtExternalResourceImporterImpl bound to the EP device, enabling import of
+    // D3D12 shared resources as CUDA memory and D3D12 fences as CUDA external
+    // semaphores. Hosts older than 1.26 ignore it (gated by ort_version_supported).
+    static OrtStatus* ORT_API_CALL CreateExternalResourceImporterForDeviceImpl(
+        OrtEpFactory* this_ptr, const OrtEpDevice* ep_device, OrtExternalResourceImporterImpl** out_importer) noexcept;
+#endif
+
+    static OrtStatus* ORT_API_CALL GetNumCustomOpDomainsImpl(OrtEpFactory* this_ptr, size_t* num_domains) noexcept;
+
+    static OrtStatus* ORT_API_CALL GetCustomOpDomainsImpl(OrtEpFactory* this_ptr, OrtCustomOpDomain** domains,
                                                           size_t num_domains) noexcept;
-    
+
     OrtStatus* InitializeCustomOpDomains();
 
-    const std::string ep_name_;               //!< Execution provider name
-    const std::string vendor_{"NVIDIA"};      //!< Execution provider vendor name (customize as needed)
-    const std::string ep_version_{TRT_RTX_EP_VERSION};   //!< Execution provider version (from CMake)
-    const uint32_t vendor_id_{0x10DE};        //!< NVIDIA PCI vendor ID
-    const OrtLogger& default_logger_;         //!< Default logger instance
+    const std::string ep_name_;                         //!< Execution provider name
+    const std::string vendor_{"NVIDIA"};                //!< Execution provider vendor name (customize as needed)
+    const std::string ep_version_{TRT_RTX_EP_VERSION};  //!< Execution provider version (from CMake)
+    const uint32_t vendor_id_{0x10DE};                  //!< NVIDIA PCI vendor ID
+    const OrtLogger& default_logger_;                   //!< Default logger instance
 
     //! Devices whose async mempool was latched off at run time. Mutated from the
     //! (concurrent) compute path under mempool_state_mutex_; entries only added.
     mutable std::mutex mempool_state_mutex_;
     std::unordered_set<uint32_t> mempool_runtime_disabled_;
+
+    //! Guards lazy creation of device_allocators entries in GetOrCreateDeviceArena().
+    std::mutex device_arena_mutex_;
+
+    //! \brief Create a BFC arena backed by a TensorrtRtxAllocator (cudaMalloc/cudaFree) for the
+    //! given device. Shared by CreateAllocatorImpl and GetOrCreateDeviceArena so the creation code
+    //! lives in one place.
+    //! \param[in]  memory_info  Device memory info the underlying allocator binds to.
+    //! \param[in]  device_id    GPU device ID.
+    //! \param[in]  options      Arena configuration (may be null for defaults).
+    //! \param[out] out          Receives the created arena on success.
+    //! \return nullptr on success, or an OrtStatus describing the failure.
+    OrtStatus* CreateBfcArenaForDevice(const OrtMemoryInfo* memory_info, uint32_t device_id,
+                                       const OrtKeyValuePairs* options, std::unique_ptr<ArenaAllocator>& out);
 
     // Cached kernel registry used by all OrtEp instances created by this factory.
     OrtKernelRegistry* kernel_registry_ = nullptr;

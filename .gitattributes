@@ -1,0 +1,9 @@
+# Force LF line endings for C/C++ source files so clang-format behaves
+# consistently across platforms (clang-format --dry-run --Werror compares
+# internally using LF; CRLF checkouts cause false-positive lint failures).
+*.c   text eol=lf
+*.cc  text eol=lf
+*.cpp text eol=lf
+*.cxx text eol=lf
+*.h   text eol=lf
+*.hpp text eol=lf

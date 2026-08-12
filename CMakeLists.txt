@@ -14,6 +14,19 @@
 # limitations under the License.
 
 cmake_minimum_required(VERSION 3.20)
+
+# Enable MSBuild multi-tool task scheduling: each source file becomes an
+# independent MSBuild task, allowing the scheduler to interleave compilations
+# across project boundaries rather than waiting for a whole .vcxproj to finish.
+# EnforceProcessCountAcrossBuilds prevents oversubscription when --parallel N
+# is also passed to cmake --build.
+if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    list(APPEND CMAKE_VS_GLOBALS
+        "UseMultiToolTask=true"
+        "EnforceProcessCountAcrossBuilds=true"
+    )
+endif()
+
 project(trt-rtx-ep LANGUAGES CXX)
 
 # =============================================================================
@@ -120,8 +133,10 @@ file(GLOB TRT_RTX_EP_HEADERS
 )
 
 # secure_load.cc is Windows-only (delay load hooks)
+# dll_main.cc is Windows-only (DllMain module pin)
 if(NOT WIN32)
     list(FILTER TRT_RTX_EP_SOURCES EXCLUDE REGEX ".*secure_load\\.cc$")
+    list(FILTER TRT_RTX_EP_SOURCES EXCLUDE REGEX ".*dll_main\\.cc$")
 endif()
 
 # =============================================================================
@@ -262,7 +277,7 @@ if(WIN32)
     message(STATUS "Delay load DLL: ${TRT_ONNX_PARSER_DLL_NAME}")
 
     # Add delay load linker flags
-    set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${TRT_RTX_DLL_NAME} /DELAYLOAD:${TRT_ONNX_PARSER_DLL_NAME} /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll")
+    set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${TRT_RTX_DLL_NAME} /DELAYLOAD:${TRT_ONNX_PARSER_DLL_NAME} /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:nvcuda.dll")
 else()
     if(USE_VCPKG MATCHES "OFF")
         # # Linux
@@ -352,7 +367,7 @@ endif()
 
 # Link libraries
 target_link_libraries(TensorRTRtxEp PRIVATE
-    onnxruntime::onnxruntime
+    onnxruntime::headers
     tensorrt_rtx::tensorrt_rtx
     protobuf::libprotobuf
     onnx
@@ -425,15 +440,14 @@ if(BUILD_EXAMPLES)
         syncstreams_cuda
         sample
         sample_buffer
+        sample_weightless
+        sample_weightless_buffer
     )
         if(TARGET ${_example_target})
+            # DLL copy is handled by copy_ep_dll_post_build() in each example's own
+            # CMakeLists.txt (add_custom_command(TARGET ...) must run in the same
+            # directory scope the target was created in, so it can't be done here).
             add_dependencies(${_example_target} TensorRTRtxEp)
-            add_custom_command(TARGET ${_example_target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    $<TARGET_FILE:TensorRTRtxEp>
-                    $<TARGET_FILE_DIR:${_example_target}>
-                COMMENT "Copying TRT RTX EP DLL to ${_example_target} directory"
-            )
         endif()
     endforeach()
 endif()

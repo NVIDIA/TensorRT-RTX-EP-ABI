@@ -31,11 +31,11 @@
 // one side) would cause TRT to refuse nodes that ORT already partitioned
 // to this EP.
 
-#include "onnx/onnx_pb.h"
-
 #include <cstddef>
 #include <string>
 #include <vector>
+
+#include "onnx/onnx_pb.h"
 
 namespace trt_rtx_ep
 {

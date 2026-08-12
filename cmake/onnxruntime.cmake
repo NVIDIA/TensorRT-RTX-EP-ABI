@@ -149,6 +149,17 @@ else()
     )
 endif()
 
+# Header-only interface for consumers that must NOT link against
+# onnxruntime.lib / libonnxruntime.so. Linking the import lib would add a
+# DT_NEEDED / IAT entry that ties the consumer to a specific ORT build.
+if(NOT TARGET onnxruntime::headers)
+    add_library(onnxruntime::headers INTERFACE IMPORTED)
+    set_target_properties(onnxruntime::headers PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+    )
+endif()
+
 if(NOT TARGET onnxruntime::onnxruntime)
     add_library(onnxruntime::onnxruntime UNKNOWN IMPORTED)
     set_target_properties(onnxruntime::onnxruntime PROPERTIES

@@ -32,7 +32,7 @@ TabWidth: 4
 UseTab: Never
 IndentCaseLabels: false
 IndentCaseBlocks: false
-IndentPPDirectives: AfterHash
+IndentPPDirectives: None
 NamespaceIndentation: None
 AccessModifierOffset: -4
 

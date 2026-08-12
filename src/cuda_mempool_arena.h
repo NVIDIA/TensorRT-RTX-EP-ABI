@@ -15,15 +15,16 @@
 
 #pragma once
 
+#include "tensorrt_rtx_allocator.h"
+
+#include "onnxruntime_c_api.h"
+
 #include <cuda_runtime_api.h>
 
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
-
-#include "onnxruntime_c_api.h"
-#include "tensorrt_rtx_allocator.h"
 
 namespace trt_rtx_ep
 {
@@ -61,12 +62,8 @@ struct CudaMempoolAllocator : OrtAllocator
     //! \return nullptr on success (including the probe-fallback case), or an
     //!         OrtStatus for an unexpected error.
     //!
-    static OrtStatus* Create(
-        const OrtMemoryInfo* memory_info,
-        DeviceId device_id,
-        const OrtApi& api,
-        const OrtLogger& logger,
-        std::unique_ptr<CudaMempoolAllocator>& out);
+    static OrtStatus* Create(const OrtMemoryInfo* memory_info, DeviceId device_id, const OrtApi& api,
+                             const OrtLogger& logger, std::unique_ptr<CudaMempoolAllocator>& out);
 
     ~CudaMempoolAllocator();
 
@@ -87,11 +84,8 @@ struct CudaMempoolAllocator : OrtAllocator
     CudaMempoolAllocator& operator=(CudaMempoolAllocator&&) = delete;
 
 private:
-    CudaMempoolAllocator(
-        const OrtMemoryInfo* memory_info,
-        DeviceId device_id,
-        const OrtApi& api,
-        const OrtLogger& logger);
+    CudaMempoolAllocator(const OrtMemoryInfo* memory_info, DeviceId device_id, const OrtApi& api,
+                         const OrtLogger& logger);
 
     // ---- OrtAllocator callbacks (static) ----
     static void* ORT_API_CALL AllocImpl(OrtAllocator* this_, size_t size);
@@ -103,6 +97,7 @@ private:
 
     // ---- Instance methods ----
     void* DoAlloc(size_t size, cudaStream_t cuda_stream);
+    void EnsureProbedOnce(cudaStream_t stream);
     void DoFree(void* p);
     cudaStream_t ResolveCudaStream(OrtSyncStream* stream) const;
     void MaybeRehashLocked();
@@ -121,6 +116,12 @@ private:
     const OrtApi& api_;
     const OrtLogger& logger_;
     cudaMemPool_t pool_{nullptr};
+
+    // Deferred one-time pool-usability probe (see Create()). Runs on the first allocation, under
+    // the caller's already-current context, so EP registration never initializes the device
+    // primary context. probe_usable_ is read after std::call_once completes (happens-before).
+    std::once_flag probe_once_;
+    bool probe_usable_ = true;
 
     std::mutex mutex_;
     std::unordered_map<void*, AllocationRecord> alloc_map_;

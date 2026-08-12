@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Copy the EP DLL, TensorRT RTX DLLs, and CUDA runtime into the Python package directory
-before building a wheel.
+Copy the EP DLL, TensorRT RTX DLLs, CUDA runtime, docs, and optional plugin DLLs
+into the Python package directory before building a wheel.
 
 The EP enforces loading TensorRT RTX DLLs only from the same directory as the EP DLL
 (see secure_load.cc). All DLLs must sit next to each other inside
@@ -17,12 +17,16 @@ Environment variables (used when CLI args omitted):
   NV_TRT_RTX_LIB_DIR  Directory containing tensorrt_rtx_*.dll and tensorrt_onnxparser_rtx_*.dll
   NV_CUDA_BIN         CUDA bin directory containing cudart64_*.dll
                       (e.g. C:\\CUDA\\v13.1\\bin\\x64 or C:\\CUDA\\v13.1\\bin)
+  NV_TRT_RTX_DOC_DIR  TensorRT RTX SDK doc directory (e.g. C:\\TensorRT-RTX\\doc)
+  NV_PLUGIN_DIR       TensorRT plugin directory containing tensorrt_plugins.dll
 
 Example:
   python scripts/stage_windows_dlls.py ^
-    --ep-dll ..\\trt-rtx-ep-abi\\build\\Release\\onnxruntime_providers_nv_tensorrt_rtx.dll ^
+    --ep-dll ..\\TensorRT-RTX-EP-ABI\\build\\Release\\onnxruntime_providers_nv_tensorrt_rtx.dll ^
     --trt-lib-dir C:\\TensorRT-RTX\\bin ^
-    --cuda-bin "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\x64"
+    --cuda-bin "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\x64" ^
+    --trt-doc-dir C:\\TensorRT-RTX\\doc ^
+    --plugin-dir "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\TensorRT-RTX-Plugins\\RTX-1.5"
 """
 
 from __future__ import annotations
@@ -85,7 +89,14 @@ def _find_cudart(cuda_bin: Path) -> Path:
     )
 
 
-def stage(ep_dll: Path, trt_lib_dir: Path, dest: Path, cuda_bin: Path | None = None) -> None:
+def stage(
+    ep_dll: Path,
+    trt_lib_dir: Path,
+    dest: Path,
+    cuda_bin: Path | None = None,
+    trt_doc_dir: Path | None = None,
+    plugin_dir: Path | None = None,
+) -> None:
     dest.mkdir(parents=True, exist_ok=True)
 
     if not ep_dll.is_file():
@@ -94,10 +105,11 @@ def stage(ep_dll: Path, trt_lib_dir: Path, dest: Path, cuda_bin: Path | None = N
     # Validate the directory contains the expected TRT RTX DLL pair
     _resolve_trt_rtx_pair(trt_lib_dir)
 
-    # Remove stale DLLs from a previous staging run before copying new ones.
+    # Remove stale DLLs and staged TRT-RTX docs from a previous staging run.
     # Without this, upgrading (e.g. tensorrt_rtx_1_0.dll -> 1_1.dll) leaves both
     # in the directory and both get packaged into the wheel.
-    for stale in dest.glob("*.dll"):
+    # Use TRTRTX_*.txt rather than *.txt to avoid deleting any checked-in package files.
+    for stale in list(dest.glob("*.dll")) + list(dest.glob("TRTRTX_*.txt")):
         stale.unlink()
         print(f"Removed stale {stale}")
 
@@ -126,6 +138,34 @@ def stage(ep_dll: Path, trt_lib_dir: Path, dest: Path, cuda_bin: Path | None = N
     else:
         print("Warning: --cuda-bin not provided; cudart64_*.dll will NOT be bundled.")
 
+    # Copy TensorRT RTX SDK docs (Acknowledgements.txt, README.txt) from doc/.
+    # Renamed with TRTRTX_ prefix so wheel consumers can distinguish them from EP docs.
+    if trt_doc_dir is not None:
+        if not trt_doc_dir.is_dir():
+            raise FileNotFoundError(f"TRT RTX doc directory not found: {trt_doc_dir}")
+        doc_files = sorted(trt_doc_dir.glob("*.txt"))
+        if not doc_files:
+            print(f"Warning: no *.txt files found under {trt_doc_dir}; docs will not be bundled.")
+        for src in doc_files:
+            dst = dest / f"TRTRTX_{src.name}"
+            shutil.copy2(src, dst)
+            print(f"Copied {src} -> {dst}")
+    else:
+        print("Warning: --trt-doc-dir not provided; TensorRT RTX docs will NOT be bundled.")
+
+    # Copy TensorRT plugin DLL(s) from the plugin directory.
+    if plugin_dir is not None:
+        if not plugin_dir.is_dir():
+            raise FileNotFoundError(f"Plugin directory not found: {plugin_dir}")
+        plugin_dlls = sorted(plugin_dir.glob("*.dll"))
+        if not plugin_dlls:
+            print(f"Warning: no *.dll files found under {plugin_dir}.")
+        for src in plugin_dlls:
+            shutil.copy2(src, dest / src.name)
+            print(f"Copied {src} -> {dest / src.name}")
+    else:
+        print("Warning: --plugin-dir not provided; TensorRT plugin DLLs will NOT be bundled.")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -139,7 +179,7 @@ def main() -> int:
         "--trt-lib-dir",
         type=Path,
         default=None,
-        help="TensorRT RTX SDK lib directory (or set NV_TRT_RTX_LIB_DIR)",
+        help="TensorRT RTX SDK bin directory containing DLLs (or set NV_TRT_RTX_LIB_DIR)",
     )
     parser.add_argument(
         "--cuda-bin",
@@ -147,6 +187,20 @@ def main() -> int:
         default=None,
         help="CUDA bin directory containing cudart64_*.dll (or set NV_CUDA_BIN). "
              "Typically <CUDA_HOME>\\bin\\x64 on Windows.",
+    )
+    parser.add_argument(
+        "--trt-doc-dir",
+        type=Path,
+        default=None,
+        help="TensorRT RTX SDK doc directory containing Acknowledgements.txt and README.txt "
+             "(or set NV_TRT_RTX_DOC_DIR). Typically <TRT_RTX_HOME>\\doc.",
+    )
+    parser.add_argument(
+        "--plugin-dir",
+        type=Path,
+        default=None,
+        help="TensorRT plugin directory containing tensorrt_plugins.dll and its docs "
+             "(or set NV_PLUGIN_DIR). E.g. C:\\TensorRT-RTX-Plugins\\RTX-1.5.",
     )
     parser.add_argument(
         "--dest",
@@ -178,11 +232,29 @@ def main() -> int:
         if env_cuda:
             cuda_bin = Path(env_cuda)
 
+    trt_doc_dir = args.trt_doc_dir
+    if trt_doc_dir is None:
+        env_doc = os.environ.get("NV_TRT_RTX_DOC_DIR")
+        if env_doc:
+            trt_doc_dir = Path(env_doc)
+
+    plugin_dir = args.plugin_dir
+    if plugin_dir is None:
+        env_plugin = os.environ.get("NV_PLUGIN_DIR")
+        if env_plugin:
+            plugin_dir = Path(env_plugin)
+
     dest = args.dest if args.dest is not None else _package_dir()
 
     try:
-        stage(ep_dll.resolve(), trt_lib_dir.resolve(), dest.resolve(),
-              cuda_bin.resolve() if cuda_bin is not None else None)
+        stage(
+            ep_dll.resolve(),
+            trt_lib_dir.resolve(),
+            dest.resolve(),
+            cuda_bin.resolve() if cuda_bin is not None else None,
+            trt_doc_dir.resolve() if trt_doc_dir is not None else None,
+            plugin_dir.resolve() if plugin_dir is not None else None,
+        )
     except (FileNotFoundError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

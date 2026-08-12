@@ -1,5 +1,6 @@
-# Staged DLLs (copied at build time by scripts/stage_windows_dlls.py)
+# Staged DLLs and docs (copied at build time by scripts/stage_windows_dlls.py)
 onnxruntime_ep_nv_tensorrt_rtx/*.dll
+onnxruntime_ep_nv_tensorrt_rtx/*.txt
 
 # Generated version files (written at build time by build.bat / build.sh)
 onnxruntime_ep_nv_tensorrt_rtx/_version.py

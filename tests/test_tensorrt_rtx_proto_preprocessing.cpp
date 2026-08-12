@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include <gtest/gtest.h>
-#include <onnxruntime_cxx_api.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -24,6 +21,8 @@
 #include "test_tensorrt_rtx_model_builder.h"
 #include "test_tensorrt_rtx_utils.h"
 #include "trt_proto_preprocessing.h"
+#include <gtest/gtest.h>
+#include <onnxruntime_cxx_api.h>
 
 extern std::unique_ptr<Ort::Env> ort_env;
 
@@ -178,8 +177,7 @@ onnx::ModelProto BuildPoolModel(const std::string& op_type, int32_t data_type, c
     model_builder::AddValueInfo(graph->mutable_output(), "Y", data_type, output_shape);
     if (add_second_output)
     {
-        model_builder::AddValueInfo(graph->mutable_output(), "Indices", onnx::TensorProto_DataType_INT64,
-                                    output_shape);
+        model_builder::AddValueInfo(graph->mutable_output(), "Indices", onnx::TensorProto_DataType_INT64, output_shape);
     }
 
     std::vector<std::string> outputs = {"Y"};
@@ -233,6 +231,16 @@ const onnx::NodeProto* FindNodeByOutput(const onnx::GraphProto& graph, const std
         }
     }
     return nullptr;
+}
+
+const onnx::AttributeProto* FindAttribute(const onnx::NodeProto& node, const std::string& attribute_name)
+{
+    const auto it = std::find_if(node.attribute().begin(), node.attribute().end(),
+                                 [&attribute_name](const onnx::AttributeProto& attribute)
+                                 {
+                                     return attribute.name() == attribute_name;
+                                 });
+    return it == node.attribute().end() ? nullptr : &*it;
 }
 
 const onnx::TensorProto* FindInitializer(const onnx::GraphProto& graph, const std::string& name)
@@ -428,7 +436,8 @@ TEST(TensorRTRTXProtoPreprocessingTest, ClipExplicitMinusInfPlusInf_RewritesToId
         for (const auto& shape : shapes)
         {
             auto model = BuildClipModel({"X", "min", "max"}, data_type, shape);
-            AddFloatScalarInitializer(*model.mutable_graph(), "min", data_type, -std::numeric_limits<float>::infinity());
+            AddFloatScalarInitializer(*model.mutable_graph(), "min", data_type,
+                                      -std::numeric_limits<float>::infinity());
             AddFloatScalarInitializer(*model.mutable_graph(), "max", data_type, std::numeric_limits<float>::infinity());
 
             trt_rtx_ep::RunClipBoundCompatibilityForTensorRt(model);
@@ -481,7 +490,8 @@ TEST(TensorRTRTXProtoPreprocessingTest, ClipMinusInfFiniteMax_RewritesToMin)
         for (const float max_value : {-2.0f, 0.0f, 3.0f})
         {
             auto model = BuildClipModel({"X", "min", "max"}, data_type);
-            AddFloatScalarInitializer(*model.mutable_graph(), "min", data_type, -std::numeric_limits<float>::infinity());
+            AddFloatScalarInitializer(*model.mutable_graph(), "min", data_type,
+                                      -std::numeric_limits<float>::infinity());
             AddFloatScalarInitializer(*model.mutable_graph(), "max", data_type, max_value);
 
             trt_rtx_ep::RunClipBoundCompatibilityForTensorRt(model);
@@ -976,6 +986,24 @@ TEST(TensorRTRTXProtoPreprocessingTest, RunTensorRtProtoPreprocessing_AppliesCli
     EXPECT_EQ(CountNodes(model.graph(), "Div"), 1u);
 }
 
+TEST(TensorRTRTXProtoPreprocessingTest, RunTensorRtProtoPreprocessing_AppliesMultiRotaryCacheConcatOffset)
+{
+    auto model = MakeModel();
+    auto* graph = model.mutable_graph();
+    model_builder::AddNode(graph, "gqa", "GroupQueryAttention", {}, {"Y"});
+
+    trt_rtx_ep::TensorRtProtoPreprocessingOptions options{};
+    options.multi_rotary_cache_concat_offset = 4096;
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model, options);
+
+    const auto* gqa = FindNodeByOutput(model.graph(), "Y");
+    ASSERT_NE(gqa, nullptr);
+    const auto* attribute = FindAttribute(*gqa, "multiRotaryCacheConcatOffset");
+    ASSERT_NE(attribute, nullptr);
+    EXPECT_EQ(attribute->type(), onnx::AttributeProto_AttributeType_INT);
+    EXPECT_EQ(attribute->i(), 4096);
+}
+
 // Intent:
 // This is a tiny runtime smoke test for the original WebNN clamp/TRT issue. It
 // does not replace the proto policy tests above; it proves that the EP path
@@ -1019,9 +1047,8 @@ TEST(TensorRTRTXProtoPreprocessingTest, TrtCompile_WebNNDilatedAveragePoolAndMax
 {
     ASSERT_FALSE(get_trt_rtx_devices(*ort_env).empty()) << "No TRT RTX EP devices found.";
 
-    CompileModelWithTrtRtx(
-        BuildPoolModel("AveragePool", kFp32, {1, 2, 5, 5}, {1, 2, 1, 1}, {3, 3}, {2, 2}),
-        "trt_compile_webnn_average_pool_dilation");
+    CompileModelWithTrtRtx(BuildPoolModel("AveragePool", kFp32, {1, 2, 5, 5}, {1, 2, 1, 1}, {3, 3}, {2, 2}),
+                           "trt_compile_webnn_average_pool_dilation");
     CompileModelWithTrtRtx(BuildPoolModel("MaxPool", kFp32, {1, 2, 5, 5}, {1, 2, 1, 1}, {3, 3}, {2, 2}),
                            "trt_compile_webnn_max_pool_dilation");
 }

@@ -15,8 +15,6 @@
 
 #pragma once
 
-#include "make_string.h"
-
 #include "onnxruntime_cxx_api.h"
 
 #include <cuda_runtime_api.h>
@@ -25,6 +23,8 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+
+#include "make_string.h"
 
 //!
 //! \brief Container for API pointers used throughout the EP.
@@ -36,17 +36,16 @@ struct ApiPtrs
     const OrtModelEditorApi& model_editor_api;
 };
 
-#define ENFORCE(condition, ...)                              \
-    do                                                       \
-    {                                                        \
-        if (!(condition))                                    \
-        {                                                    \
+#define ENFORCE(condition, ...)                                \
+    do                                                         \
+    {                                                          \
+        if (!(condition))                                      \
+        {                                                      \
             throw std::runtime_error(MakeString(__VA_ARGS__)); \
-        }                                                    \
+        }                                                      \
     } while (false)
 
-#define THROW(...) \
-    throw std::runtime_error(MakeString(__VA_ARGS__));
+#define THROW(...) throw std::runtime_error(MakeString(__VA_ARGS__));
 
 #define RETURN_IF_ORTSTATUS_ERROR(fn) RETURN_IF_ERROR(fn)
 
@@ -70,13 +69,13 @@ struct ApiPtrs
         }                              \
     } while (0)
 
-#define RETURN_IF(cond, ...)                                                               \
-    do                                                                                     \
-    {                                                                                      \
-        if ((cond))                                                                        \
-        {                                                                                  \
+#define RETURN_IF(cond, ...)                                                                 \
+    do                                                                                       \
+    {                                                                                        \
+        if ((cond))                                                                          \
+        {                                                                                    \
             return Ort::GetApi().CreateStatus(ORT_EP_FAIL, MakeString(__VA_ARGS__).c_str()); \
-        }                                                                                  \
+        }                                                                                    \
     } while (0)
 
 #define RETURN_IF_NOT(condition, ...) RETURN_IF(!(condition), __VA_ARGS__)
@@ -89,31 +88,30 @@ struct ApiPtrs
         return Ort::GetApi().CreateStatus(error_code, _oss.str().c_str()); \
     } while (false)
 
-#define MAKE_STATUS(error_code, msg) \
-    Ort::GetApi().CreateStatus(error_code, (msg));
+#define MAKE_STATUS(error_code, msg) Ort::GetApi().CreateStatus(error_code, (msg));
 
-#define THROW_IF_ERROR(expr)                             \
-    do                                                   \
-    {                                                    \
-        auto _status = (expr);                           \
-        if (_status != nullptr)                          \
-        {                                                \
-            std::ostringstream oss;                      \
+#define THROW_IF_ERROR(expr)                               \
+    do                                                     \
+    {                                                      \
+        auto _status = (expr);                             \
+        if (_status != nullptr)                            \
+        {                                                  \
+            std::ostringstream oss;                        \
             oss << Ort::GetApi().GetErrorMessage(_status); \
-            Ort::GetApi().ReleaseStatus(_status);        \
-            throw std::runtime_error(oss.str());         \
-        }                                                \
+            Ort::GetApi().ReleaseStatus(_status);          \
+            throw std::runtime_error(oss.str());           \
+        }                                                  \
     } while (0)
 
-#define RETURN_FALSE_AND_PRINT_IF_ERROR(fn)                                \
-    do                                                                     \
-    {                                                                      \
-        OrtStatus* status = (fn);                                          \
-        if (status != nullptr)                                             \
-        {                                                                  \
+#define RETURN_FALSE_AND_PRINT_IF_ERROR(fn)                                  \
+    do                                                                       \
+    {                                                                        \
+        OrtStatus* status = (fn);                                            \
+        if (status != nullptr)                                               \
+        {                                                                    \
             std::cerr << Ort::GetApi().GetErrorMessage(status) << std::endl; \
-            return false;                                                  \
-        }                                                                  \
+            return false;                                                    \
+        }                                                                    \
     } while (0)
 
 #if defined(_WIN32)
@@ -124,24 +122,25 @@ struct ApiPtrs
 #define EP_FILE __FILE__
 #endif
 
-#define LOG(level, message)                                                                                         \
-    do                                                                                                              \
-    {                                                                                                               \
-        std::ostringstream ss;                                                                                      \
-        ss << message;                                                                                              \
-        Ort::GetApi().Logger_LogMessage(&logger_, ORT_LOGGING_LEVEL_##level, ss.str().c_str(), EP_FILE, __LINE__, __FUNCTION__); \
+#define LOG(level, message)                                                                                       \
+    do                                                                                                            \
+    {                                                                                                             \
+        std::ostringstream ss;                                                                                    \
+        ss << message;                                                                                            \
+        Ort::GetApi().Logger_LogMessage(&logger_, ORT_LOGGING_LEVEL_##level, ss.str().c_str(), EP_FILE, __LINE__, \
+                                        __FUNCTION__);                                                            \
     } while (false)
 
-#define ENFORCE_EP(condition, ...)                           \
-    do                                                       \
-    {                                                        \
-        if (!(condition))                                    \
-        {                                                    \
-            std::ostringstream oss;                          \
+#define ENFORCE_EP(condition, ...)                             \
+    do                                                         \
+    {                                                          \
+        if (!(condition))                                      \
+        {                                                      \
+            std::ostringstream oss;                            \
             oss << "EP_ENFORCE failed: " << #condition << " "; \
-            oss << __VA_ARGS__;                              \
-            throw std::runtime_error(oss.str());             \
-        }                                                    \
+            oss << __VA_ARGS__;                                \
+            throw std::runtime_error(oss.str());               \
+        }                                                      \
     } while (false)
 
 //!
@@ -151,12 +150,16 @@ template <typename T>
 struct DeferOrtRelease
 {
     DeferOrtRelease(T** object_ptr, std::function<void(T*)> release_func)
-        : objects_(object_ptr), count_(1), release_func_(release_func)
+        : objects_(object_ptr)
+        , count_(1)
+        , release_func_(release_func)
     {
     }
 
     DeferOrtRelease(T** objects, size_t count, std::function<void(T*)> release_func)
-        : objects_(objects), count_(count), release_func_(release_func)
+        : objects_(objects)
+        , count_(count)
+        , release_func_(release_func)
     {
     }
 

@@ -1,0 +1,99 @@
+:root {
+  --nvidia-green: #76b900;
+  --nvidia-green-dark: #4f7f00;
+  --nvidia-green-darker: #3d6200;
+  --nvidia-green-pale: #f1f8e8;
+}
+
+/* Read the Docs navigation chrome */
+.wy-side-nav-search,
+.wy-nav-top {
+  background-color: var(--nvidia-green);
+}
+
+.wy-side-nav-search > a,
+.wy-side-nav-search .wy-dropdown > a {
+  color: #101010;
+  font-weight: 700;
+}
+
+.wy-side-nav-search input[type="text"] {
+  border-color: var(--nvidia-green-darker);
+}
+
+.wy-menu-vertical header,
+.wy-menu-vertical p.caption {
+  color: var(--nvidia-green);
+}
+
+.wy-menu-vertical a:active {
+  background-color: var(--nvidia-green-dark);
+}
+
+/* Preserve the NVIDIA palette when an RTD navigation submenu is active. */
+.wy-menu-vertical li.toctree-l1.current > a {
+  background-color: var(--nvidia-green-dark);
+  border-color: var(--nvidia-green-darker);
+  color: #fff;
+}
+
+.wy-menu-vertical li.toctree-l1.current > a:hover {
+  background-color: var(--nvidia-green-darker);
+}
+
+.wy-menu-vertical li.toctree-l2.current > a,
+.wy-menu-vertical li.toctree-l2 > a:hover {
+  background-color: var(--nvidia-green-pale);
+  border-right: 4px solid var(--nvidia-green);
+  color: var(--nvidia-green-darker);
+}
+
+/* Content links use a darker green to retain contrast on white. */
+.rst-content a:not(.btn),
+.wy-breadcrumbs a,
+.wy-nav-content a.icon {
+  color: var(--nvidia-green-dark);
+}
+
+.rst-content a:not(.btn):hover,
+.wy-breadcrumbs a:hover,
+.wy-nav-content a.icon:hover {
+  color: var(--nvidia-green-darker);
+  text-decoration: underline;
+}
+
+.rst-content .note,
+.rst-content .seealso {
+  background-color: var(--nvidia-green-pale);
+}
+
+.rst-content .note .admonition-title,
+.rst-content .seealso .admonition-title {
+  background-color: var(--nvidia-green-dark);
+}
+
+.rst-content .guilabel,
+.rst-content .menuselection {
+  border-color: var(--nvidia-green);
+}
+
+.btn-info,
+.btn-info:visited {
+  background-color: var(--nvidia-green-dark) !important;
+  border-color: var(--nvidia-green-darker) !important;
+}
+
+.btn-info:hover,
+.btn-info:focus {
+  background-color: var(--nvidia-green-darker) !important;
+}
+
+.wy-nav-content {
+  max-width: none;
+}
+
+.rst-content table td,
+.rst-content table th {
+  word-break: normal;
+  overflow-wrap: break-word;
+}

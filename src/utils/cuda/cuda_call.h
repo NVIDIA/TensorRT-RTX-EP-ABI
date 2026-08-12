@@ -35,8 +35,9 @@ inline const char* CudaErrString<cudaError_t>(cudaError_t x)
 }
 
 template <typename ERRTYPE, bool THRW>
-std::conditional_t<THRW, void, OrtStatus*> CudaCall(
-    ERRTYPE retCode, const char* exprString, const char* libName, ERRTYPE successCode, const char* msg, const char* file, const int line)
+std::conditional_t<THRW, void, OrtStatus*> CudaCall(ERRTYPE retCode, const char* exprString, const char* libName,
+                                                    ERRTYPE successCode, const char* msg, const char* file,
+                                                    const int line)
 {
     if (retCode != successCode)
     {
@@ -46,9 +47,8 @@ std::conditional_t<THRW, void, OrtStatus*> CudaCall(
             cudaGetDevice(&currentCudaDevice);
             cudaGetLastError();  // clear last CUDA error
             static char str[1024];
-            snprintf(str, 1024, "%s failure %d: %s ; GPU=%d ; hostname=? ; file=%s ; line=%d ; expr=%s; %s",
-                     libName, (int)retCode, CudaErrString(retCode), currentCudaDevice,
-                     file, line, exprString, msg);
+            snprintf(str, 1024, "%s failure %d: %s ; GPU=%d ; hostname=? ; file=%s ; line=%d ; expr=%s; %s", libName,
+                     (int)retCode, CudaErrString(retCode), currentCudaDevice, file, line, exprString, msg);
             if constexpr (THRW)
             {
                 // throw an exception with the error info
@@ -61,7 +61,8 @@ std::conditional_t<THRW, void, OrtStatus*> CudaCall(
         }
         catch (const std::exception& e)
         {
-            // catch, log, and rethrow since CUDA code sometimes hangs in destruction, so we'd never get to see the error
+            // catch, log, and rethrow since CUDA code sometimes hangs in destruction, so we'd never get to see the
+            // error
             if constexpr (THRW)
             {
                 THROW(e.what());

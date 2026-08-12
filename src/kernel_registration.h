@@ -15,11 +15,12 @@
 
 #pragma once
 
-#include <vector>
-#include "onnxruntime_cxx_api.h"
 #include "utils/ep_utils.h"
+
+#include "onnxruntime_cxx_api.h"
+
+#include <vector>
 
 size_t GetNumKernels();
 
 OrtStatus* CreateKernelRegistry(const char* ep_name, void* create_kernel_state, OrtKernelRegistry** kernel_registry);
-

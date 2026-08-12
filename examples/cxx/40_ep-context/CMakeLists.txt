@@ -29,6 +29,12 @@ target_link_libraries(sample PRIVATE onnxruntime_interface example_utils)
 add_executable(sample_buffer sample_buffer.cpp)
 target_link_libraries(sample_buffer PRIVATE onnxruntime_interface example_utils)
 
+add_executable(sample_weightless sample_weightless.cpp)
+target_link_libraries(sample_weightless PRIVATE onnxruntime_interface example_utils)
+
+add_executable(sample_weightless_buffer sample_weightless_buffer.cpp)
+target_link_libraries(sample_weightless_buffer PRIVATE onnxruntime_interface example_utils)
+
 set(ONNX "candy.onnx")
 set(CANDY_ONNX_PATH "${CMAKE_CURRENT_BINARY_DIR}/../candy.onnx")
 
@@ -40,7 +46,7 @@ else()
     message(STATUS "candy.onnx not found -- sample 40 will need a model at runtime")
 endif()
 
-set_target_properties(sample sample_buffer
+set_target_properties(sample sample_buffer sample_weightless sample_weightless_buffer
     PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
     LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
@@ -48,6 +54,9 @@ set_target_properties(sample sample_buffer
 )
 
 copy_ep_dll_post_build(sample)
+copy_ep_dll_post_build(sample_buffer)
+copy_ep_dll_post_build(sample_weightless)
+copy_ep_dll_post_build(sample_weightless_buffer)
 
 # sample: no required args, defaults to candy.onnx -> candy_compiled.onnx in the exe dir.
 add_test(
