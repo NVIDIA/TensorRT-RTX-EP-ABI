@@ -253,6 +253,12 @@ struct IExecutionContextDeleter
     IExecutionContextDeleter(const std::string&, std::unique_ptr<nvinfer1::IRuntimeCache>&&,
                              std::unique_ptr<nvinfer1::IRuntimeConfig>&&, const OrtApi&) = delete;
 
+    //! \brief Retain EP-owned auxiliary streams until after the execution context is destroyed.
+    void SetOwnedAuxStreams(std::vector<cudaStream_t>&& streams) noexcept;
+
+    //! \brief Bind the retained streams for the context's next enqueue, if any.
+    void BindOwnedAuxStreams(nvinfer1::IExecutionContext& context) noexcept;
+
     //!
     //! \brief Destroys an execution context and then persists its final optimized runtime cache.
     //!
@@ -266,11 +272,15 @@ private:
     //!
     void SaveCache() noexcept;
 
+    //! \brief Destroy retained auxiliary streams after TensorRT releases the execution context.
+    void DestroyAuxStreams() noexcept;
+
     std::filesystem::path runtime_cache_path_;
     // Declaration order is intentional: reverse destruction releases the config before its cache if no execution
     // context was ever created.
     std::unique_ptr<nvinfer1::IRuntimeCache> runtime_cache_;
     std::unique_ptr<nvinfer1::IRuntimeConfig> runtime_config_;
+    std::vector<cudaStream_t> aux_streams_;
     const OrtApi& ort_api_;
 };
 
@@ -481,18 +491,9 @@ struct TensorrtRtxExecutionProvider
 
     ~TensorrtRtxExecutionProvider();
 
-    // Optional synchronous GPU allocator. When set (non-null), it is installed on runtime_ and
-    // builder_ via setGpuAllocator(), forcing TensorRT RTX to use cudaMalloc/cudaFree instead of
-    // its default cudaMallocAsync path. Its presence is the single source of truth for whether
-    // the sync allocator is enabled.
-    //
-    // Declared as the first data member on purpose: it must outlive every TRT object that holds a
-    // raw pointer to it (runtime_, builder_, engines, contexts, ...). Members are destroyed in
-    // reverse declaration order, so declaring it first guarantees it is destroyed last on *every*
-    // path -- including a partially-constructed object when the constructor throws after
-    // setGpuAllocator() has already installed it on runtime_ (at which point the explicit
-    // destructor body does not run). The destructor still resets it last as belt-and-suspenders.
-    std::unique_ptr<trt_rtx_ep::GpuSyncAllocator> sync_gpu_allocator_ = nullptr;
+    // Optional synchronous GPU allocator owned per device by the factory so it outlives every EP
+    // object that uses it.
+    GpuSyncAllocator* sync_gpu_allocator_ = nullptr;
 
     TensorrtRtxExecutionProviderFactory& factory_;
     std::string name_;
