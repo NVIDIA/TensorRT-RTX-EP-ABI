@@ -32,6 +32,7 @@
 
 #include "cuda_mempool_arena.h"
 #include "ep_utils.h"
+#include "gpu_sync_allocator.h"
 
 // Forward declarations for ORT types
 struct OrtEpFactory;
@@ -118,6 +119,12 @@ public:
     //! \return The arena as an OrtAllocator*, or nullptr if it could not be created (e.g. no memory
     //!         info for the device or arena construction failed); a warning is logged in that case.
     OrtAllocator* GetOrCreateDeviceArena(uint32_t device_id);
+
+    //! \brief Get (creating on first use) the factory-owned synchronous TensorRT allocator for a device.
+    //!
+    //! Factory ownership ensures the allocator remains valid for all TensorRT objects created by
+    //! EP sessions from this factory.
+    GpuSyncAllocator* GetOrCreateSyncGpuAllocator(uint32_t device_id);
 
     //! \brief Latch the device's async mempool off after a runtime allocation
     //! failure, so subsequent runs use the synchronous cudaMalloc arena. Idempotent;
@@ -222,6 +229,11 @@ private:
 
     //! Guards lazy creation of device_allocators entries in GetOrCreateDeviceArena().
     std::mutex device_arena_mutex_;
+
+    //! Per-device TensorRT allocator adapters. Declared after device_allocators so the adapters are
+    //! destroyed before the arenas they borrow when the factory is released.
+    std::mutex sync_gpu_allocators_mutex_;
+    std::unordered_map<uint32_t, std::unique_ptr<GpuSyncAllocator>> sync_gpu_allocators_;
 
     //! \brief Create a BFC arena backed by a TensorrtRtxAllocator (cudaMalloc/cudaFree) for the
     //! given device. Shared by CreateAllocatorImpl and GetOrCreateDeviceArena so the creation code

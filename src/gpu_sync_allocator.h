@@ -46,17 +46,15 @@ namespace trt_rtx_ep
 //!          available due to a known CUDA Windows driver bug. Forwarding to the device BFC arena (cudaMalloc)
 //!          keeps allocation deterministic while reusing arena chunks.
 //!
-//! \note Header-only; included by tensorrt_rtx_execution_provider.h so the type is complete at
-//!       the sync_gpu_allocator_ member declaration (std::unique_ptr member functions require a
-//!       complete type wherever they are instantiated -- GCC rejects the forward-declared form
-//!       even though MSVC accepts it). The wrapped arena
+//! \note Header-only; included by tensorrt_rtx_provider_factory.h so the type is complete at the
+//!       factory's std::unique_ptr member declaration. The wrapped arena
 //!       validates sizes/alignment and treats a null free as a no-op, so this adapter adds no
 //!       redundant checks of its own; it only forwards and, being noexcept, converts any exception
 //!       from the arena into the nullptr/false the IGpuAllocator contract expects.
 //!
 //! \warning The lifetime of the allocator (and the arena it wraps) must exceed that of every
 //!          runtime, builder, engine and execution context that uses it (a TensorRT requirement).
-//!          The arena is owned by the factory (device_allocators), which outlives the EP.
+//!          Both are owned per device by the factory, which outlives every EP session.
 //!
 class GpuSyncAllocator final : public nvinfer1::IGpuAsyncAllocator
 {

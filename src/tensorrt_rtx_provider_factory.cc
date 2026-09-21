@@ -810,6 +810,27 @@ OrtAllocator* TensorrtRtxExecutionProviderFactory::GetOrCreateDeviceArena(uint32
     return result;
 }
 
+GpuSyncAllocator* TensorrtRtxExecutionProviderFactory::GetOrCreateSyncGpuAllocator(uint32_t device_id)
+{
+    OrtAllocator* device_arena = GetOrCreateDeviceArena(device_id);
+    if (device_arena == nullptr)
+    {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(sync_gpu_allocators_mutex_);
+    auto it = sync_gpu_allocators_.find(device_id);
+    if (it != sync_gpu_allocators_.end())
+    {
+        return it->second.get();
+    }
+
+    auto allocator = std::make_unique<GpuSyncAllocator>(device_arena);
+    GpuSyncAllocator* result = allocator.get();
+    sync_gpu_allocators_.emplace(device_id, std::move(allocator));
+    return result;
+}
+
 void TensorrtRtxExecutionProviderFactory::NoteAsyncMempoolFailure(uint32_t device_id)
 {
     bool newly_disabled = false;
@@ -1453,6 +1474,11 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl
 
     if (factory.ep_api.MemoryDevice_GetMemoryType(mem_device) == OrtDeviceMemoryType_DEFAULT)
     {
+        // GetOrCreateDeviceArena() can initialize this same shared map from an EP constructor.
+        // Serialize the complete lookup/create/publish transaction so a factory-owned
+        // GpuSyncAllocator never observes an arena that is concurrently replaced.
+        std::lock_guard<std::mutex> arena_lock(factory.device_arena_mutex_);
+
         // Use the one that was previously created
         if (factory.device_allocators.find(device_id) != factory.device_allocators.end())
         {

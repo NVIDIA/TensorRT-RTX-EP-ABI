@@ -207,12 +207,47 @@ std::unique_ptr<nvinfer1::IRuntimeCache> CreateAndAttachRuntimeCache(nvinfer1::I
 tensorrt_ptr::unique_pointer_exec_ctx
 CreateOwnedExecutionContext(nvinfer1::ICudaEngine& engine, const std::filesystem::path& runtime_cache_file,
                             std::unique_ptr<nvinfer1::IRuntimeCache> runtime_cache,
-                            std::unique_ptr<nvinfer1::IRuntimeConfig> runtime_config, const OrtApi& ort_api)
+                            std::unique_ptr<nvinfer1::IRuntimeConfig> runtime_config, const OrtApi& ort_api,
+                            bool create_internal_aux_streams)
 {
     auto* runtime_config_ptr = runtime_config.get();
     auto deleter = tensorrt_ptr::IExecutionContextDeleter(runtime_cache_file, std::move(runtime_cache),
                                                           std::move(runtime_config), ort_api);
-    return {engine.createExecutionContext(runtime_config_ptr), std::move(deleter)};
+    tensorrt_ptr::unique_pointer_exec_ctx context{engine.createExecutionContext(runtime_config_ptr),
+                                                  std::move(deleter)};
+    if (context == nullptr || !create_internal_aux_streams)
+    {
+        return context;
+    }
+
+    const int32_t stream_count = engine.getNbAuxStreams();
+    if (stream_count <= 0)
+    {
+        return context;
+    }
+
+    std::vector<cudaStream_t> streams;
+    streams.reserve(static_cast<size_t>(stream_count));
+    try
+    {
+        for (int32_t i = 0; i < stream_count; ++i)
+        {
+            cudaStream_t stream = nullptr;
+            CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            streams.push_back(stream);
+        }
+    }
+    catch (...)
+    {
+        for (cudaStream_t stream : streams)
+        {
+            (void)cudaStreamDestroy(stream);
+        }
+        throw;
+    }
+
+    context.get_deleter().SetOwnedAuxStreams(std::move(streams));
+    return context;
 }
 }  // namespace
 
@@ -231,15 +266,36 @@ IExecutionContextDeleter::IExecutionContextDeleter(const std::filesystem::path& 
 
 void IExecutionContextDeleter::operator()(nvinfer1::IExecutionContext* context) noexcept
 {
-    if (context == nullptr)
+    if (context != nullptr)
     {
-        return;
+        // IExecutionContext stores a non-owning IRuntimeConfig pointer. Keep both dependencies alive while the context
+        // synchronizes its stream and releases its TensorRT/Myelin resources, then serialize the still-owned cache.
+        delete context;
+        SaveCache();
     }
+    DestroyAuxStreams();
+}
 
-    // IExecutionContext stores a non-owning IRuntimeConfig pointer. Keep both dependencies alive while the context
-    // synchronizes its stream and releases its TensorRT/Myelin resources, then serialize the still-owned cache.
-    delete context;
-    SaveCache();
+void IExecutionContextDeleter::SetOwnedAuxStreams(std::vector<cudaStream_t>&& streams) noexcept
+{
+    aux_streams_ = std::move(streams);
+}
+
+void IExecutionContextDeleter::BindOwnedAuxStreams(nvinfer1::IExecutionContext& context) noexcept
+{
+    if (!aux_streams_.empty())
+    {
+        context.setAuxStreams(aux_streams_.data(), static_cast<int32_t>(aux_streams_.size()));
+    }
+}
+
+void IExecutionContextDeleter::DestroyAuxStreams() noexcept
+{
+    for (cudaStream_t stream : aux_streams_)
+    {
+        (void)cudaStreamDestroy(stream);
+    }
+    aux_streams_.clear();
 }
 
 void IExecutionContextDeleter::SaveCache() noexcept
@@ -1285,7 +1341,7 @@ nvinfer1::IBuilder* TensorrtRtxExecutionProvider::GetBuilder(TensorrtRtxLogger& 
             // Force synchronous GPU allocation during engine build if requested.
             if (sync_gpu_allocator_)
             {
-                builder_->setGpuAllocator(sync_gpu_allocator_.get());
+                builder_->setGpuAllocator(sync_gpu_allocator_);
             }
         }
     }
@@ -1442,8 +1498,9 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromPrecompiledEng
     // Note: Creating an execution context from an engine is thread safe per TRT doc
     // https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading
 
-    auto trt_context = CreateOwnedExecutionContext(*trt_engine, runtime_cache_file, std::move(trt_runtime_cache),
-                                                   std::move(trt_runtime_config), ep->ort_api);
+    auto trt_context =
+        CreateOwnedExecutionContext(*trt_engine, runtime_cache_file, std::move(trt_runtime_cache),
+                                    std::move(trt_runtime_config), ep->ort_api, !ep->external_aux_streams_);
     if (!trt_context)
     {
         std::string message = "NvTensorRTRTX EP could not build execution context for fused node: " + fused_node_name;
@@ -2168,8 +2225,9 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     // Note: Creating an execution context from an engine is thread safe per TRT doc
     // https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading
 
-    auto trt_context = CreateOwnedExecutionContext(*trt_engine, runtime_cache_file, std::move(trt_runtime_cache),
-                                                   std::move(trt_runtime_config), ep->ort_api);
+    auto trt_context =
+        CreateOwnedExecutionContext(*trt_engine, runtime_cache_file, std::move(trt_runtime_cache),
+                                    std::move(trt_runtime_config), ep->ort_api, !ep->external_aux_streams_);
     if (!trt_context)
     {
         std::string message = "[NvTensorRTRTX EP] NvTensorRTRTX EP could not build execution context for fused node: ";
@@ -2995,19 +3053,17 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
         runtime_ = std::unique_ptr<nvinfer1::IRuntime>(
             nvinfer1::createInferRuntime(GetTensorrtRtxLogger(detailed_build_log_)));
 
-        // Force synchronous GPU allocation if requested: wrap the device's existing BFC arena
-        // (device_allocators[device_id], cudaMalloc/cudaFree) in a GpuSyncAllocator and install it,
+        // Force synchronous GPU allocation if requested: use the factory's per-device adapter for
+        // the existing BFC arena (device_allocators[device_id], cudaMalloc/cudaFree) and install it,
         // so all GPU memory acquired by the runtime (and the engines/contexts it deserializes) goes
-        // through the arena instead of TensorRT RTX's default cudaMallocAsync path. Created here,
-        // next to its use; sync_gpu_allocator_ being non-null is the single source of truth for
-        // whether the sync path is enabled (it is also installed on the builder in GetBuilder).
+        // through the arena instead of TensorRT RTX's default cudaMallocAsync path. Factory ownership
+        // ensures the adapter outlives every EP object that uses it.
         if (runtime_ && info_.use_sync_gpu_allocator)
         {
-            OrtAllocator* device_arena = factory_.GetOrCreateDeviceArena(static_cast<uint32_t>(device_id_));
-            if (device_arena != nullptr)
+            sync_gpu_allocator_ = factory_.GetOrCreateSyncGpuAllocator(static_cast<uint32_t>(device_id_));
+            if (sync_gpu_allocator_ != nullptr)
             {
-                sync_gpu_allocator_ = std::make_unique<trt_rtx_ep::GpuSyncAllocator>(device_arena);
-                runtime_->setGpuAllocator(sync_gpu_allocator_.get());
+                runtime_->setGpuAllocator(sync_gpu_allocator_);
                 std::string msg = "[NvTensorRTRTX EP] Using synchronous GPU allocator (GpuSyncAllocator); "
                                   "TensorRT RTX async allocation (cudaMallocAsync) is disabled.";
                 Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
@@ -3097,10 +3153,6 @@ TensorrtRtxExecutionProvider::~TensorrtRtxExecutionProvider()
     // 6. Destroy runtime last
     trt_rtx_runtime_.reset();
     runtime_.reset();
-
-    // 6.5 Release the synchronous GPU allocator only after every TRT object that used it
-    //     (contexts, engines, builders, runtime) has been destroyed above.
-    sync_gpu_allocator_.reset();
 
     // 7. Destroy the CUDA stream if we created it
     if (!external_stream_ && stream_ != nullptr)
@@ -5603,6 +5655,10 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
     {
         trt_context->setAuxStreams(ep.aux_streams_, static_cast<int32_t>(ep.auxiliary_streams_));
     }
+    else
+    {
+        compute_state_ptr->context->get_deleter().BindOwnedAuxStreams(*trt_context);
+    }
 
     if (ep.profiling_enable_ && ep.profiler_)
     {
@@ -6003,6 +6059,10 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
     if (ep.external_aux_streams_ && ep.aux_streams_ != nullptr)
     {
         trt_context->setAuxStreams(ep.aux_streams_, static_cast<int32_t>(ep.auxiliary_streams_));
+    }
+    else
+    {
+        trt_state->context->get_deleter().BindOwnedAuxStreams(*trt_context);
     }
 
     if (!trt_context->enqueueV3(stream))
