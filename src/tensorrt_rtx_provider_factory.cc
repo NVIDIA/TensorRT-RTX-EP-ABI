@@ -1051,7 +1051,30 @@ static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const 
     int cuda_device_idx = 0;
     if (cudaDeviceGetByPCIBusId(&cuda_device_idx, pci_bus_id) != cudaSuccess)
     {
-        return false;
+        // WSL2 fallback: ORT's PCI discovery reports the WSL virtual bus id
+        // (e.g. 176e:00:00.0), which the CUDA driver rejects (rc=101) even
+        // though the card is present. Fall back to enumerating CUDA devices
+        // and accepting the first one with CC >= 8 (Ampere+), matching the
+        // gate used on the successful path below.
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        {
+            return false;
+        }
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess)
+        {
+            return false;
+        }
+        if (major != nullptr)
+        {
+            *major = prop.major;
+        }
+        if (minor != nullptr)
+        {
+            *minor = prop.minor;
+        }
+        return prop.major >= 8;
     }
 
     cudaDeviceProp prop;
@@ -1334,7 +1357,12 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
             const OrtHardwareDevice* device = devices[i];
 
             if (factory->ort_api.HardwareDevice_Type(device) == OrtHardwareDeviceType::OrtHardwareDeviceType_GPU &&
-                factory->ort_api.HardwareDevice_VendorId(device) == factory->vendor_id_ &&
+                (factory->ort_api.HardwareDevice_VendorId(device) == factory->vendor_id_ ||
+                 // WSL2 fallback: ORT's PCI discovery reports the GPU with the
+                 // virtual vendor 0x1414 (Microsoft) and a bus id the CUDA
+                 // driver rejects. Accept such devices via the CUDA
+                 // enumeration fallback in IsOrtHardwareDeviceSupported.
+                 factory->ort_api.HardwareDevice_VendorId(device) == 0x1414) &&
                 IsOrtHardwareDeviceSupported(device, factory->ort_api, nullptr, nullptr))
             {
                 OrtKeyValuePairs* ep_options = nullptr;
