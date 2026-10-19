@@ -99,11 +99,14 @@ python scripts/stage_windows_dlls.py `
 
 For Linux use `python scripts/stage_linux_so.py` with equivalent arguments.
 
-**Step 3** — Build the wheel:
+**Step 3** — Build the wheel. Set `NV_CUDA_MAJOR` to the CUDA major version you built
+against (`12` or `13`); it selects the package name (`...-cu12` / `...-cu13`). If it is unset,
+the wheel is built without the CUDA suffix.
 
 Windows:
 
 ```powershell
+$env:NV_CUDA_MAJOR = "<12|13>"
 $env:TRT_RTX_EP_VERSION = "<M.m.p>"
 python -m build --wheel --no-isolation --outdir dist
 ```
@@ -111,7 +114,7 @@ python -m build --wheel --no-isolation --outdir dist
 Linux:
 
 ```bash
-TRT_RTX_EP_VERSION="<M.m.p>" python -m build --wheel --no-isolation --outdir dist
+NV_CUDA_MAJOR=<12|13> TRT_RTX_EP_VERSION="<M.m.p>" python -m build --wheel --no-isolation --outdir dist
 ```
 
 **Outputs** (under `python\dist\` / `python/dist/`):
