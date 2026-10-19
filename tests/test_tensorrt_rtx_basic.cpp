@@ -362,6 +362,62 @@ TEST(TensorRTRTXEpTest, LoadUnloadPluginLibraryCxxApi)
 }
 
 // =============================================================================
+// LoadUnloadPluginLibraryCustomName
+// =============================================================================
+
+// The EP name is caller-assigned at registration time, not hardcoded by the
+// DLL. Unregister the standard name and re-register the same library under
+// an arbitrary custom name (following the same unregister/register pattern
+// as LoadUnloadPluginLibraryCxxApi -- never two simultaneous registrations
+// of the same library) and confirm inference still works.
+TEST(TensorRTRTXEpTest, LoadUnloadPluginLibraryCustomName)
+{
+    ASSERT_FALSE(g_ep_lib_path.empty()) << "EP library path not set.";
+
+    constexpr const char* kCustomEpName = "my_custom_trt_rtx_ep_name";
+
+    // Unregister the globally registered EP first
+    ort_env->UnregisterExecutionProviderLibrary(kEpName);
+
+    // Register under the custom name
+    ort_env->RegisterExecutionProviderLibrary(kCustomEpName, toOrtString(g_ep_lib_path).c_str());
+
+    auto ep_devices = ort_env->GetEpDevices();
+    auto it = std::find_if(ep_devices.begin(), ep_devices.end(),
+                           [](const Ort::ConstEpDevice& d)
+                           {
+                               return std::string(d.EpName()) == kCustomEpName;
+                           });
+    ASSERT_NE(it, ep_devices.end()) << "Expected an OrtEpDevice for the custom-named EP registration.";
+    ASSERT_STREQ(it->EpVendor(), "NVIDIA");
+
+    const std::string model_name = "nv_execution_provider_custom_name_test.onnx";
+    model_builder::CreateBaseModel(model_name, "test", {1, 3, 2});
+
+    // Session and io_binding must be destroyed before the custom-name EP is
+    // unregistered below -- both hold state tied to that registration, and
+    // releasing them after UnregisterExecutionProviderLibrary() has torn it
+    // down is a use-after-free (crashes in the OrtIoBinding destructor).
+    {
+        Ort::SessionOptions so;
+        std::vector<Ort::ConstEpDevice> devices = {*it};
+        Ort::KeyValuePairs kv_options;
+        so.AppendExecutionProvider_V2(*ort_env, devices, kv_options);
+
+        Ort::Session session(*ort_env, toOrtString(model_name).c_str(), so);
+        auto io_binding = generate_io_binding(session);
+        Ort::RunOptions run_options;
+        session.Run(run_options, io_binding);
+    }
+
+    // Unregister the custom name
+    ort_env->UnregisterExecutionProviderLibrary(kCustomEpName);
+
+    // Re-register the standard name for subsequent tests
+    ort_env->RegisterExecutionProviderLibrary(kEpName, toOrtString(g_ep_lib_path).c_str());
+}
+
+// =============================================================================
 // DataTransfer
 // =============================================================================
 

@@ -105,7 +105,8 @@ int main(int argc, char* argv[])
         if (!trt_device)
         {
             std::cerr << "ERROR: TensorRT RTX EP device not found. "
-                      << "Ensure onnxruntime_providers_nv_tensorrt_rtx is next to the executable." << std::endl;
+                      << "Ensure onnxruntime_providers_nv_tensorrt_rtx is in the ep directory next to the executable."
+                      << std::endl;
             return 1;
         }
 

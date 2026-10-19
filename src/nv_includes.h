@@ -31,18 +31,18 @@
 #pragma warning(pop)
 #endif
 
-// Weightless EPContext refit requires TensorRT-RTX >= 1.6: the weight-strip build capability plus the
-// IRefitterObserver / RefitRecord / setRefitObserver parser API (parser 0.2.0) it depends on are only
-// available from 1.6. TensorRT-RTX < 1.6 is NOT supported. The minimum is enforced at CMake configure
-// time (cmake/tensorrt_rtx.cmake); this hard compile-time guard re-checks it so a build that bypasses
-// CMake still fails clearly rather than silently. (TRT_MAJOR_RTX / TRT_MINOR_RTX come from
-// NvInferVersion.h, included above; requiring >= 1.6 subsumes the previous NV_ONNX_PARSER_VERSION >= 200
-// gate.) A per-GPU-arch functional floor also applies, e.g. SM120 -> >= 1.6.1.106, resolved at
-// engine-build time (see the build path), not here.
-#if (TRT_MAJOR_RTX < 1) || (TRT_MAJOR_RTX == 1 && TRT_MINOR_RTX < 6)
+// Weightless EPContext refit requires TensorRT-RTX >= 1.7: the weight-strip build capability, the
+// IRefitterObserver / RefitRecord API and the parse-time emission point the capture uses --
+// IParser::setRefitObserver -- are all taken from the TensorRT-RTX 1.7 release (also in the 1.8
+// development branch). Older SDKs are NOT supported for this feature. The minimum is enforced at CMake
+// configure time (cmake/tensorrt_rtx.cmake); this hard compile-time guard re-checks it so a build that
+// bypasses CMake still fails clearly rather than silently. (TRT_MAJOR_RTX / TRT_MINOR_RTX come from
+// NvInferVersion.h, included above.) Whether a given GPU architecture supports weight stripping is
+// still decided by the builder at engine-build time (see the build path), not here.
+#if (TRT_MAJOR_RTX < 1) || (TRT_MAJOR_RTX == 1 && TRT_MINOR_RTX < 7)
 #error \
-    "Weightless EPContext refit / weight-stripped engine requires TensorRT-RTX >= 1.6. Build against a TensorRT-RTX 1.6 or newer SDK."
+    "Weightless EPContext refit / weight-stripped engine requires TensorRT-RTX >= 1.7 (IParser::setRefitObserver). Build against a TensorRT-RTX 1.7 or newer SDK."
 #endif
-// Always 1 in a supported build (TensorRT-RTX >= 1.6 is enforced above). Retained so the existing
+// Always 1 in a supported build (TensorRT-RTX >= 1.7 is enforced above). Retained so the existing
 // `#if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED` guards in the sources continue to compile the feature in.
 #define TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED 1

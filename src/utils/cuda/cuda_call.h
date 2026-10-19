@@ -17,6 +17,12 @@
 
 #include "utils/ep_utils.h"  // For OrtStatus, MAKE_STATUS, THROW, ORT_EP_FAIL
 
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+
+#include <cstdio>
+#include <type_traits>
+
 // -----------------------------------------------------------------------
 // Error handling
 // -----------------------------------------------------------------------
@@ -32,6 +38,14 @@ template <>
 inline const char* CudaErrString<cudaError_t>(cudaError_t x)
 {
     return cudaGetErrorString(x);
+}
+
+template <>
+inline const char* CudaErrString<CUresult>(CUresult x)
+{
+    const char* error_string = nullptr;
+    return cuGetErrorString(x, &error_string) == CUDA_SUCCESS && error_string != nullptr ? error_string
+                                                                                         : "unknown error";
 }
 
 template <typename ERRTYPE, bool THRW>
@@ -79,5 +93,7 @@ std::conditional_t<THRW, void, OrtStatus*> CudaCall(ERRTYPE retCode, const char*
     }
 }
 
-#define CUDA_CALL(expr) (CudaCall<cudaError, false>((expr), #expr, "CUDA", cudaSuccess, "", __FILE__, __LINE__))
-#define CUDA_CALL_THROW(expr) (CudaCall<cudaError, true>((expr), #expr, "CUDA", cudaSuccess, "", __FILE__, __LINE__))
+#define CUDA_CALL(expr) (CudaCall<cudaError_t, false>((expr), #expr, "CUDA", cudaSuccess, "", __FILE__, __LINE__))
+#define CUDA_CALL_THROW(expr) (CudaCall<cudaError_t, true>((expr), #expr, "CUDA", cudaSuccess, "", __FILE__, __LINE__))
+#define CUDA_DRIVER_CALL_THROW(expr) \
+    (CudaCall<CUresult, true>((expr), #expr, "CUDA driver", CUDA_SUCCESS, "", __FILE__, __LINE__))

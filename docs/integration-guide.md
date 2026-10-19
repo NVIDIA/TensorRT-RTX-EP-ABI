@@ -149,3 +149,20 @@ commonly used options:
 
 See the [provider options](_generated/provider-options.rst) page for the full reference including
 types, defaults, and accepted values for every option.
+
+### Dynamic weight-streaming budget
+
+Use `Ort::Session::SetEpDynamicOptions` to update the resident-weight budget after session creation:
+
+```cpp
+const char* keys[] = {"nv_weight_streaming_budget"};
+const char* values[] = {"50%"};
+session.SetEpDynamicOptions(keys, values, 1);
+```
+
+The update applies to subsequent runs and remains active until it is changed again. It accepts the same values as the
+session provider option.
+For a source ONNX model, set a nonzero session `nv_weight_streaming_budget` as well so the engine is built with weight
+streaming enabled.
+Updating the budget recreates the affected execution contexts and is synchronized with inference runs in the same
+session.

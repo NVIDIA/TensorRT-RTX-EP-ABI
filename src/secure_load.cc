@@ -39,6 +39,10 @@
 #define TRT_ONNX_PARSER_DLL_NAME "tensorrt_onnxparser_rtx.dll"
 #endif
 
+#ifndef TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS
+#define TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS ""
+#endif
+
 namespace
 {
 
@@ -74,7 +78,32 @@ bool isTrtRtxTarget(const char* dllName)
         filename = lastForwardSlash + 1;
     }
 
-    return strEqualsIgnoreCase(filename, TRT_RTX_DLL_NAME) || strEqualsIgnoreCase(filename, TRT_ONNX_PARSER_DLL_NAME);
+    if (strEqualsIgnoreCase(filename, TRT_RTX_DLL_NAME) || strEqualsIgnoreCase(filename, TRT_ONNX_PARSER_DLL_NAME))
+    {
+        return true;
+    }
+
+    // Optional architecture-specific CUDA/NVIDIA imports can be converted to
+    // delay-load imports by TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS. CMake joins
+    // the configured names with '|', which is not legal in a Windows filename.
+    const std::string additional_targets = TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS;
+    size_t begin = 0;
+    while (begin < additional_targets.size())
+    {
+        const size_t end = additional_targets.find('|', begin);
+        const std::string target =
+            additional_targets.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (!target.empty() && strEqualsIgnoreCase(filename, target.c_str()))
+        {
+            return true;
+        }
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        begin = end + 1;
+    }
+    return false;
 }
 
 //! \brief Log security warning and abort the delay-load by raising an exception
@@ -125,15 +154,16 @@ bool verifyDllSignature(const char* dllName)
 
     // Get the EP module directory - this must succeed for security
     // Use address of this function as anchor to locate the EP DLL
-    std::wstring baseDir = trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&verifyDllSignature);
-    if (baseDir.empty())
+    std::filesystem::path dependency_dir =
+        trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&verifyDllSignature);
+    if (dependency_dir.empty())
     {
         securityFailure(dllNameW.c_str(), L"could not determine the expected library directory.");
         return false;  // Never reached due to [[noreturn]] on securityFailure
     }
 
-    // Construct full path: DLL must be in the EP directory
-    std::wstring fullPath = baseDir + L"\\" + dllNameW;
+    // Construct full path: DLL must be in the selected architecture directory.
+    const std::filesystem::path fullPath = dependency_dir / dllNameW;
 
     // Verify the file exists and is not a directory
     DWORD attrib = GetFileAttributesW(fullPath.c_str());
@@ -146,7 +176,7 @@ bool verifyDllSignature(const char* dllName)
     // Directory enforcement complete. Now handle signature verification based on build type.
 #ifdef TRT_RTX_EP_PRODUCTION_BUILD
     // Production builds: verify NVIDIA signature on the DLL
-    if (!VerifyNvidiaSignature(fullPath))
+    if (!VerifyNvidiaSignature(fullPath.wstring()))
     {
         securityFailure(dllNameW.c_str(), L"digital signature verification failed.");
         return false;  // Never reached due to [[noreturn]] on securityFailure
@@ -193,16 +223,17 @@ static FARPROC WINAPI delayLoadNotifyHook(unsigned dliNotify, PDelayLoadInfo pdl
 
         // Load exclusively from the EP directory using absolute path
         std::wstring dllNameW = extractDllFilename(pdli->szDll);
-        std::wstring baseDir = trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&delayLoadNotifyHook);
-        if (baseDir.empty())
+        const std::filesystem::path dependency_dir =
+            trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&delayLoadNotifyHook);
+        if (dependency_dir.empty())
         {
             securityFailure(dllNameW.c_str(), L"could not determine the expected library directory.");
             return nullptr;  // Never reached
         }
 
-        std::wstring fullPath = baseDir + L"\\" + dllNameW;
+        const std::filesystem::path fullPath = dependency_dir / dllNameW;
 
-        // Load from the EP directory only using absolute path
+        // Load from the selected architecture directory only using an absolute path.
         // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: Search the folder containing the DLL (from fullPath)
         // LOAD_LIBRARY_SEARCH_SYSTEM32: Allow system DLL dependencies
         // This combination prevents loading from arbitrary search paths

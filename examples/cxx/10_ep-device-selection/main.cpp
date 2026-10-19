@@ -102,24 +102,7 @@ auto main(int argc, char** argv) -> int
         LOG("Hello from ONNX runtime version: {} (build info {})\n", version_string, build_info);
 
         auto env = Ort::Env(ORT_LOGGING_LEVEL_WARNING);
-        // In next examples this code snipped will be used as function: register_execution_providers(env);
-        const auto providers_library = get_executable_parent_path() / DLL_NAME("onnxruntime_providers_nv_tensorrt_rtx");
-        if (!std::filesystem::is_regular_file(providers_library))
-        {
-            LOG("{} does not exist! Skipping execution provider", providers_library.string());
-            return EXIT_FAILURE;
-        }
-
-        try
-        {
-            env.RegisterExecutionProviderLibrary(kNvTensorRTRTXExecutionProvider, toOrtFileString(providers_library));
-        }
-        catch (std::exception& e)
-        {
-            LOG("Failed to register {}! Skipping execution provider with error {}", providers_library.string(),
-                e.what());
-            return EXIT_FAILURE;
-        }
+        register_execution_providers(env);
         auto session_options = create_session_options(env, opts);
 
         std::string model_file = MODEL_FILE;
@@ -140,6 +123,19 @@ auto main(int argc, char** argv) -> int
             LOG("Failed to load image \"{}\"", opts.input_image);
             return EXIT_FAILURE;
         }
+
+        // Reject unreasonable/attacker-controlled dimensions before any allocation or
+        // arithmetic on width/height. Without this, 3 * width * height below is computed
+        // in 32-bit arithmetic and can wrap, producing an undersized buffer that the
+        // conversion loop then writes past (heap OOB write).
+        constexpr uint32_t kMaxImageDim = 8192;  // sane upper bound for this sample
+        if (width == 0 || height == 0 || width > kMaxImageDim || height > kMaxImageDim)
+        {
+            LOG("Image dimensions {}x{} are invalid or exceed the supported maximum ({}x{})", width, height,
+                kMaxImageDim, kMaxImageDim);
+            return EXIT_FAILURE;
+        }
+
         LOG("Loaded image \"{}\" with size {}x{}", opts.input_image, width, height);
 
         // candy.onnx expects [batch_size, 3, H, W] float32 NCHW RGB input
@@ -156,15 +152,19 @@ auto main(int argc, char** argv) -> int
         Ort::AllocatedStringPtr output_name = infer_session.GetOutputNameAllocated(0, cpu_allocator);
 
         // Convert RGBA uint8 image to float32 NCHW RGB
-        std::vector<float> input_data(3 * width * height);
+        std::vector<float> input_data(static_cast<size_t>(3) * width * height);
         for (uint32_t y = 0; y < height; y++)
         {
             for (uint32_t x = 0; x < width; x++)
             {
                 size_t rgba_idx = (y * width + x) * 4;
-                input_data[0 * width * height + y * width + x] = static_cast<float>(image[rgba_idx + 0]);  // R
-                input_data[1 * width * height + y * width + x] = static_cast<float>(image[rgba_idx + 1]);  // G
-                input_data[2 * width * height + y * width + x] = static_cast<float>(image[rgba_idx + 2]);  // B
+                size_t const plane = static_cast<size_t>(width) * height;
+                input_data[0 * plane + y * static_cast<size_t>(width) + x] =
+                    static_cast<float>(image[rgba_idx + 0]);  // R
+                input_data[1 * plane + y * static_cast<size_t>(width) + x] =
+                    static_cast<float>(image[rgba_idx + 1]);  // G
+                input_data[2 * plane + y * static_cast<size_t>(width) + x] =
+                    static_cast<float>(image[rgba_idx + 2]);  // B
             }
         }
 

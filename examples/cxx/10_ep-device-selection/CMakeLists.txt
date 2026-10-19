@@ -19,52 +19,7 @@ project(ep-device-selection-sample)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
 include(onnxruntimesetup)
 
-add_executable(ep-device-selection
-    main.cpp
-)
-
-set_target_properties(ep-device-selection PROPERTIES
-    CXX_STANDARD 20
-    CXX_EXTENSIONS OFF
-)
-target_link_libraries(ep-device-selection PRIVATE
-    onnxruntime_interface
-    example_utils
-)
-
-set(MODEL_ONNX "candy.onnx")
-set(CANDY_ONNX_PATH "${CMAKE_CURRENT_BINARY_DIR}/../candy.onnx")
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${MODEL_ONNX}")
-    copy_file_to_bin_dir("${CMAKE_CURRENT_SOURCE_DIR}/${MODEL_ONNX}")
-elseif(EXISTS "${CANDY_ONNX_PATH}")
-    copy_file_to_bin_dir("${CANDY_ONNX_PATH}")
-else()
-    message(STATUS "candy.onnx not found -- sample 10 will need the model at runtime")
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Input.png")
-    copy_file_to_bin_dir("${CMAKE_CURRENT_SOURCE_DIR}/Input.png")
-elseif(EXISTS "${ASSETS_DIR}/Input.png")
-    copy_file_to_bin_dir("${ASSETS_DIR}/Input.png")
-endif()
-
-target_compile_definitions(ep-device-selection
-    PRIVATE -DMODEL_FILE="${MODEL_ONNX}")
-set_target_properties(ep-device-selection
-    PROPERTIES
-    ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-    LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-    RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-)
-
-copy_ep_dll_post_build(ep-device-selection)
-
-add_test(
-    NAME    examples/10_ep-device-selection
-    COMMAND $<TARGET_FILE:ep-device-selection>
-    WORKING_DIRECTORY $<TARGET_FILE_DIR:ep-device-selection>
-)
-set_tests_properties(examples/10_ep-device-selection PROPERTIES
-    LABELS  "examples"
-    TIMEOUT 300
-)
+add_cxx_example(ep-device-selection
+    SOURCES main.cpp
+    MODEL_DEFINITION MODEL_FILE
+    TEST_NAME examples/10_ep-device-selection)

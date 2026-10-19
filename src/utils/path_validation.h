@@ -67,6 +67,64 @@ inline bool IsRelativePathToParentPath(const std::string& path_string)
     return false;
 }
 
+//! \brief Returns true if \p path_string carries a root-name (e.g. "D:") or root-directory
+//! (e.g. a leading '\' or '/') component — i.e. it is not a plain relative path.
+//!
+//! On Windows, drive-relative ("D:foo") and root-relative ("\foo") paths report
+//! is_absolute()==false (which requires BOTH a root-name and a root-directory) and contain
+//! no "..", so they pass IsAbsolutePath() and IsRelativePathToParentPath() undetected. Both
+//! still escape a base directory when composed via std::filesystem::path::operator/=, which
+//! discards the base path's directory component whenever the appended path supplies its own
+//! root-name or root-directory. This check catches that gap.
+inline bool HasRootComponent(const std::string& path_string)
+{
+    PathString ort_path_string = ToPathString(path_string);
+    std::filesystem::path path(ort_path_string.c_str());
+    return path.has_root_name() || path.has_root_directory();
+}
+
+//! \brief Result of a single-parse classification of a path string's safety-relevant properties.
+//! Combines what IsAbsolutePath(), IsRelativePathToParentPath(), and HasRootComponent() each
+//! check individually, without re-converting/re-parsing the string for each one.
+struct PathClassification
+{
+    bool is_absolute;           //!< Has both a root-name and a root-directory (e.g. "C:\foo").
+    bool has_parent_traversal;  //!< Contains ".." after lexical normalisation (e.g. "../foo").
+    bool has_root_component;    //!< Has a root-name or root-directory alone (e.g. "D:foo", "\foo").
+};
+
+//! \brief Parses \p path_string once and reports all three safety-relevant path properties.
+//!
+//! Equivalent to calling IsAbsolutePath(), IsRelativePathToParentPath(), and HasRootComponent()
+//! on the same string, but does the UTF conversion and std::filesystem::path construction once
+//! instead of three times. Prefer this over the individual checks when more than one of them is
+//! needed for the same path string.
+inline PathClassification ClassifyPath(const std::string& path_string)
+{
+    PathClassification result{false, false, false};
+    if (path_string.empty())
+    {
+        return result;
+    }
+
+    PathString ort_path_string = ToPathString(path_string);
+    std::filesystem::path path(ort_path_string.c_str());
+
+    result.is_absolute = path.is_absolute();
+    result.has_root_component = path.has_root_name() || path.has_root_directory();
+
+    std::filesystem::path normalized_path = path.lexically_normal();
+    for (const auto& component : normalized_path)
+    {
+        if (component == "..")
+        {
+            result.has_parent_traversal = true;
+            break;
+        }
+    }
+    return result;
+}
+
 //! \brief Sanitizes a model-derived name for use as a runtime-cache filename.
 //!
 //! If \p raw_name is absolute or contains parent-directory traversal components,

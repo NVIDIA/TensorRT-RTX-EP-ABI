@@ -14,6 +14,7 @@ import pytest
 EP_CONTEXT_ENABLE = "ep.context_enable"
 EP_CONTEXT_FILE_PATH = "ep.context_file_path"
 EP_CONTEXT_EMBED_MODE = "ep.context_embed_mode"
+DISABLE_CPU_EP_FALLBACK = "session.disable_cpu_ep_fallback"
 
 
 def clear_path(path: str | Path):
@@ -45,8 +46,16 @@ def get_trt_rtx_devices(registered_ep):
         if getattr(d, "ep_name", None) == registered_ep.ep_name
     ]
     if not devices:
-        pytest.skip(f"No OrtEpDevice found for {registered_ep.ep_name}")
+        pytest.fail(f"No OrtEpDevice found for mandatory EP {registered_ep.ep_name}")
     return devices
+
+
+def assert_nv_ep_session(session, registered_ep):
+    providers = session.get_providers()
+    assert registered_ep.ep_name in providers, (
+        f"Session does not expose mandatory EP {registered_ep.ep_name}; "
+        f"available providers: {providers}"
+    )
 
 
 def make_session_options(
@@ -54,19 +63,38 @@ def make_session_options(
     provider_options: Mapping[str, str] | None = None,
     session_config: Mapping[str, str] | None = None,
     profiling_prefix: str | Path | None = None,
+    log_severity_level: int | None = None,
+    allow_cpu_fallback: bool = False,
 ):
     ort = registered_ep.ort
     so = ort.SessionOptions()
 
-    for key, value in (session_config or {}).items():
+    config = {str(key): str(value) for key, value in (session_config or {}).items()}
+    if allow_cpu_fallback:
+        if config.get(DISABLE_CPU_EP_FALLBACK) == "1":
+            raise ValueError(
+                f"allow_cpu_fallback=True conflicts with {DISABLE_CPU_EP_FALLBACK}=1"
+            )
+    else:
+        configured_value = config.setdefault(DISABLE_CPU_EP_FALLBACK, "1")
+        if configured_value != "1":
+            raise ValueError(
+                f"TRT RTX EP tests require {DISABLE_CPU_EP_FALLBACK}=1; "
+                "pass allow_cpu_fallback=True only for an intentional split-graph test"
+            )
+
+    for key, value in config.items():
         so.add_session_config_entry(str(key), str(value))
 
     if profiling_prefix is not None:
         so.enable_profiling = True
         so.profile_file_prefix = str(profiling_prefix)
 
+    if log_severity_level is not None:
+        so.log_severity_level = log_severity_level
+
     if not hasattr(so, "add_provider_for_devices"):
-        pytest.skip("onnxruntime.SessionOptions does not expose add_provider_for_devices")
+        pytest.fail("onnxruntime.SessionOptions does not expose mandatory add_provider_for_devices")
 
     so.add_provider_for_devices(
         get_trt_rtx_devices(registered_ep),
@@ -77,7 +105,9 @@ def make_session_options(
 
 def create_session(registered_ep, model_path_or_bytes, **session_options_kwargs):
     so = make_session_options(registered_ep, **session_options_kwargs)
-    return registered_ep.ort.InferenceSession(model_path_or_bytes, sess_options=so)
+    session = registered_ep.ort.InferenceSession(model_path_or_bytes, sess_options=so)
+    assert_nv_ep_session(session, registered_ep)
+    return session
 
 
 def concrete_shape(shape, override=None):
@@ -112,28 +142,48 @@ def numpy_dtype_for_ort_type(ort_type: str):
     try:
         return mapping[ort_type]
     except KeyError:
-        pytest.skip(f"No zero-feed mapping for ONNX Runtime type {ort_type}")
+        pytest.fail(f"No deterministic-feed mapping for ONNX Runtime type {ort_type}")
 
 
-def make_zero_feeds(session, shape_overrides: Mapping[str, list[int]] | None = None):
+def make_deterministic_feeds(session, shape_overrides: Mapping[str, list[int]] | None = None):
     feeds = {}
     shape_overrides = shape_overrides or {}
     for inp in session.get_inputs():
         shape = concrete_shape(inp.shape, shape_overrides.get(inp.name))
         dtype = numpy_dtype_for_ort_type(inp.type)
-        feeds[inp.name] = np.zeros(shape, dtype=dtype)
+        element_count = int(np.prod(shape, dtype=np.int64))
+        values = np.arange(1, element_count + 1, dtype=np.int64).reshape(shape)
+        if dtype == np.bool_:
+            feeds[inp.name] = (values % 2).astype(dtype)
+        elif np.issubdtype(dtype, np.floating):
+            feeds[inp.name] = ((values % 11) / 4.0 - 1.0).astype(dtype)
+        else:
+            feeds[inp.name] = (values % 11).astype(dtype)
     return feeds
 
 
 def run_session_once(session, feeds=None, shape_overrides=None):
     if feeds is None:
-        feeds = make_zero_feeds(session, shape_overrides)
+        feeds = make_deterministic_feeds(session, shape_overrides)
     return session.run(None, feeds)
+
+
+def assert_base_model_output(session, shape_overrides=None):
+    feeds = make_deterministic_feeds(session, shape_overrides)
+    outputs = session.run(["O"], feeds)
+    assert len(outputs) == 1
+    expected = feeds["X"] + feeds["Y"] + feeds["Z"] + feeds["S"][0]
+    if np.issubdtype(expected.dtype, np.floating):
+        tolerance = 2e-3 if expected.dtype == np.float16 else 1e-5
+        np.testing.assert_allclose(outputs[0], expected, rtol=0, atol=tolerance)
+    else:
+        np.testing.assert_array_equal(outputs[0], expected)
+    return outputs[0]
 
 
 def require_model_compiler(ort):
     if not hasattr(ort, "ModelCompiler"):
-        pytest.skip("onnxruntime build does not expose ModelCompiler")
+        pytest.fail("onnxruntime build does not expose required ModelCompiler")
     return ort.ModelCompiler
 
 

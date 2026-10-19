@@ -1,5 +1,6 @@
 # Build directories
 build/
+build-*/
 out/
 cmake-build-*/
 
@@ -35,6 +36,7 @@ python/onnxruntime_ep_nv_tensorrt_rtx/_version.py
 docs/_build/
 docs/_generated/
 docs/__pycache__/
+.docs-venv/
 
 # CMake
 CMakeCache.txt

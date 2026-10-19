@@ -582,7 +582,7 @@ std::atomic<uint64_t> CuptiMemcpyTracker::d2h_bytes_{0};
 
 }  // namespace
 
-TEST(TensorRTRTXEpTest, HostAccessibleRunAvoidsPageableMemcpyActivity)
+TEST(TensorRTRTXEpTest, HostAccessibleRunCopiesOnlyForDiscreteGpu)
 {
 #if !TRT_RTX_ENABLE_CUPTI_MEMCPY_TEST
     GTEST_SKIP() << "CUPTI headers are not available in this build.";
@@ -609,6 +609,11 @@ TEST(TensorRTRTXEpTest, HostAccessibleRunAvoidsPageableMemcpyActivity)
     const OrtMemoryInfo* host_accessible_mem_info =
         api.EpDevice_MemoryInfo(devices[0], OrtDeviceMemoryType_HOST_ACCESSIBLE);
     ASSERT_NE(host_accessible_mem_info, nullptr) << "TRT RTX EP did not expose HOST_ACCESSIBLE memory.";
+    int device_id = 0;
+    Ort::ThrowOnError(api.MemoryInfoGetId(host_accessible_mem_info, &device_id));
+    int is_integrated = 0;
+    ASSERT_EQ(cudaSuccess, cudaDeviceGetAttribute(&is_integrated, cudaDevAttrIntegrated, device_id));
+    EXPECT_EQ(api.MemoryInfoGetVendorId(host_accessible_mem_info), is_integrated ? 0x10DEu : 0xFFFF10DEu);
 
     OrtAllocator* host_accessible_allocator = nullptr;
     Ort::ThrowOnError(api.GetSharedAllocator(*ort_env, host_accessible_mem_info, &host_accessible_allocator));
@@ -687,8 +692,20 @@ TEST(TensorRTRTXEpTest, HostAccessibleRunAvoidsPageableMemcpyActivity)
 
     EXPECT_GT(pageable.h2d_bytes + pageable.d2h_bytes, 0u)
         << "Expected pageable Session::Run to require host/device memcpy activity.";
-    EXPECT_LT(pinned.h2d_bytes + pinned.d2h_bytes, pageable.h2d_bytes + pageable.d2h_bytes)
-        << "Expected HOST_ACCESSIBLE Session::Run to reduce host/device memcpy activity.";
+    if (is_integrated)
+    {
+        EXPECT_LT(pinned.h2d_bytes + pinned.d2h_bytes, pageable.h2d_bytes + pageable.d2h_bytes)
+            << "Expected HOST_ACCESSIBLE Session::Run to reduce host/device memcpy activity on UMA.";
+    }
+    else
+    {
+        EXPECT_GT(pinned.h2d_bytes + pinned.d2h_bytes, 0u)
+            << "Expected HOST_ACCESSIBLE Session::Run to stage through device memory on a discrete GPU.";
+        EXPECT_EQ(pinned.h2d_bytes, pageable.h2d_bytes)
+            << "Expected HOST_ACCESSIBLE input staging to match pageable input staging on a discrete GPU.";
+        EXPECT_EQ(pinned.d2h_bytes, pageable.d2h_bytes)
+            << "Expected HOST_ACCESSIBLE output staging to match pageable output staging on a discrete GPU.";
+    }
 
     ExpectOutputsClose(pageable_outputs, pinned_outputs);
 #endif

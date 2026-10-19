@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <string>
@@ -62,106 +63,120 @@ inline bool IsAsciiAlpha(char c)
     return std::isalpha(static_cast<unsigned char>(c)) != 0;
 }
 
-inline OrtStatus* ParseWeightStreamingBudget(const std::string& value_str, TensorrtRtxWeightStreamingBudget& budget)
+inline OrtStatus* ParseWeightStreamingBudget(std::string_view value_str,
+                                             TensorrtRtxWeightStreamingBudget& budget) noexcept
 {
-    RETURN_IF_NOT(!value_str.empty(), "Invalid nv_weight_streaming_budget: value must not be empty.");
-
-    const char last_char = value_str.back();
-    if (last_char == '%')
+    try
     {
-        const std::string percent_value = value_str.substr(0, value_str.size() - 1);
-        double percent{};
-        RETURN_IF_NOT(TryParseStringWithClassicLocale(percent_value, percent) && std::isfinite(percent),
-                      "Invalid nv_weight_streaming_budget: ", value_str,
-                      ". The weight streaming percentage must be between 0 and 100.");
-        RETURN_IF_NOT(percent >= 0.0 && percent <= 100.0, "Invalid nv_weight_streaming_budget: ", value_str,
-                      ". The weight streaming percentage must be between 0 and 100.");
+        RETURN_IF_NOT(!value_str.empty(), "Invalid nv_weight_streaming_budget: value must not be empty.");
 
-        budget.mode = TensorrtRtxWeightStreamingBudgetMode::Percent;
-        budget.percent = percent;
-        budget.bytes = 0;
-        budget.requested_value = value_str;
-        return nullptr;
-    }
-
-    if (IsAsciiAlpha(last_char))
-    {
-        RETURN_IF_NOT(value_str.size() < 2 || !IsAsciiAlpha(value_str[value_str.size() - 2]),
-                      "Invalid nv_weight_streaming_budget: ", value_str,
-                      ". Invalid unit specifier. Valid base-2 unit suffixes include: ",
-                      kValidWeightStreamingBudgetUnitSuffixes, ".");
-
-        const char unit = static_cast<char>(std::toupper(static_cast<unsigned char>(last_char)));
-        int64_t multiplier = 0;
-        switch (unit)
+        const char last_char = value_str.back();
+        if (last_char == '%')
         {
-        case 'B':
-            multiplier = 1LL;
-            break;
-        case 'K':
-            multiplier = 1LL << 10;
-            break;
-        case 'M':
-            multiplier = 1LL << 20;
-            break;
-        case 'G':
-            multiplier = 1LL << 30;
-            break;
-        default:
-            RETURN_IF_NOT(false, "Invalid nv_weight_streaming_budget: ", value_str, ". Invalid unit specifier '", unit,
-                          "'. Valid base-2 unit suffixes include: ", kValidWeightStreamingBudgetUnitSuffixes, ".");
+            const std::string_view percent_value = value_str.substr(0, value_str.size() - 1);
+            double percent{};
+            RETURN_IF_NOT(TryParseStringWithClassicLocale(percent_value, percent) && std::isfinite(percent),
+                          "Invalid nv_weight_streaming_budget: ", value_str,
+                          ". The weight streaming percentage must be between 0 and 100.");
+            RETURN_IF_NOT(percent >= 0.0 && percent <= 100.0, "Invalid nv_weight_streaming_budget: ", value_str,
+                          ". The weight streaming percentage must be between 0 and 100.");
+
+            budget.mode = TensorrtRtxWeightStreamingBudgetMode::Percent;
+            budget.percent = percent;
+            budget.bytes = 0;
+            budget.requested_value = value_str;
+            return nullptr;
         }
 
-        const std::string byte_value = value_str.substr(0, value_str.size() - 1);
-        double unit_count{};
-        RETURN_IF_NOT(TryParseStringWithClassicLocale(byte_value, unit_count) && std::isfinite(unit_count),
-                      "Invalid nv_weight_streaming_budget: ", value_str,
-                      ". Unit budgets must start with a non-negative number.");
-        RETURN_IF_NOT(unit_count >= 0.0, "Invalid nv_weight_streaming_budget: ", value_str,
-                      ". Unit budgets must be non-negative.");
+        if (IsAsciiAlpha(last_char))
+        {
+            RETURN_IF_NOT(value_str.size() < 2 || !IsAsciiAlpha(value_str[value_str.size() - 2]),
+                          "Invalid nv_weight_streaming_budget: ", value_str,
+                          ". Invalid unit specifier. Valid base-2 unit suffixes include: ",
+                          kValidWeightStreamingBudgetUnitSuffixes, ".");
 
-        const double byte_budget = unit_count * static_cast<double>(multiplier);
-        const double max_int64_exclusive = std::ldexp(1.0, 63);
-        RETURN_IF_NOT(byte_budget < max_int64_exclusive, "Invalid nv_weight_streaming_budget: ", value_str,
-                      ". Budget exceeds int64 byte range.");
+            const char unit = static_cast<char>(std::toupper(static_cast<unsigned char>(last_char)));
+            int64_t multiplier = 0;
+            switch (unit)
+            {
+            case 'B':
+                multiplier = 1LL;
+                break;
+            case 'K':
+                multiplier = 1LL << 10;
+                break;
+            case 'M':
+                multiplier = 1LL << 20;
+                break;
+            case 'G':
+                multiplier = 1LL << 30;
+                break;
+            default:
+                RETURN_IF_NOT(false, "Invalid nv_weight_streaming_budget: ", value_str, ". Invalid unit specifier '",
+                              unit, "'. Valid base-2 unit suffixes include: ", kValidWeightStreamingBudgetUnitSuffixes,
+                              ".");
+            }
 
-        budget.mode = TensorrtRtxWeightStreamingBudgetMode::Bytes;
-        budget.bytes = static_cast<int64_t>(byte_budget);
-        budget.percent = 0.0;
+            const std::string_view byte_value = value_str.substr(0, value_str.size() - 1);
+            double unit_count{};
+            RETURN_IF_NOT(TryParseStringWithClassicLocale(byte_value, unit_count) && std::isfinite(unit_count),
+                          "Invalid nv_weight_streaming_budget: ", value_str,
+                          ". Unit budgets must start with a non-negative number.");
+            RETURN_IF_NOT(unit_count >= 0.0, "Invalid nv_weight_streaming_budget: ", value_str,
+                          ". Unit budgets must be non-negative.");
+
+            const double byte_budget = unit_count * static_cast<double>(multiplier);
+            const double max_int64_exclusive = std::ldexp(1.0, 63);
+            RETURN_IF_NOT(byte_budget < max_int64_exclusive, "Invalid nv_weight_streaming_budget: ", value_str,
+                          ". Budget exceeds int64 byte range.");
+
+            budget.mode = TensorrtRtxWeightStreamingBudgetMode::Bytes;
+            budget.bytes = static_cast<int64_t>(byte_budget);
+            budget.percent = 0.0;
+            budget.requested_value = value_str;
+            return nullptr;
+        }
+
+        int64_t legacy_budget{};
+        RETURN_IF_ERROR(ParseStringWithClassicLocale(value_str, legacy_budget));
+        RETURN_IF_NOT(legacy_budget >= -1, "Invalid nv_weight_streaming_budget: ", legacy_budget,
+                      ". Valid values are 0 (disabled), -1 (automatic), "
+                      "1 (minimum VRAM), an explicit byte budget greater than 1, "
+                      "a byte budget with one of the base-2 suffixes ",
+                      kValidWeightStreamingBudgetUnitSuffixes, ", or a percentage budget from 0% to 100%.");
+
         budget.requested_value = value_str;
+        budget.percent = 0.0;
+        budget.bytes = 0;
+        if (legacy_budget == 0)
+        {
+            budget.mode = TensorrtRtxWeightStreamingBudgetMode::Disabled;
+        }
+        else if (legacy_budget == -1)
+        {
+            budget.mode = TensorrtRtxWeightStreamingBudgetMode::Automatic;
+        }
+        else if (legacy_budget == 1)
+        {
+            budget.mode = TensorrtRtxWeightStreamingBudgetMode::MinimumVram;
+        }
+        else
+        {
+            budget.mode = TensorrtRtxWeightStreamingBudgetMode::Bytes;
+            budget.bytes = legacy_budget;
+        }
+
         return nullptr;
     }
-
-    int64_t legacy_budget{};
-    RETURN_IF_ERROR(ParseStringWithClassicLocale(value_str, legacy_budget));
-    RETURN_IF_NOT(legacy_budget >= -1, "Invalid nv_weight_streaming_budget: ", legacy_budget,
-                  ". Valid values are 0 (disabled), -1 (automatic), "
-                  "1 (minimum VRAM), an explicit byte budget greater than 1, "
-                  "a byte budget with one of the base-2 suffixes ",
-                  kValidWeightStreamingBudgetUnitSuffixes, ", or a percentage budget from 0% to 100%.");
-
-    budget.requested_value = value_str;
-    budget.percent = 0.0;
-    budget.bytes = 0;
-    if (legacy_budget == 0)
+    catch (const std::exception& ex)
     {
-        budget.mode = TensorrtRtxWeightStreamingBudgetMode::Disabled;
+        return Ort::GetApi().CreateStatus(ORT_FAIL, ex.what());
     }
-    else if (legacy_budget == -1)
+    catch (...)
     {
-        budget.mode = TensorrtRtxWeightStreamingBudgetMode::Automatic;
+        return Ort::GetApi().CreateStatus(ORT_FAIL,
+                                          "Failed to parse nv_weight_streaming_budget due to an unknown exception.");
     }
-    else if (legacy_budget == 1)
-    {
-        budget.mode = TensorrtRtxWeightStreamingBudgetMode::MinimumVram;
-    }
-    else
-    {
-        budget.mode = TensorrtRtxWeightStreamingBudgetMode::Bytes;
-        budget.bytes = legacy_budget;
-    }
-
-    return nullptr;
 }
 
 template <typename TEnum>

@@ -45,7 +45,7 @@ std::filesystem::path get_executable_parent_path();
 void loadInputImage(float* pData, const char* imageFileName);
 void saveOutputImage(float* pData, const char* imageFileName);
 
-static const char* kNvTensorRTRTXExecutionProvider = "nv_tensorrt_rtx";
+static const char* kNvTensorRTRTXExecutionProvider = "NvTensorRTRTXExecutionProvider";
 
 void register_execution_providers(Ort::Env& env);
 Ort::ConstEpDevice find_trt_rtx_device(Ort::Env& env);
