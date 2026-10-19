@@ -18,15 +18,15 @@
 #include "nv_includes.h"
 
 // Weightless EPContext refit — SDK support (2 parts):
-//   PART 1 (build-time, HARD requirement): the new-parser API (IRefitterObserver/RefitRecord) and the
-//     weight-strip build capability require TensorRT-RTX >= 1.6. This minimum is enforced at CMake
-//     configure time (cmake/tensorrt_rtx.cmake) and re-checked as a hard #error via
-//     TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED (nv_includes.h); TensorRT-RTX < 1.6 is not supported and fails
-//     the build. (Below, only the RefitTransformKind enum is parser-specific; it is handled via
+//   PART 1 (build-time, HARD requirement): the parser API (IRefitterObserver/RefitRecord,
+//     IParser::setRefitObserver) and the weight-strip build capability require TensorRT-RTX >= 1.7. This
+//     minimum is enforced at CMake configure time (cmake/tensorrt_rtx.cmake) and re-checked as a hard
+//     #error via TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED (nv_includes.h); TensorRT-RTX < 1.7 is not supported
+//     and fails the build. (Below, only the RefitTransformKind enum is parser-specific; it is handled via
 //     plain-int constants + a guarded static_assert.)
-//   PART 2 (functional SDK floor, documented) + runtime handling of a failed weight-strip build: see
-//     tensorrt_rtx_execution_provider.cc (the kSTRIP_PLAN enable site and the
-//     buildSerializedNetwork == nullptr path). Known floor: SM120/RTX 5090 -> TensorRT-RTX >= 1.6.1.106.
+//   PART 2 (per-GPU-architecture support, decided by the builder) + runtime handling of a failed
+//     weight-strip build: see tensorrt_rtx_execution_provider.cc (the kSTRIP_PLAN enable site and the
+//     buildSerializedNetwork == nullptr path).
 
 #include <climits>
 #include <cstring>

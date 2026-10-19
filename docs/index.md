@@ -12,6 +12,7 @@ Documentation for the NVIDIA TensorRT RTX Execution Provider for ONNX Runtime.
 :caption: Get Started
 
 introduction
+prerequisites
 installation
 ```
 
@@ -21,6 +22,7 @@ installation
 
 build-guide
 integration-guide
+technical-notes
 contributing
 ```
 

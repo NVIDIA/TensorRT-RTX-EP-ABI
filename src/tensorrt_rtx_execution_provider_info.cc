@@ -17,13 +17,10 @@
 
 #include "tensorrt_rtx_provider_options.h"
 
-#include "utils/cuda/cuda_call.h"
 #include "utils/ep_utils.h"
 #include "utils/provider_options_utils.h"
 
 #include "onnxruntime_session_options_config_keys.h"
-
-#include <cuda_runtime.h>
 
 #include <limits>
 #include <sstream>
@@ -64,17 +61,6 @@ TensorrtRtxExecutionProviderInfo TensorrtRtxExecutionProviderInfo::FromProviderO
     void* external_data_bytestream = nullptr;
     THROW_IF_ERROR(
         ProviderOptionsParser{}
-            .AddValueParser(onnxruntime::tensorrt_rtx::provider_option_names::kDeviceId,
-                            [&info](const std::string& value_str) -> OrtStatus*
-                            {
-                                RETURN_IF_ERROR(ParseStringWithClassicLocale(value_str, info.device_id));
-                                int num_devices{};
-                                RETURN_IF_ERROR(CUDA_CALL(cudaGetDeviceCount(&num_devices)));
-                                RETURN_IF_NOT(0 <= info.device_id && info.device_id < num_devices,
-                                              "Invalid device ID: ", info.device_id,
-                                              ", must be between 0 (inclusive) and ", num_devices, " (exclusive).");
-                                return nullptr;
-                            })
             .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kHasUserComputeStream,
                                       info.has_user_compute_stream)
             .AddValueParser(onnxruntime::tensorrt_rtx::provider_option_names::kUserComputeStream,
@@ -151,7 +137,15 @@ TensorrtRtxExecutionProviderInfo TensorrtRtxExecutionProviderInfo::FromProviderO
             .AddAssignmentToReference(kOrtSessionOptionEpContextFilePath, info.ep_context_file_path)
             .AddAssignmentToReference(kOrtSessionOptionEpContextEmbedMode, info.ep_context_embed_mode)
             // .AddAssignmentToReference(kOrtSessionOptionsDisableModelCompile, info.disable_model_compile)
-
+            .AddValueParser(onnxruntime::tensorrt_rtx::provider_option_names::kTargetSM,
+                            [&info](const std::string& value_str) -> OrtStatus*
+                            {
+                                RETURN_IF_NOT(onnxruntime::tensorrt_rtx::IsTargetSMSupported(value_str),
+                                              "Invalid nv_target_sm value: '", value_str,
+                                              "'. Valid values are: sm86, sm89, sm120, sm121.");
+                                info.target_sm = value_str;
+                                return nullptr;
+                            })
             .Parse(options));  // add new provider option here.
 
     info.user_compute_stream = user_compute_stream;

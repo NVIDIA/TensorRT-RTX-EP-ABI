@@ -32,6 +32,9 @@ struct OrtStatus;
 namespace trt_rtx_ep
 {
 
+// Non-PCI VendorId for HOST_ACCESSIBLE allocator on non-integrated platform
+inline constexpr uint32_t kNonPCIVendorId = 0xFFFF10DEu;
+
 //!
 //! \brief Data transfer implementation for copying tensors between memory locations.
 //!

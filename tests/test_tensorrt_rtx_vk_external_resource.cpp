@@ -19,6 +19,7 @@
 #define VULKAN_HPP_NO_EXCEPTIONS
 #define VULKAN_HPP_NO_SMART_HANDLE
 #define VULKAN_HPP_NO_CONSTRUCTORS
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -73,7 +74,13 @@ protected:
         }
 
         interop_api_ = &Ort::GetInteropApi();
-        loader_.init();
+        auto get_instance_proc_addr =
+            dynamic_loader_.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+        if (!get_instance_proc_addr)
+        {
+            return;
+        }
+        loader_.init(get_instance_proc_addr);
 
         VkApplicationInfo app_info{};
         app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -116,11 +123,30 @@ protected:
             NvVkDevice nv_device;
             nv_device.physical_device = physical_device;
 
+            uint32_t extension_count = 0;
+            if (loader_.vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr) !=
+                VK_SUCCESS)
+            {
+                continue;
+            }
+            std::vector<VkExtensionProperties> extensions(extension_count);
+            if (loader_.vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count,
+                                                             extensions.data()) != VK_SUCCESS)
+            {
+                continue;
+            }
+            const bool has_pci_bus_info =
+                std::any_of(extensions.begin(), extensions.end(),
+                            [](const VkExtensionProperties& extension)
+                            {
+                                return std::strcmp(extension.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0;
+                            });
+
             VkPhysicalDevicePCIBusInfoPropertiesEXT pci_properties{};
             pci_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
             VkPhysicalDeviceVulkan11Properties id_properties{};
             id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
-            id_properties.pNext = &pci_properties;
+            id_properties.pNext = has_pci_bus_info ? &pci_properties : nullptr;
             VkPhysicalDeviceProperties2 properties2{};
             properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
             properties2.pNext = &id_properties;
@@ -155,7 +181,7 @@ protected:
                 }
 #else
                 auto pci_bus_id = ep_device.Device().Metadata().GetValue("pci_bus_id");
-                if (pci_bus_id)
+                if (has_pci_bus_info && pci_bus_id)
                 {
                     std::cmatch matches;
                     if (std::regex_match(pci_bus_id, matches, pci_bus_id_pattern))
@@ -461,6 +487,7 @@ protected:
         return semaphore;
     }
 
+    vk::detail::DynamicLoader dynamic_loader_;
     vk::detail::DispatchLoaderDynamic loader_;
     VkInstance instance_{};
     VkDevice device_{};

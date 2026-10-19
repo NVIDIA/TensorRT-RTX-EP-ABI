@@ -25,9 +25,9 @@ BEGIN
             VALUE "CompanyName",      "NVIDIA Corporation\0"
             VALUE "FileDescription",  "ONNX Runtime TensorRT RTX Execution Provider\0"
             VALUE "FileVersion",      "@TRT_RTX_EP_VERSION@\0"
-            VALUE "InternalName",     "onnxruntime_providers_nv_tensorrt_rtx\0"
+            VALUE "InternalName",     "@TRT_RTX_EP_OUTPUT_NAME@\0"
             VALUE "LegalCopyright",   "Copyright (C) 2025 NVIDIA Corporation. All rights reserved.\0"
-            VALUE "OriginalFilename", "onnxruntime_providers_nv_tensorrt_rtx.dll\0"
+            VALUE "OriginalFilename", "@TRT_RTX_EP_OUTPUT_NAME@.dll\0"
             VALUE "ProductName",      "ONNX Runtime TensorRT RTX Execution Provider\0"
             VALUE "ProductVersion",   "@TRT_RTX_EP_VERSION@\0"
         END

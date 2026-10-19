@@ -97,3 +97,28 @@
   word-break: normal;
   overflow-wrap: break-word;
 }
+
+/* Keep the generated provider-option reference within the content viewport. */
+.rst-content table.provider-options-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.wy-table-responsive table.provider-options-table td,
+.wy-table-responsive table.provider-options-table th,
+.wy-table-responsive table.provider-options-table code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.provider-options-table th:nth-child(2),
+.provider-options-table th:nth-child(3),
+.provider-options-table th:nth-child(4),
+.provider-options-table td:nth-child(2),
+.provider-options-table td:nth-child(3),
+.provider-options-table td:nth-child(4) {
+  padding-left: 6px;
+  padding-right: 6px;
+  text-align: center;
+}

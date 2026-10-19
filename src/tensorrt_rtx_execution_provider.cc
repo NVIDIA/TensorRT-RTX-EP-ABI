@@ -18,6 +18,7 @@
 #include "onnx_ctx_model_helper.h"
 #include "tensorrt_rtx_allocator.h"
 #include "tensorrt_rtx_execution_provider_stream_support.h"
+#include "tensorrt_rtx_profiler_metadata.h"
 #include "tensorrt_rtx_provider_factory.h"
 #include "tensorrt_rtx_provider_options.h"
 
@@ -50,6 +51,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -63,6 +65,8 @@
 #include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
+// VcppException(), for recognizing a delay-load failure raised as a structured exception.
+#include <delayimp.h>
 #define LIBTYPE HINSTANCE
 #define OPENLIB(libname) LoadLibrary(libname)
 #define LIBFUNC(lib, fn) GetProcAddress((lib), (fn))
@@ -85,6 +89,65 @@ const OrtLogger* g_logger = nullptr;
 
 namespace
 {
+//!
+//! \brief Converts a supported nv_target_sm string into its TensorRT RTX compute capability.
+//!
+//! \param sm SM identifier such as "sm86", "sm89", "sm120", or "sm121".
+//! \return The corresponding major/minor compute capability.
+//!
+static nvinfer1::ComputeCapability SmStringToComputeCapability(const std::string& sm)
+{
+    if (sm == "sm86")
+        return nvinfer1::ComputeCapability::kSM86;
+    if (sm == "sm89")
+        return nvinfer1::ComputeCapability::kSM89;
+    if (sm == "sm120")
+        return nvinfer1::ComputeCapability::kSM120;
+    if (sm == "sm121")
+        return nvinfer1::ComputeCapability::kSM121;
+    THROW("[NvTensorRTRTX EP] Unrecognized nv_target_sm value: ", sm);
+}
+
+#if defined(_WIN32)
+//!
+//! \brief Handles a delay-load failure and nothing else.
+//!
+//! \details The delay-load helper reports both a missing library and a missing entry point this
+//! way. Every other structured exception is a genuine fault and must not be swallowed here.
+//!
+static int DelayLoadFailureFilter(unsigned long exception_code)
+{
+    return (exception_code == static_cast<unsigned long>(VcppException(ERROR_SEVERITY_ERROR, ERROR_MOD_NOT_FOUND)) ||
+            exception_code == static_cast<unsigned long>(VcppException(ERROR_SEVERITY_ERROR, ERROR_PROC_NOT_FOUND)))
+               ? EXCEPTION_EXECUTE_HANDLER
+               : EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
+//!
+//! \brief Queries the TensorRT library version, reporting a failure to load it instead of dying.
+//!
+//! \details Kept free of C++ objects so SEH can guard the call: TensorRT is delay-loaded, and the
+//! delay-load helper signals a load failure with a structured exception that no catch clause sees.
+//! Left unguarded that terminates the host process silently.
+//!
+static int32_t TryGetInferLibVersion(bool& failed_to_load)
+{
+#if defined(_WIN32)
+    __try
+    {
+        return getInferLibVersion();
+    }
+    __except (DelayLoadFailureFilter(GetExceptionCode()))
+    {
+        failed_to_load = true;
+        return 0;
+    }
+#else
+    return getInferLibVersion();
+#endif
+}
+
 //!
 //! \brief Resolves a model-derived runtime-cache filename without making caching mandatory.
 //!
@@ -220,33 +283,7 @@ CreateOwnedExecutionContext(nvinfer1::ICudaEngine& engine, const std::filesystem
         return context;
     }
 
-    const int32_t stream_count = engine.getNbAuxStreams();
-    if (stream_count <= 0)
-    {
-        return context;
-    }
-
-    std::vector<cudaStream_t> streams;
-    streams.reserve(static_cast<size_t>(stream_count));
-    try
-    {
-        for (int32_t i = 0; i < stream_count; ++i)
-        {
-            cudaStream_t stream = nullptr;
-            CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-            streams.push_back(stream);
-        }
-    }
-    catch (...)
-    {
-        for (cudaStream_t stream : streams)
-        {
-            (void)cudaStreamDestroy(stream);
-        }
-        throw;
-    }
-
-    context.get_deleter().SetOwnedAuxStreams(std::move(streams));
+    context.get_deleter().EnsureAndBindOwnedAuxStreams(engine, *context);
     return context;
 }
 }  // namespace
@@ -281,6 +318,44 @@ void IExecutionContextDeleter::SetOwnedAuxStreams(std::vector<cudaStream_t>&& st
     aux_streams_ = std::move(streams);
 }
 
+std::vector<cudaStream_t> IExecutionContextDeleter::ReleaseOwnedAuxStreams() noexcept
+{
+    return std::move(aux_streams_);
+}
+
+void IExecutionContextDeleter::EnsureAndBindOwnedAuxStreams(nvinfer1::ICudaEngine& engine,
+                                                            nvinfer1::IExecutionContext& context)
+{
+    const int32_t stream_count = engine.getNbAuxStreams();
+    if (stream_count <= 0)
+    {
+        return;
+    }
+
+    const size_t retained_stream_count = aux_streams_.size();
+    aux_streams_.reserve(static_cast<size_t>(stream_count));
+    try
+    {
+        while (aux_streams_.size() < static_cast<size_t>(stream_count))
+        {
+            cudaStream_t stream = nullptr;
+            CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            aux_streams_.push_back(stream);
+        }
+    }
+    catch (...)
+    {
+        while (aux_streams_.size() > retained_stream_count)
+        {
+            (void)cudaStreamDestroy(aux_streams_.back());
+            aux_streams_.pop_back();
+        }
+        throw;
+    }
+
+    context.setAuxStreams(aux_streams_.data(), stream_count);
+}
+
 void IExecutionContextDeleter::BindOwnedAuxStreams(nvinfer1::IExecutionContext& context) noexcept
 {
     if (!aux_streams_.empty())
@@ -296,6 +371,13 @@ void IExecutionContextDeleter::DestroyAuxStreams() noexcept
         (void)cudaStreamDestroy(stream);
     }
     aux_streams_.clear();
+}
+
+nvinfer1::IExecutionContext*
+IExecutionContextDeleter::CreateExecutionContext(nvinfer1::ICudaEngine& engine) const noexcept
+{
+    // Reuse the retained runtime configuration when recreating a context after a weight-streaming budget change.
+    return engine.createExecutionContext(runtime_config_.get());
 }
 
 void IExecutionContextDeleter::SaveCache() noexcept
@@ -393,7 +475,7 @@ int64_t ResolveWeightStreamingBudget(nvinfer1::ICudaEngine& trt_engine,
     case TensorrtRtxWeightStreamingBudgetMode::Percent:
         return static_cast<int64_t>((requested_budget.percent / 100.0) * trt_engine.getStreamableWeightsSize());
     case TensorrtRtxWeightStreamingBudgetMode::Disabled:
-        return 0;
+        return trt_engine.getStreamableWeightsSize();
     }
 
     return 0;
@@ -401,9 +483,10 @@ int64_t ResolveWeightStreamingBudget(nvinfer1::ICudaEngine& trt_engine,
 
 OrtStatus* ApplyWeightStreamingBudget(nvinfer1::ICudaEngine& trt_engine,
                                       const TensorrtRtxWeightStreamingBudget& requested_budget,
-                                      const std::string& engine_name, const OrtLogger& logger, const OrtApi& ort_api)
+                                      const std::string& engine_name, const OrtLogger& logger, const OrtApi& ort_api,
+                                      bool apply_disabled = false)
 {
-    if (!requested_budget.IsEnabled())
+    if (!requested_budget.IsEnabled() && !apply_disabled)
     {
         return nullptr;
     }
@@ -483,6 +566,10 @@ void* OutputAllocator::reallocateOutputAsync(char const* /*tensorName*/, void* /
     // Some memory allocators return nullptr when allocating zero bytes, but TensorRT requires a non-null ptr
     // even for empty tensors, so allocate a dummy byte.
     size = (std::max)(size, static_cast<uint64_t>(1));
+    // Track the exact requested size on every call (even when the existing buffer is reused for a
+    // smaller request) — this is what getRequestedSize() reports, distinct from getSize()'s padded
+    // allocation size. See getRequestedSize() for why the distinction matters for copy bounds.
+    requested_size = size;
 
     // TensorRT requires the returned buffer to satisfy the requested alignment (e.g. 512 bytes for
     // data-dependent-shape outputs such as NonZero). The ORT allocator does not guarantee this alignment,
@@ -731,72 +818,21 @@ static std::unordered_map<std::string, std::string> ExtractLayerOnnxMapping(nvin
         {
             continue;
         }
-        const std::string_view info(info_raw);
-
-        // Extract "Name" value - first occurrence in the JSON.
-        const std::string name_key = "\"Name\": \"";
-        const auto name_start = info.find(name_key);
-        if (name_start == std::string::npos)
-        {
-            continue;
-        }
-        const auto name_val_start = name_start + name_key.size();
-        const auto name_val_end = info.find('"', name_val_start);
-        if (name_val_end == std::string::npos)
-        {
-            continue;
-        }
-        const std::string_view layer_name = info.substr(name_val_start, name_val_end - name_val_start);
-
-        // Extract "Metadata" value.
-        const std::string meta_key = "\"Metadata\": \"";
-        const auto meta_start = info.find(meta_key);
-        if (meta_start == std::string::npos)
-        {
-            continue;
-        }
-        const auto meta_val_start = meta_start + meta_key.size();
-        const auto meta_val_end = info.find('"', meta_val_start);
-        if (meta_val_end == std::string::npos)
-        {
-            continue;
-        }
-        const std::string_view metadata = info.substr(meta_val_start, meta_val_end - meta_val_start);
-        if (metadata.empty())
+        // getLayerInformation(kJSON) returns JSON-escaped metadata. Decode the JSON strings before
+        // interpreting TRT/Myelin's U+001E/U+001F fused-node delimiters.
+        std::string layer_name;
+        std::string metadata;
+        if (!profiler_metadata::GetJsonStringField(info_raw, "Name", layer_name) ||
+            !profiler_metadata::GetJsonStringField(info_raw, "Metadata", metadata))
         {
             continue;
         }
 
-        // Metadata format: "[ONNX Layer: /node1]\x1f[ONNX Layer: /node2]..."
-        // Split on unit separator (\x1f = ASCII 31), extract node names, join with ", ".
-        std::string onnx_nodes;
-        constexpr std::string_view prefix = "[ONNX Layer: ";
-        const char delim = '\x1f';
-        std::string_view::size_type pos = 0;
-        while (pos < metadata.size())
-        {
-            auto end = metadata.find(delim, pos);
-            if (end == std::string_view::npos)
-            {
-                end = metadata.size();
-            }
-            const std::string_view token = metadata.substr(pos, end - pos);
-            // token looks like "[ONNX Layer: /conv1/Conv]"
-            if (token.size() > prefix.size() + 1 && token.substr(0, prefix.size()) == prefix)
-            {
-                const std::string_view node_name = token.substr(prefix.size(), token.size() - prefix.size() - 1);
-                if (!onnx_nodes.empty())
-                {
-                    onnx_nodes += ", ";
-                }
-                onnx_nodes += node_name;
-            }
-            pos = (end == metadata.size()) ? end : end + 1;
-        }
+        const std::string onnx_nodes = profiler_metadata::ExtractOnnxNodeNames(metadata);
 
         if (!onnx_nodes.empty())
         {
-            mapping.emplace(layer_name, std::move(onnx_nodes));
+            mapping.emplace(std::move(layer_name), onnx_nodes);
         }
     }
 
@@ -1442,7 +1478,7 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromPrecompiledEng
     std::unique_ptr<EPContextNodeReader> ep_context_node_reader = std::make_unique<EPContextNodeReader>(
         *ep, logger_, &trt_engine, runtime_.get(), model_path_, compute_capability_, weight_stripped_engine_enable_,
         onnx_model_folder_path_, onnx_model_bytestream_, onnx_model_bytestream_size_, onnx_external_data_bytestream_,
-        onnx_external_data_bytestream_size_, detailed_build_log_);
+        onnx_external_data_bytestream_size_, detailed_build_log_, !weight_streaming_budget_.IsEnabled());
     RETURN_IF_ERROR(ep_context_node_reader->GetEpContextFromGraph(*graph));
     RETURN_IF_ERROR(
         ApplyWeightStreamingBudget(*trt_engine, weight_streaming_budget_, fused_node_name, ep->logger_, ep->ort_api));
@@ -1506,6 +1542,7 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromPrecompiledEng
         std::string message = "NvTensorRTRTX EP could not build execution context for fused node: " + fused_node_name;
         return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
     }
+    RETURN_IF_ERROR(ep_context_node_reader->LoadDeferredWeights(ep->stream_));
 
     if (ep->profiling_enable_)
     {
@@ -1546,6 +1583,17 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromPrecompiledEng
         auto type_info = output.TypeInfo();
         output_types[output_name] = type_info.GetTensorTypeAndShapeInfo().GetElementType();
     }
+    const int32_t num_optimization_profiles = trt_engine->getNbOptimizationProfiles();
+    const bool engine_has_multiple_profiles = num_optimization_profiles > 1;
+    multi_profile_enable_ = multi_profile_enable_ || engine_has_multiple_profiles;
+    if (engine_has_multiple_profiles)
+    {
+        const std::string message = "[NvTensorRTRTX EP] EPContext engine for fused node '" + fused_node_name +
+                                    "' contains " + std::to_string(num_optimization_profiles) +
+                                    " optimization profiles; enabling per-run profile selection.";
+        RETURN_IF_ERROR(ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
+                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+    }
     engines_.emplace(fused_node_name, std::move(trt_engine));
     contexts_.emplace(fused_node_name, std::move(trt_context));
     input_info_[fused_node_name].push_back(input_indexes);
@@ -1560,6 +1608,7 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromPrecompiledEng
     compute_state->input_info = input_info_[fused_node_name];
     compute_state->output_info = output_info_[fused_node_name];
     compute_state->tensorrt_mu_ptr = &tensorrt_rtx_mu_;
+    compute_state->multi_profile_enable = engine_has_multiple_profiles;
     compute_state->is_dynamic_shape = is_dynamic_shape_context;
 
     ep->compute_states_for_ep_context_[fused_node_name] = std::move(compute_state);
@@ -1568,6 +1617,126 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromPrecompiledEng
 
     return nullptr;
 }
+
+// Weightless capture — uses the TRT-RTX ONNX parser refit-observer API (IRefitterObserver /
+// RefitRecord / IParser::setRefitObserver), guaranteed by the enforced TensorRT-RTX >= 1.7 minimum
+// (nv_includes.h / cmake). The TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED guard is retained defensively.
+#if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
+namespace
+{
+
+//! \brief Deep-copies every RefitRecord emitted during the compile parse into an owned
+//!        trt_rtx_ep::WeightlessRefitRecord list. RefitRecord's pointer fields are parser-owned
+//!        and only valid for the duration of onRefittableWeight(), hence the copy.
+//!
+//! Parse-time records are a candidate superset of the built engine's refittable weights (the
+//! builder may fold or absorb some), so consumers skip records the engine's IRefitter does not
+//! report in getAllWeights and must verify coverage themselves: on TensorRT-RTX a weight-stripped
+//! engine reports no missing weights and refitCudaEngine() succeeds even when nothing was set, so
+//! the refitter is not a coverage check (see WeightlessRefitEngineImpl).
+class WeightlessRefitCaptureObserver : public nvonnxparser::IRefitterObserver
+{
+public:
+    std::vector<trt_rtx_ep::WeightlessRefitRecord> records;
+    //! Set when copying a record threw (allocation failure). The interface callback is noexcept, so
+    //! the exception must be absorbed here; the capture is then incomplete and the caller fails the
+    //! compile instead of persisting a partial table.
+    bool capture_failed{false};
+
+    void onRefittableWeight(nvonnxparser::RefitRecord const& src) noexcept override
+    {
+        if (capture_failed)
+        {
+            return;
+        }
+        try
+        {
+            Capture(src);
+        }
+        catch (...)
+        {
+            capture_failed = true;
+            records.clear();
+        }
+    }
+
+private:
+    void Capture(nvonnxparser::RefitRecord const& src)
+    {
+        // `src` is the parser-owned RefitRecord (camelCase SDK fields); `copy` is our owned
+        // trt_rtx_ep::WeightlessRefitRecord (snake_case). Keeping the two variable names distinct avoids
+        // the identical field names colliding.
+        trt_rtx_ep::WeightlessRefitRecord copy;
+        copy.trt_name = src.trtName != nullptr ? src.trtName : "";
+        copy.kind = static_cast<int32_t>(src.kind);
+        copy.onnx_dtype = src.onnxDtype;
+        copy.trt_dtype = static_cast<int32_t>(src.trtDtype);
+        copy.count = src.count;
+        copy.epsilon = src.epsilon;
+        copy.source_onnx_names.reserve(static_cast<size_t>(src.nbSources));
+        for (int32_t i = 0; i < src.nbSources; ++i)
+        {
+            copy.source_onnx_names.emplace_back(src.sourceOnnxNames[i] != nullptr ? src.sourceOnnxNames[i] : "");
+        }
+        if (src.fixedData != nullptr && src.fixedDataSize > 0)
+        {
+            const uint8_t* bytes = static_cast<const uint8_t*>(src.fixedData);
+            copy.fixed_data.assign(bytes, bytes + src.fixedDataSize);
+        }
+        records.push_back(std::move(copy));
+    }
+};
+
+//! \brief The weight names the engine's refitter reports as refittable (IRefitter::getAllWeights),
+//!        as an owned set. Null entries are skipped rather than turned into std::string.
+std::unordered_set<std::string> EngineRefittableWeightNames(nvinfer1::IRefitter& refitter)
+{
+    const int32_t num_weights = refitter.getAllWeights(0, nullptr);
+    std::vector<const char*> names(static_cast<size_t>(num_weights > 0 ? num_weights : 0));
+    if (!names.empty())
+    {
+        refitter.getAllWeights(num_weights, names.data());
+    }
+    std::unordered_set<std::string> result;
+    for (const char* name : names)
+    {
+        if (name != nullptr)
+        {
+            result.emplace(name);
+        }
+    }
+    return result;
+}
+
+//! \brief Drop records whose trtName the built engine's refitter does not report. Parse-time
+//!        records are a superset of the engine's refittable set; filtering here (when a live
+//!        engine is available) keeps the persisted ep_refit_table minimal and avoids the export
+//!        guard rejecting sources of weights the builder folded away. In compile-only sessions no
+//!        engine is deserialized and the superset is persisted as-is; the load-time replay skips
+//!        unknown names with the same rule.
+//! \return The number of weights the engine reports as refittable (0 when the engine needs no
+//!         refit at all, e.g. every candidate was folded), or std::nullopt if no refitter could be
+//!         created (records are then left unfiltered).
+std::optional<size_t> FilterRefitRecordsToEngine(std::vector<trt_rtx_ep::WeightlessRefitRecord>& records,
+                                                 nvinfer1::ICudaEngine& engine, TensorrtRtxLogger& trt_logger)
+{
+    auto refitter = std::unique_ptr<nvinfer1::IRefitter>(nvinfer1::createInferRefitter(engine, trt_logger));
+    if (!refitter)
+    {
+        return std::nullopt;
+    }
+    const std::unordered_set<std::string> engine_names = EngineRefittableWeightNames(*refitter);
+    records.erase(std::remove_if(records.begin(), records.end(),
+                                 [&](const trt_rtx_ep::WeightlessRefitRecord& r)
+                                 {
+                                     return engine_names.find(r.trt_name) == engine_names.end();
+                                 }),
+                  records.end());
+    return engine_names.size();
+}
+
+}  // namespace
+#endif  // TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
 
 OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     OrtEp* this_ptr, const OrtGraph* graph, const OrtNode* fused_node,
@@ -1706,8 +1875,24 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
         return ort_api.CreateStatus(ORT_EP_FAIL,
                                     "[NvTensorRTRTX EP] createBuilderConfig returned null; cannot build engine.");
     }
+#if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
+    // Declared before the parser: the parser keeps a raw pointer to the observer, so the observer
+    // must outlive it (destruction runs in reverse declaration order).
+    WeightlessRefitCaptureObserver parse_refit_observer;
+#endif
     auto trt_parser =
         tensorrt_ptr::unique_pointer<nvonnxparser::IParser>(nvonnxparser::createParser(*trt_network, trt_logger));
+
+#if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
+    // Capture the weightless refit records during the parse the compile already runs — no
+    // throwaway engine deserialize and no second model traversal. The records are a candidate
+    // superset of the built engine's refittable weights; they are filtered against the engine
+    // below (or at load time in compile-only sessions).
+    if (weight_stripped_engine_enable_)
+    {
+        trt_parser->setRefitObserver(&parse_refit_observer);
+    }
+#endif
 
     trt_parser->loadModelProto(string_buf.data(), string_buf.size(), model_path_);
     for (auto const& userWeight : userWeights)
@@ -1732,7 +1917,14 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     {
         trt_config->setNbComputeCapabilities(kDefaultNumComputeCapabilities);
     }
-    trt_config->setComputeCapability(nvinfer1::ComputeCapability::kCURRENT, 0);
+    if (target_sm_.empty())
+    {
+        trt_config->setComputeCapability(nvinfer1::ComputeCapability::kCURRENT, 0);
+    }
+    else
+    {
+        trt_config->setComputeCapability(SmStringToComputeCapability(target_sm_), 0);
+    }
 
     int num_inputs = trt_network->getNbInputs();
     int num_outputs = trt_network->getNbOutputs();
@@ -1864,10 +2056,10 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
                     if (dim_value == -1)
                     {
                         has_implicit_profile = true;
-                        // TODO: this is needed until we have a wildcard in the API to support dynamic
+                        // TODO(maximilianm) this is needed until we have a wildcard in the API to support dynamic
                         // shapes
                         profile_min_shapes_[input_name][0][idx_dim] = 0;
-                        // TODO: This can be buggy since shape inference can fail with 1 being used as
+                        // TODO(maximilianm) This can be buggy since shape inference can fail with 1 being used as
                         // optimal shape
                         //        [2025-04-04 15:41:58   ERROR] IBuilder::buildSerializedNetwork: Error Code 4: Internal
                         //        Error (kOPT values for profile 0 violate shape constraints: /conv1/Conv: spatial
@@ -1940,10 +2132,10 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
 
     if (weight_stripped_engine_enable_)
     {
-        // Weightless SDK-support guard, PART 2 (functional floor): kSTRIP_PLAN needs a per-GPU-arch
-        // functional TensorRT-RTX floor (e.g. SM120/RTX 5090 -> >= 1.6.1.106) that the compile-time
-        // parser-version check (weightless_refit.cc) cannot see. If the build below fails on an
-        // unsupported arch, PART 3 (the buildSerializedNetwork failure path) surfaces the floor.
+        // Weightless SDK-support guard, PART 2 (functional support): whether kSTRIP_PLAN can be honored
+        // for the target GPU architecture is decided by the builder, which the compile-time version
+        // check (weightless_refit.cc) cannot see. If the build below fails on an unsupported arch,
+        // PART 3 (the buildSerializedNetwork failure path) reports the detected environment.
         trt_config->setFlag(nvinfer1::BuilderFlag::kSTRIP_PLAN);
         std::string message = "[NvTensorRTRTX EP] STRIP_PLAN is enabled";
         Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
@@ -1987,6 +2179,10 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
                                           std::filesystem::path(ToPathString(model_path_)));
     }
 
+    auto ep_ctx_node_helper = std::make_unique<EPContextNodeHelper>(*ep, graph, fused_node);
+    RETURN_IF_ERROR(ep_ctx_node_helper->InitializeEngineOutput(cache_path_, cache_prefix_, dump_ep_context_model_,
+                                                               ep_context_embed_mode_));
+
     {
         auto lock = GetApiLock();
         // Build engine
@@ -1996,9 +2192,20 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             engine_build_start = std::chrono::steady_clock::now();
         }
 
-        std::unique_ptr<nvinfer1::IHostMemory> serialized_engine{
-            trt_builder->buildSerializedNetwork(*trt_network, *trt_config)};
-        if (serialized_engine == nullptr)
+        bool engine_built = false;
+        if (ep_ctx_node_helper->StreamsEngineOutput())
+        {
+            engine_built = trt_builder->buildSerializedNetworkToStream(*trt_network, *trt_config,
+                                                                       ep_ctx_node_helper->GetEngineStreamWriter());
+        }
+        else
+        {
+            std::unique_ptr<nvinfer1::IHostMemory> serialized_engine{
+                trt_builder->buildSerializedNetwork(*trt_network, *trt_config)};
+            engine_built = serialized_engine != nullptr;
+            ep_ctx_node_helper->SetSerializedEngine(std::move(serialized_engine));
+        }
+        if (!engine_built)
         {
             std::string message = "[NvTensorRTRTX EP] Failed to create serialized engine for fused node: ";
             if (node_name != nullptr)
@@ -2007,13 +2214,12 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             }
             // Weightless SDK-support guard, PART 3 (runtime handling): a weight-stripped (kSTRIP_PLAN)
             // build can fail here for two very different reasons -- a genuine per-GPU-arch weight-strip
-            // capability gap (a Myelin functional floor, e.g. sm_120 / RTX 50-series -> TensorRT-RTX >=
-            // 1.6.1.106) OR an environmental CUDA failure unrelated to weight-strip (e.g. CUDA-in-Graphics
-            // / D3D12-Vulkan interop, where cudaMallocAsync can fail). We cannot tell them apart from the
-            // TRT error, so report the DETECTED environment (compute capability + runtime version) and
-            // only point at the sm_120 floor when actually on sm_120; otherwise point at the environmental
-            // path. (getInferLibVersion() exposes only MAJOR.MINOR.PATCH, not the build number, so we
-            // report the version and name the floor rather than auto-deciding the exact 1.6.1.106 build.)
+            // capability gap in the builder OR an environmental CUDA failure unrelated to weight-strip
+            // (e.g. CUDA-in-Graphics / D3D12-Vulkan interop, where cudaMallocAsync can fail). We cannot
+            // tell them apart from the TRT error, so report the DETECTED environment (compute capability
+            // + runtime version) and name the 1.7 minimum on sm_120, where older SDKs lacked weight-strip
+            // support; otherwise point at the environmental path. (getInferLibVersion() exposes only
+            // MAJOR.MINOR.PATCH, not the build number.)
             if (weight_stripped_engine_enable_)
             {
                 const int v = trt_version_;
@@ -2025,7 +2231,7 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
                 if (compute_capability_ == "120")
                 {
                     message += " Weight-stripping on sm_120 (Blackwell / RTX 50-series) requires TensorRT-RTX "
-                               ">= 1.6.1.106 -- verify the installed version meets this floor.";
+                               ">= 1.7 -- verify the installed version meets this minimum.";
                 }
                 else
                 {
@@ -2036,31 +2242,31 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             }
             return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
         }
+        RETURN_IF_ERROR(ep_ctx_node_helper->FinalizeEngineOutput());
+        const size_t serialized_engine_size = ep_ctx_node_helper->GetEngineSize();
+        const auto& engine_header = ep_ctx_node_helper->GetEngineHeader();
 
         std::string engine_id;
         // Capture engine header (first 64 bytes) for compatibility validation
-        if (serialized_engine->size() < kTensorRTEngineHeaderSize)
+        if (serialized_engine_size < kTensorRTEngineHeaderSize || engine_header.size() < kTensorRTEngineHeaderSize)
         {
             std::string message = "[NvTensorRTRTX EP] Engine header invalid (too small or corrupted): " +
-                                  std::to_string(serialized_engine->size()) + " bytes";
+                                  std::to_string(serialized_engine_size) + " bytes";
             Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
                                                         message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
             return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
         }
         else
         {
-            std::string engine_header_hex = BinaryToHexString(serialized_engine->data(), kTensorRTEngineHeaderSize);
-            if (node_name != nullptr && node_name[0] != '\0')
+            std::string engine_header_hex = BinaryToHexString(engine_header.data(), kTensorRTEngineHeaderSize);
+            // GraphPartitioner synthesizes a non-empty fused-node name before invoking the EP:
+            // https://github.com/microsoft/onnxruntime/blob/0c32e39a151211fdac6bf7fb9ed0ae1cf42426a5/onnxruntime/core/framework/graph_partitioner.cc#L602-L604
+            if (node_name == nullptr || node_name[0] == '\0')
             {
-                engine_id = node_name;
+                return ort_api.CreateStatus(ORT_EP_FAIL,
+                                            "[NvTensorRTRTX EP] GraphPartitioner produced an unnamed fused node.");
             }
-            else
-            {
-                uint64_t engine_hash[2] = {0, 0};
-                MurmurHash3_x64_128(serialized_engine->data(), static_cast<int>(serialized_engine->size()), 0,
-                                    &engine_hash);
-                engine_id = BinaryToHexString(engine_hash, sizeof(engine_hash));
-            }
+            engine_id = node_name;
 
             engine_headers_[engine_id] = engine_header_hex;
         }
@@ -2069,8 +2275,9 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
         // and GPU context creation — the serialized engine is already saved as an EP context node.
         if (!compile_only_mode_)
         {
+            const auto& serialized_engine = ep_ctx_node_helper->GetEngineData();
             trt_engine = std::unique_ptr<nvinfer1::ICudaEngine>(
-                runtime_->deserializeCudaEngine(serialized_engine->data(), serialized_engine->size()));
+                runtime_->deserializeCudaEngine(serialized_engine.data(), serialized_engine.size()));
             if (trt_engine == nullptr)
             {
                 std::string message =
@@ -2143,62 +2350,86 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
         }
 
         // dump EP context node model
-        std::unique_ptr<EPContextNodeHelper> ep_ctx_node_helper =
-            std::make_unique<EPContextNodeHelper>(*ep, graph, fused_node);
         if (dump_ep_context_model_)
         {
-            // "ep_cache_context" node attribute should be a relative path to context model directory
-
-            std::filesystem::path cache_path;
-
-            // Customize cache prefix if assigned
-            const char* name = nullptr;
-            THROW_IF_ERROR(ort_api.Node_GetName(fused_node, &name));
-            if (!cache_prefix_.empty())
-            {
-                // Generate cache suffix in case user would like to customize cache prefix
-                cache_path = GetCachePath(cache_path_, cache_prefix_ + "_" + std::string(name) + ".engine");
-            }
-            else
-            {
-                cache_path = GetCachePath(cache_path_, std::string(name) + ".engine");
-            }
             // NV TRT EP per default generates hardware compatible engines for any RTX device with compute capability >
             // 80
             std::string compute_capability_hw_compat = "80+";
 
-            char* serialized_engine_pointer = reinterpret_cast<char*>(serialized_engine->data());
-            size_t serialized_engine_size = serialized_engine->size();
-
-            // Capture the weightless refit table now, while the original ONNX structure
-            // (string_buf) and weights (userWeights) built above are still in scope. Only
-            // meaningful for weight-stripped (kSTRIP_PLAN) engines; an ordinary engine has no
-            // refittable weights to observe. A capture failure is logged and treated as
-            // "no weightless table" rather than failing the whole compile -- the EPContext model
-            // is still produced and remains usable via the legacy RefitEngineImpl path.
+            // The weightless refit table comes from the parse-time observer attached to the
+            // compile parse above — no throwaway engine deserialize and no refit traversal.
+            // Only meaningful for weight-stripped (kSTRIP_PLAN) engines. For those the table is
+            // always persisted, even when empty: it is the marker the load path keys on, and an
+            // engine whose refittable weights were all folded by the builder legitimately has an
+            // empty one (the load-time coverage check then has nothing to cover).
             std::vector<trt_rtx_ep::WeightlessRefitRecord> refit_records;
+            bool persist_refit_table = false;
+            // True once refit_records has been filtered against a live built engine's IRefitter (i.e.
+            // trt_engine != nullptr below), which only happens outside compile-only mode. Passed to
+            // CreateEPContextNode so it knows whether a record's missing source is a real bug (filtering
+            // ran, so every remaining record is expected to be needed) or an artifact of not being able to
+            // filter (compile-only: the parser's unfiltered superset may include folded-away weights).
+            bool refit_table_filtered_against_engine = false;
+#if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
             if (weight_stripped_engine_enable_)
             {
-                auto capture_status = ep->CaptureWeightlessRefitTable(*serialized_engine, string_buf, userWeights,
-                                                                      detailed_build_log_, refit_records);
-                if (capture_status != nullptr)
+                if (parse_refit_observer.capture_failed)
                 {
-                    std::string message = std::string("[NvTensorRTRTX EP] Failed to capture the weightless refit "
-                                                      "table; this EPContext model will require the original "
-                                                      "ONNX model at load time instead: ") +
-                                          std::string(ort_api.GetErrorMessage(capture_status));
-                    ort_api.ReleaseStatus(capture_status);
+                    return ort_api.CreateStatus(
+                        ORT_EP_FAIL, "[NvTensorRTRTX EP] Failed to capture the weightless refit table during "
+                                     "the compile parse (allocation failure); the weight-stripped EPContext "
+                                     "model would not be loadable.");
+                }
+                persist_refit_table = true;
+                refit_records = std::move(parse_refit_observer.records);
+                std::optional<size_t> engine_refittable_count;
+                if (trt_engine != nullptr)
+                {
+                    engine_refittable_count = FilterRefitRecordsToEngine(refit_records, *trt_engine,
+                                                                         GetTensorrtRtxLogger(detailed_build_log_));
+                    // FilterRefitRecordsToEngine returns nullopt (records left unfiltered) when
+                    // createInferRefitter fails -- only claim the table was filtered when it actually was,
+                    // so CreateEPContextNode doesn't apply the strict hard-abort path to a still-unfiltered
+                    // superset.
+                    refit_table_filtered_against_engine = engine_refittable_count.has_value();
+                }
+                if (refit_records.empty())
+                {
+                    const bool engine_needs_no_refit =
+                        engine_refittable_count.has_value() && *engine_refittable_count == 0;
+                    Ort::ThrowOnError(ort_api.Logger_LogMessage(
+                        &ep->logger_,
+                        engine_needs_no_refit ? OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE
+                                              : OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                        engine_needs_no_refit
+                            ? "[NvTensorRTRTX EP] The weight-stripped engine reports no refittable weights; an empty "
+                              "weightless refit table is persisted."
+                            : "[NvTensorRTRTX EP] The compile parse emitted no weightless refit records; the EPContext "
+                              "model will fail to load under the weightless option unless the engine has no "
+                              "refittable weights.",
+                        ORT_FILE, __LINE__, __FUNCTION__));
+                }
+                else if (engine_refittable_count.has_value() && refit_records.size() < *engine_refittable_count)
+                {
+                    // Partial coverage: some, but not all, of the engine's refittable weights were named by
+                    // the compile parse. This is the same shape of gap the original bug hit ("124 of 245") --
+                    // catch it here, at compile time, with both counts in hand, instead of only at load time
+                    // via WeightlessRefitEngineImpl's coverage check below.
+                    const std::string message =
+                        "[NvTensorRTRTX EP] The weightless refit table covers " + std::to_string(refit_records.size()) +
+                        " of " + std::to_string(*engine_refittable_count) +
+                        " refittable engine weight(s); the EPContext model will fail to load unless this "
+                        "compile-time coverage gap is expected.";
                     Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_,
                                                                 OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
                                                                 message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
-                    refit_records.clear();
                 }
             }
+#endif
 
             auto status = ep_ctx_node_helper->CreateEPContextNode(
-                cache_path, serialized_engine_pointer, serialized_engine_size, ep_context_embed_mode_,
                 compute_capability_hw_compat, std::filesystem::path(ToPathString(model_path_)), refit_records,
-                ep_context_node);
+                persist_refit_table, refit_table_filtered_against_engine, ep_context_node);
             if (status != nullptr)
             {
                 return status;
@@ -2307,7 +2538,6 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
         auxiliary_streams_,
         cuda_graph_enable_,
         multi_profile_enable_,
-        trt_profile_index_,
         is_dynamic_shape_context,
         cache_prefix_,
         "",     // cache_suffix
@@ -2576,7 +2806,7 @@ bool TensorrtRtxExecutionProvider::DetectTensorRTGraphCycles(SubGraphCollection_
 TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionProviderFactory& factory,
                                                            const std::string& name,
                                                            const OrtSessionOptions& session_options,
-                                                           const OrtLogger& logger)
+                                                           const OrtLogger& logger, int device_id)
     : OrtEp{}
     , ApiPtrs{static_cast<const ApiPtrs&>(factory)}
     , factory_{factory}
@@ -2595,8 +2825,16 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     ReleaseNodeComputeInfos = ReleaseNodeComputeInfosImpl;
     CreateSyncStreamForDevice = CreateSyncStreamForDeviceImpl;
     GetCompiledModelCompatibilityInfo = GetCompiledModelCompatibilityInfoImpl;
+    IsConcurrentRunSupported = IsConcurrentRunSupportedImpl;
+    SetDynamicOptions = SetDynamicOptionsImpl;
     OnRunStart = OnRunStartImpl;
     OnRunEnd = OnRunEndImpl;
+    // OrtEp::Sync was added in ORT 1.25. OrtEp{} leaves the callback null when
+    // this plugin negotiates with an older host.
+    if (ort_version_supported >= 25)
+    {
+        Sync = SyncImpl;
+    }
     // Initialize the execution provider.
 
     // initializing logging
@@ -2611,6 +2849,47 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     g_ep_api = &ep_api;
     g_model_editor_api = &model_editor_api;
     g_logger = &logger_;
+
+    // EPContext I/O callbacks are experimental and may not be exported by an older host.
+    // Resolve them dynamically so the plugin keeps its existing file fallback on those hosts.
+    if (NegotiatedOrtApiVersion() >= 28)
+    {
+        const auto get_experimental = [this](const char* function_name)
+        {
+            return ort_api.GetExperimentalFunction(function_name);
+        };
+        const auto get_context_config =
+            reinterpret_cast<OrtExperimental_OrtEpApi_SessionOptions_GetEpContextConfig_SinceV28_Fn>(
+                get_experimental(kOrtExperimental_OrtEpApi_SessionOptions_GetEpContextConfig_SinceV28_FnName));
+        const auto release_context_config =
+            reinterpret_cast<OrtExperimental_OrtEpApi_ReleaseEpContextConfig_SinceV28_Fn>(
+                get_experimental(kOrtExperimental_OrtEpApi_ReleaseEpContextConfig_SinceV28_FnName));
+        const auto get_read_callback =
+            reinterpret_cast<OrtExperimental_OrtEpApi_EpContextConfig_GetEpContextDataReadFunc_SinceV28_Fn>(
+                get_experimental(kOrtExperimental_OrtEpApi_EpContextConfig_GetEpContextDataReadFunc_SinceV28_FnName));
+        const auto get_write_callback =
+            reinterpret_cast<OrtExperimental_OrtEpApi_EpContextConfig_GetEpContextDataWriteFunc_SinceV28_Fn>(
+                get_experimental(kOrtExperimental_OrtEpApi_EpContextConfig_GetEpContextDataWriteFunc_SinceV28_FnName));
+        if (get_context_config != nullptr && release_context_config != nullptr && get_read_callback != nullptr &&
+            get_write_callback != nullptr)
+        {
+            OrtEpContextConfig* context_config = nullptr;
+            Ort::ThrowOnError(get_context_config(&session_options_, &context_config));
+            try
+            {
+                Ort::ThrowOnError(
+                    get_read_callback(context_config, &ep_context_data_read_func_, &ep_context_data_read_state_));
+                Ort::ThrowOnError(
+                    get_write_callback(context_config, &ep_context_data_write_func_, &ep_context_data_write_state_));
+            }
+            catch (...)
+            {
+                release_context_config(context_config);
+                throw;
+            }
+            release_context_config(context_config);
+        }
+    }
 
     // Register this EP's logger with the TRT singleton so it always points to a live instance.
     GetTensorrtRtxLogger(false).set_ort_logger(&logger_, &ort_api);
@@ -2653,6 +2932,7 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     }
 
     info_ = TensorrtRtxExecutionProviderInfo::FromProviderOptions(provider_options);
+    info_.device_id = device_id;
 
     for (size_t i = 0; i < num_entries; ++i)
     {
@@ -2724,44 +3004,58 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
 
     device_id_ = info_.device_id;
 
-    if (!info_.has_user_compute_stream)
-    {
-        // If the app is passing in a compute stream, it already has initialized cuda and created a context.
-        // Calling cudaSetDevice() will set the default context in the current thread
-        // which may not be compatible with the stream created by the app.
-        CUDA_CALL_THROW(cudaSetDevice(device_id_));
-    }
+    // A compile-only session never runs inference, so it needs no device, stream, or CUDA
+    // context -- but only if the caller named the target architecture, since resolving
+    // kCURRENT instead requires a live GPU. Together these make AOT compilation possible on
+    // a machine with no GPU (or in a sandbox with no driver access). Compile-only intent
+    // comes from ORT's generic session.compile_only flag, set by OrtCompileAPI::CompileModel().
+    const bool skip_device_init = info_.compile_only_mode && !info_.target_sm.empty();
 
-    cudaDeviceProp prop;
-    CUDA_CALL_THROW(cudaGetDeviceProperties(&prop, device_id_));
-    auto cc = prop.major * 10 + prop.minor;
-    if (!(cc == 86 || cc == 89 || cc >= 120))
+    if (!skip_device_init)
     {
-        std::string message = "[NvTensorRTRTX EP] The execution provider only supports RTX devices with compute "
-                              "capabilities 86, 89, 120 and above";
-        Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                    message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
-    }
-    compute_capability_ = GetComputeCapability(prop);
+        if (!info_.has_user_compute_stream)
+        {
+            // If the app is passing in a compute stream, it already has initialized cuda and created a context.
+            // Calling cudaSetDevice() will set the default context in the current thread
+            // which may not be compatible with the stream created by the app.
+            CUDA_CALL_THROW(cudaSetDevice(device_id_));
+        }
 
-    // Set cuda_graph_enable_ before stream initialization so we can use the member variable consistently
-    cuda_graph_enable_ = info_.cuda_graph_enable;
+        cudaDeviceProp prop;
+        CUDA_CALL_THROW(cudaGetDeviceProperties(&prop, device_id_));
+        if (!onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(prop.major, prop.minor))
+        {
+            std::string message = "[NvTensorRTRTX EP] The execution provider only supports RTX devices with compute "
+                                  "capabilities 86, 89, 120 and above";
+            Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                        message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+        }
+        compute_capability_ = GetComputeCapability(prop);
 
-    if (info_.has_user_compute_stream)
-    {
-        external_stream_ = true;
-        stream_ = static_cast<cudaStream_t>(info_.user_compute_stream);
+        if (info_.has_user_compute_stream)
+        {
+            external_stream_ = true;
+            stream_ = static_cast<cudaStream_t>(info_.user_compute_stream);
+        }
+        else
+        {
+            external_stream_ = false;
+            CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        }
+        compute_stream_context_ = GetCudaStreamContextOrThrow(stream_);
+        if (external_stream_ && compute_stream_context_ == nullptr)
+        {
+            THROW("[NvTensorRTRTX EP] user_compute_stream has no associated CUDA context");
+        }
     }
     else
     {
-        external_stream_ = false;
-        CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        // Compiler session: no live GPU. compute_capability_ derived from nv_target_sm.
+        compute_capability_ = info_.target_sm.substr(2);
     }
-    compute_stream_context_ = GetCudaStreamContextOrThrow(stream_);
-    if (external_stream_ && compute_stream_context_ == nullptr)
-    {
-        THROW("[NvTensorRTRTX EP] user_compute_stream has no associated CUDA context");
-    }
+
+    // Set cuda_graph_enable_ before stream initialization so we can use the member variable consistently
+    cuda_graph_enable_ = info_.cuda_graph_enable;
 
     std::string profile_min_shapes, profile_max_shapes, profile_opt_shapes;
 
@@ -2791,11 +3085,11 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     weight_streaming_budget_ = info_.weight_streaming_budget;
     if (weight_streaming_budget_.IsEnabled() && cuda_graph_enable_)
     {
-        const std::string message = "[NvTensorRTRTX EP] Weight streaming is not compatible with CUDA graph replay. "
-                                    "Disabling CUDA graph for this session.";
-        Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                    message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
-        cuda_graph_enable_ = false;
+        const std::string message =
+            "[NvTensorRTRTX EP] Weight streaming and CUDA graph replay were both requested. TensorRT RTX will "
+            "determine CUDA graph eligibility from the resolved engine budget";
+        Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO, message.c_str(),
+                                                    ORT_FILE, __LINE__, __FUNCTION__));
     }
 
     // make runtime cache path absolute and create directory if it doesn't exist
@@ -2845,6 +3139,7 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     ep_context_file_path_ = info_.ep_context_file_path;
     ep_context_embed_mode_ = info_.ep_context_embed_mode;
     compile_only_mode_ = info_.compile_only_mode;
+    target_sm_ = info_.target_sm;
 
     enable_engine_cache_for_ep_context_model();
     cache_prefix_ = info_.engine_cache_prefix;
@@ -2983,7 +3278,7 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     // For security reason, it needs to make sure the engine cache is saved inside context model directory.
     if (dump_ep_context_model_)
     {
-        // TODO: not sure if this is still needed
+        // TODO(maximilianm) not sure if this is still needed
         engine_cache_enable_ = true;
         std::string cache_path_utf8 = PathToUTF8String(cache_path_.native());
         if (IsAbsolutePath(cache_path_utf8))
@@ -3047,6 +3342,11 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
         sync_stream_after_enqueue_ = false;
     }
 
+    // A compile-only session never deserializes an engine, so the TensorRT runtime is
+    // unnecessary. Creating it forces NVIDIA driver/CUDA initialization, which issues
+    // Win32k/GDI syscalls that a sandboxed compiler process rejects, hard-killing it.
+    // AOT compilation only needs the builder (createInferBuilder + buildSerializedNetwork).
+    if (!skip_device_init)
     {
         auto lock = GetApiLock();
         ScopedCudaContext compute_stream_context(compute_stream_context_);
@@ -3079,8 +3379,31 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
         }
     }
 
-    trt_version_ = getInferLibVersion();
-    CUDA_CALL_THROW(cudaRuntimeGetVersion(&cuda_version_));
+    // This is the first call into TensorRT, so it is what resolves the delay-loaded library. When
+    // the library cannot be loaded the delay-load helper raises a structured exception that no C++
+    // handler catches, killing the process with no diagnostic; taking it here turns that into a
+    // logged error and lets the compile fail cleanly instead.
+    {
+        bool trt_failed_to_load = false;
+        trt_version_ = TryGetInferLibVersion(trt_failed_to_load);
+        if (trt_failed_to_load)
+        {
+            (void)ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                                            "[NvTensorRTRTX EP] The TensorRT library could not be loaded in this "
+                                            "process. Compilation will fail.",
+                                            ORT_FILE, __LINE__, __FUNCTION__);
+        }
+    }
+    if (!skip_device_init)
+    {
+        CUDA_CALL_THROW(cudaRuntimeGetVersion(&cuda_version_));
+    }
+    else
+    {
+        // CUDA runtime is intentionally not initialized in a sandboxed compile-only
+        // process (Win32k lockdown); AOT engine builds do not need it.
+        cuda_version_ = 0;
+    }
 
     std::string temp_str = "[NvTensorRTRTX EP] TensorRT version is " + std::to_string(trt_version_) +
                            " and CUDA version is " + std::to_string(cuda_version_);
@@ -3321,22 +3644,19 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
             }
 
             auto ts_info = tp.GetTensorTypeAndShapeInfo();
-            if (ts_info.GetDimensionsCount() > 0)
+            auto data_type = ts_info.GetElementType();
+            if (!IsSupportedInputOutputDataType(data_type))
             {
-                auto data_type = ts_info.GetElementType();
-                if (!IsSupportedInputOutputDataType(data_type))
+                std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
+                                      " for input node: " + input.GetName();
+                OrtStatus* log_status =
+                    ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, message.c_str(),
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+                if (log_status)
                 {
-                    std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
-                                          " for input node: " + input.GetName();
-                    OrtStatus* log_status =
-                        ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
-                    if (log_status)
-                    {
-                        ort_api.ReleaseStatus(log_status);
-                    }
-                    return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+                    ort_api.ReleaseStatus(log_status);
                 }
+                return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
             }
         }
     }
@@ -3361,22 +3681,19 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
             }
 
             auto ts_info = tp.GetTensorTypeAndShapeInfo();
-            if (ts_info.GetDimensionsCount() > 0)
+            auto data_type = ts_info.GetElementType();
+            if (!IsSupportedInputOutputDataType(data_type))
             {
-                auto data_type = ts_info.GetElementType();
-                if (!IsSupportedInputOutputDataType(data_type))
+                std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
+                                      " for output node: " + output.GetName();
+                OrtStatus* log_status =
+                    ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, message.c_str(),
+                                              ORT_FILE, __LINE__, __FUNCTION__);
+                if (log_status)
                 {
-                    std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
-                                          " for output node: " + output.GetName();
-                    OrtStatus* log_status =
-                        ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
-                    if (log_status)
-                    {
-                        ort_api.ReleaseStatus(log_status);
-                    }
-                    return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+                    ort_api.ReleaseStatus(log_status);
                 }
+                return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
             }
         }
     }
@@ -3467,6 +3784,73 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
 
     auto exclude_ops_set = get_exclude_ops_set(ep->op_types_to_exclude_);
 
+    std::unique_ptr<nvinfer1::INetworkDefinition> coarse_check_network;
+    tensorrt_ptr::unique_pointer<nvonnxparser::IParser> coarse_check_parser;
+    std::unordered_map<std::string, bool> coarse_operator_support;
+
+    auto parser_may_support_operator = [&](const std::string& op_type) -> bool
+    {
+        if (auto it = coarse_operator_support.find(op_type); it != coarse_operator_support.end())
+        {
+            return it->second;
+        }
+
+        if (!coarse_check_parser)
+        {
+            TensorrtRtxLogger& trt_logger = GetTensorrtRtxLogger(ep->detailed_build_log_);
+            auto* trt_builder = ep->GetBuilder(trt_logger);
+            if (trt_builder == nullptr)
+            {
+                return true;
+            }
+
+            const auto network_flags =
+                1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+            coarse_check_network.reset(trt_builder->createNetworkV2(network_flags));
+            if (!coarse_check_network)
+            {
+                return true;
+            }
+
+            coarse_check_parser.reset(nvonnxparser::createParser(*coarse_check_network, trt_logger));
+            if (!coarse_check_parser)
+            {
+                return true;
+            }
+        }
+
+        // A false result definitively rules out the operator. A true result only means that
+        // the parser may support it; the intact parent-context retry remains authoritative.
+        const bool may_be_supported = coarse_check_parser->supportsOperator(op_type.c_str());
+        coarse_operator_support.emplace(op_type, may_be_supported);
+        return may_be_supported;
+    };
+
+    auto graph_passes_coarse_checks = [&](auto&& self, Ort::ConstGraph candidate_graph) -> bool
+    {
+        for (const auto& candidate_node : candidate_graph.GetNodes())
+        {
+            const std::string candidate_op_type = candidate_node.GetOperatorType();
+            if (exclude_ops_set.count(candidate_op_type) != 0 || !CheckNodeDataTypes(candidate_node) ||
+                !parser_may_support_operator(candidate_op_type))
+            {
+                return false;
+            }
+
+            if (ep->control_flow_op_set_.count(candidate_op_type) != 0)
+            {
+                for (const auto& nested_subgraph : candidate_node.GetSubgraphs())
+                {
+                    if (!self(self, nested_subgraph.sub_graph))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
     SubGraphCollection_t parser_nodes_vector, supported_nodes_vector;
     bool new_subgraph = true;
 
@@ -3498,27 +3882,25 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
          */
         if (ep->control_flow_op_set_.find(op_type) != ep->control_flow_op_set_.end())
         {
-            auto supported_control_flow_op = [&](Ort::ConstNode node) -> bool
+            bool all_subgraphs_assigned_to_trt = true;
+            bool all_subgraphs_unassigned_and_coarse_eligible = true;
+
+            for (const auto& attr_subgraph : ort_node.GetSubgraphs())
             {
-                auto sub_graphs = node.GetSubgraphs();
-                if (sub_graphs.size() != 0)
+                if (attr_subgraph.sub_graph.GetNodes().empty())
                 {
-                    for (const auto& attr_subgraph : sub_graphs)
-                    {
-                        if (attr_subgraph.sub_graph.GetNodes().size() == 0)
-                        {
-                            continue;
-                        }
-                        if (!ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_))
-                        {
-                            return false;
-                        }
-                        return true;
-                    }
+                    continue;
                 }
-                return true;
-            };
-            supported_node = supported_control_flow_op(ort_node);
+
+                all_subgraphs_assigned_to_trt &= ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_);
+                all_subgraphs_unassigned_and_coarse_eligible &=
+                    ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, "") &&
+                    graph_passes_coarse_checks(graph_passes_coarse_checks, attr_subgraph.sub_graph);
+            }
+
+            // A completely unassigned control-flow node whose branches pass the inexpensive checks gets one
+            // parser attempt in its parent graph, where implicit captures have their producer context.
+            supported_node = all_subgraphs_assigned_to_trt || all_subgraphs_unassigned_and_coarse_eligible;
         }
 
         // Exclude any ops, if applicable
@@ -3625,53 +4007,51 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
         Ort::ConstNode parent_node = ort_graph.GetParentNode();
         if (parent_node.GetOperatorType() == "If")
         {
-            all_subgraphs_are_supported = false;
-            SubGraphCollection_t subgraph_supported_nodes_vector;
-
-            std::vector<Ort::AttrNameSubgraph> attr_name_subgraphs = parent_node.GetSubgraphs();
-            for (const auto& attr_name_subgraph : attr_name_subgraphs)
+            // Check every branch, rather than identifying a sibling by graph-pointer identity. The graph passed to
+            // GetCapability may be a view whose pointer differs from the graph stored on the parent node.
+            all_subgraphs_are_supported = true;
+            for (const auto& attr_name_subgraph : parent_node.GetSubgraphs())
             {
                 auto subgraph = attr_name_subgraph.sub_graph;
-                const OrtGraph* subgraph_raw_pointer = subgraph;
-                if (subgraph_raw_pointer != graph)
+                size_t num_subgraph_nodes = 0;
+                RETURN_IF_ERROR(ort_api.Graph_GetNumNodes(subgraph, &num_subgraph_nodes));
+
+                if (num_subgraph_nodes == 0)
                 {
-                    size_t num_subgraph_nodes = 0;
-                    RETURN_IF_ERROR(ort_api.Graph_GetNumNodes(subgraph, &num_subgraph_nodes));
+                    continue;
+                }
 
-                    // Another subgraph of "If" control flow op has no nodes.
-                    // In this case, TRT EP should consider this empty subgraph is fully supported by TRT.
-                    if (num_subgraph_nodes == 0)
-                    {
-                        all_subgraphs_are_supported = true;
-                        break;
-                    }
-                    // Another subgraph of "If" control flow op has been parsed by GetCapability before and all
-                    // subgraph's nodes assigned to TRT EP.
-                    else if (ep->AllNodesAssignedToSpecificEP(subgraph, ep->name_))
-                    {
-                        all_subgraphs_are_supported = true;
-                        break;
-                    }
-                    // Another subgraph of "If" control flow has been parsed by GetCapability and not all subgraph's
-                    // nodes assigned to TRT EP. (Note: GetExecutionProviderType() returns "" meaning node has not yet
-                    // been assigned to any EPs)
-                    else if (!ep->AllNodesAssignedToSpecificEP(subgraph, ""))
-                    {
-                        all_subgraphs_are_supported = false;
-                        break;
-                    }
+                // A coarse-check failure anywhere in the If disables complete-If retry and supported branch regions
+                // must instead continue through the original fusion path below.
+                if (!graph_passes_coarse_checks(graph_passes_coarse_checks, subgraph))
+                {
+                    all_subgraphs_are_supported = false;
+                    break;
+                }
 
-                    std::vector<size_t> subgraph_nodes_vector(num_subgraph_nodes);
-                    std::iota(std::begin(subgraph_nodes_vector), std::end(subgraph_nodes_vector), 0);
-                    SubGraphCollection_t parser_subgraph_nodes_vector = {{subgraph_nodes_vector, false}};
-                    bool subgraph_early_termination = false;
+                if (ep->AllNodesAssignedToSpecificEP(subgraph, ep->name_))
+                {
+                    continue;
+                }
 
-                    // Another subgraph of "If" control flow has not yet been parsed by GetCapability.
-                    subgraph_supported_nodes_vector =
-                        ep->GetSupportedList(parser_subgraph_nodes_vector, 0, ep->max_partition_iterations_, subgraph,
-                                             &subgraph_early_termination);
-                    all_subgraphs_are_supported =
-                        ep->IsSubGraphFullySupported(subgraph, subgraph_supported_nodes_vector);
+                // A partially assigned branch cannot participate in the intact parent-context retry.
+                if (!ep->AllNodesAssignedToSpecificEP(subgraph, ""))
+                {
+                    all_subgraphs_are_supported = false;
+                    break;
+                }
+
+                std::vector<size_t> subgraph_nodes_vector(num_subgraph_nodes);
+                std::iota(std::begin(subgraph_nodes_vector), std::end(subgraph_nodes_vector), 0);
+                SubGraphCollection_t parser_subgraph_nodes_vector = {{subgraph_nodes_vector, false}};
+                bool subgraph_early_termination = false;
+                auto subgraph_supported_nodes_vector =
+                    ep->GetSupportedList(parser_subgraph_nodes_vector, 0, ep->max_partition_iterations_, subgraph,
+                                         &subgraph_early_termination);
+                if (subgraph_early_termination ||
+                    !ep->IsSubGraphFullySupported(subgraph, subgraph_supported_nodes_vector))
+                {
+                    all_subgraphs_are_supported = false;
                     break;
                 }
             }
@@ -3698,6 +4078,25 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
             Ort::ThrowOnError(ep->ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
                                                             message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
 
+            return nullptr;
+        }
+    }
+
+    // A fully supported branch whose sibling branches are also fully supported returns from the original path above.
+    // We reach this point only when at least one branch parser check did not fully succeed. Preserve the branches for
+    // a parent-context retry only if every branch of the control-flow node passes the inexpensive checks. If any
+    // branch fails those checks, keep the original fallback behavior below so supported branch regions can be fused.
+    bool all_control_flow_subgraphs_pass_coarse_checks = true;
+    if (ep->IsSubGraphOfControlFlowOp(graph))
+    {
+        for (const auto& attr_subgraph : ort_graph.GetParentNode().GetSubgraphs())
+        {
+            all_control_flow_subgraphs_pass_coarse_checks &=
+                graph_passes_coarse_checks(graph_passes_coarse_checks, attr_subgraph.sub_graph);
+        }
+
+        if (all_control_flow_subgraphs_pass_coarse_checks)
+        {
             return nullptr;
         }
     }
@@ -3910,6 +4309,314 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::CreateSyncStreamForDeviceI
     return nullptr;
 }
 
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::IsConcurrentRunSupportedImpl(_In_ OrtEp* this_ptr,
+                                                                                   _Outptr_ bool* is_supported) noexcept
+{
+    if (this_ptr == nullptr)
+    {
+        return g_ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                       "[NvTensorRTRTX EP] IsConcurrentRunSupportedImpl: this_ptr is null");
+    }
+    if (is_supported == nullptr)
+    {
+        return g_ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                       "[NvTensorRTRTX EP] IsConcurrentRunSupportedImpl: is_supported is null");
+    }
+
+    *is_supported = false;
+    return nullptr;
+}
+
+OrtStatus*
+TensorrtRtxExecutionProvider::RecreateWeightStreamingContexts(const std::vector<std::string>& engine_names) noexcept
+{
+    // std::string construction and operator+= below can throw. Convert those failures to OrtStatus so
+    // ApplyRuntimeWeightStreamingBudget can continue its context/budget rollback instead of terminating this
+    // noexcept recovery helper.
+    try
+    {
+        std::string failed_engines;
+        for (const std::string& engine_name : engine_names)
+        {
+            auto engine_it = engines_.find(engine_name);
+            auto context_it = contexts_.find(engine_name);
+            if (engine_it == engines_.end() || engine_it->second == nullptr || context_it == contexts_.end())
+            {
+                if (!failed_engines.empty())
+                {
+                    failed_engines += ", ";
+                }
+                failed_engines += engine_name;
+                continue;
+            }
+
+            auto* recreated = context_it->second.get_deleter().CreateExecutionContext(*engine_it->second);
+            if (recreated == nullptr)
+            {
+                if (!failed_engines.empty())
+                {
+                    failed_engines += ", ";
+                }
+                failed_engines += engine_name;
+                continue;
+            }
+
+            auto owned_aux_streams = context_it->second.get_deleter().ReleaseOwnedAuxStreams();
+            context_it->second.reset(recreated);
+            context_it->second.get_deleter().SetOwnedAuxStreams(std::move(owned_aux_streams));
+            if (!external_aux_streams_)
+            {
+                context_it->second.get_deleter().EnsureAndBindOwnedAuxStreams(*engine_it->second, *recreated);
+            }
+            if (profiling_enable_ && profiler_)
+            {
+                recreated->setProfiler(profiler_.get());
+            }
+            if (auto state_it = compute_states_.find(engine_name); state_it != compute_states_.end())
+            {
+                state_it->second->is_first_run = true;
+                state_it->second->skip_io_binding_allowed = false;
+            }
+            if (auto state_it = compute_states_for_ep_context_.find(engine_name);
+                state_it != compute_states_for_ep_context_.end())
+            {
+                state_it->second->is_first_run = true;
+                state_it->second->skip_io_binding_allowed = false;
+            }
+        }
+
+        if (!failed_engines.empty())
+        {
+            std::string message = "[NvTensorRTRTX EP] Failed to recreate execution contexts after changing the runtime "
+                                  "weight-streaming budget for engine(s): " +
+                                  failed_engines;
+            return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+        }
+        return nullptr;
+    }
+    catch (const std::exception& ex)
+    {
+        return ort_api.CreateStatus(ORT_FAIL, ex.what());
+    }
+    catch (...)
+    {
+        return ort_api.CreateStatus(
+            ORT_FAIL, "[NvTensorRTRTX EP] Execution-context recreation failed with an unknown exception.");
+    }
+}
+
+OrtStatus* TensorrtRtxExecutionProvider::ApplyRuntimeWeightStreamingBudget(
+    const TensorrtRtxWeightStreamingBudget& requested_budget)
+{
+    struct RuntimeBudgetUpdate
+    {
+        std::string engine_name;
+        nvinfer1::ICudaEngine* engine;
+        tensorrt_ptr::unique_pointer_exec_ctx* context;
+        int64_t previous_budget;
+    };
+
+    std::lock_guard<std::mutex> trt_lock(tensorrt_rtx_mu_);
+    ScopedCudaContext compute_stream_context(compute_stream_context_);
+    if (stream_ != nullptr)
+    {
+        RETURN_IF_ERROR(CUDA_CALL(cudaStreamSynchronize(stream_)));
+    }
+
+    std::vector<RuntimeBudgetUpdate> updates;
+    updates.reserve(engines_.size());
+
+    for (auto& [engine_name, owned_engine] : engines_)
+    {
+        if (owned_engine == nullptr)
+        {
+            continue;
+        }
+
+        nvinfer1::ICudaEngine& engine = *owned_engine;
+        const int64_t streamable_size = engine.getStreamableWeightsSize();
+        if (requested_budget.IsEnabled() && streamable_size == 0)
+        {
+            const std::string message = "[NvTensorRTRTX EP] Cannot apply runtime weight-streaming budget '" +
+                                        requested_budget.requested_value + "' to engine '" + engine_name +
+                                        "' because the engine is not weight-streaming-capable. Rebuild the engine with "
+                                        "kWEIGHT_STREAMING flag set.";
+            return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+        }
+
+        const int64_t resolved_budget = ResolveWeightStreamingBudget(engine, requested_budget);
+        if (resolved_budget < 0)
+        {
+            return ort_api.CreateStatus(
+                ORT_EP_FAIL, "[NvTensorRTRTX EP] TensorRT RTX returned a negative resolved weight-streaming budget.");
+        }
+
+        const int64_t effective_budget = (std::min)(resolved_budget, streamable_size);
+        const int64_t current_budget = engine.getWeightStreamingBudgetV2();
+        const bool automatic_budget = requested_budget.mode == TensorrtRtxWeightStreamingBudgetMode::Automatic;
+        if (!automatic_budget && current_budget == effective_budget)
+        {
+            continue;
+        }
+
+        auto context_it = contexts_.find(engine_name);
+        if (context_it == contexts_.end() || context_it->second == nullptr)
+        {
+            std::string message = "[NvTensorRTRTX EP] Cannot update the runtime weight-streaming budget for engine '" +
+                                  engine_name + "': no execution context is available.";
+            return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+        }
+        updates.push_back(RuntimeBudgetUpdate{engine_name, &engine, &context_it->second, current_budget});
+    }
+
+    if (updates.empty())
+    {
+        return nullptr;
+    }
+
+    std::vector<std::string> engine_names;
+    engine_names.reserve(updates.size());
+    // ICudaEngine::setWeightStreamingBudgetV2 requires every context for that engine to be destroyed first.
+    for (auto& update : updates)
+    {
+        engine_names.push_back(update.engine_name);
+        update.context->reset();
+    }
+
+    size_t applied_count = 0;
+    OrtStatus* apply_status = nullptr;
+    for (auto& update : updates)
+    {
+        apply_status =
+            ApplyWeightStreamingBudget(*update.engine, requested_budget, update.engine_name, logger_, ort_api, true);
+        if (apply_status != nullptr)
+        {
+            break;
+        }
+        ++applied_count;
+    }
+
+    auto rollback_budgets = [&](size_t count) noexcept
+    {
+        bool succeeded = true;
+        for (size_t i = 0; i < count; ++i)
+        {
+            succeeded = updates[i].engine->setWeightStreamingBudgetV2(updates[i].previous_budget) && succeeded;
+        }
+        return succeeded;
+    };
+
+    if (apply_status != nullptr)
+    {
+        const bool rollback_succeeded = rollback_budgets(applied_count);
+        OrtStatus* recreate_status = RecreateWeightStreamingContexts(engine_names);
+        if (rollback_succeeded && recreate_status == nullptr)
+        {
+            return apply_status;
+        }
+
+        std::string message = ort_api.GetErrorMessage(apply_status);
+        ort_api.ReleaseStatus(apply_status);
+        message += " The previous engine budget or execution context could not be fully restored.";
+        if (recreate_status != nullptr)
+        {
+            message += " ";
+            message += ort_api.GetErrorMessage(recreate_status);
+            ort_api.ReleaseStatus(recreate_status);
+        }
+        return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+    }
+
+    OrtStatus* recreate_status = RecreateWeightStreamingContexts(engine_names);
+    if (recreate_status == nullptr)
+    {
+        return nullptr;
+    }
+
+    std::string message = ort_api.GetErrorMessage(recreate_status);
+    ort_api.ReleaseStatus(recreate_status);
+    for (auto& update : updates)
+    {
+        update.context->reset();
+    }
+    const bool rollback_succeeded = rollback_budgets(updates.size());
+    OrtStatus* restore_context_status = RecreateWeightStreamingContexts(engine_names);
+    if (!rollback_succeeded || restore_context_status != nullptr)
+    {
+        message += " The previous engine budget or execution context could not be fully restored.";
+        if (restore_context_status != nullptr)
+        {
+            message += " ";
+            message += ort_api.GetErrorMessage(restore_context_status);
+            ort_api.ReleaseStatus(restore_context_status);
+        }
+    }
+    // The requested runtime budget was not activated, so the run must fail even if rollback restored the prior state.
+    return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+}
+
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::SetDynamicOptionsImpl(
+    _In_ OrtEp* this_ptr, _In_reads_(num_options) const char* const* option_keys,
+    _In_reads_(num_options) const char* const* option_values, _In_ size_t num_options) noexcept
+{
+    if (this_ptr == nullptr)
+    {
+        return g_ort_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                       "[NvTensorRTRTX EP] SetDynamicOptionsImpl: this_ptr is null");
+    }
+    if (num_options > 0 && (option_keys == nullptr || option_values == nullptr))
+    {
+        return g_ort_api->CreateStatus(
+            ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] SetDynamicOptionsImpl: option keys and values must not be null");
+    }
+
+    auto* ep = static_cast<TensorrtRtxExecutionProvider*>(this_ptr);
+
+    // Constructing TensorrtRtxWeightStreamingBudget initializes its requested-value string, and
+    // ApplyRuntimeWeightStreamingBudget allocates vectors and diagnostic strings. Translate those exceptions at this
+    // noexcept ORT ABI boundary; ParseWeightStreamingBudget handles its own exceptions.
+    try
+    {
+        std::optional<TensorrtRtxWeightStreamingBudget> requested_budget;
+        for (size_t i = 0; i < num_options; ++i)
+        {
+            if (option_keys[i] == nullptr || option_values[i] == nullptr)
+            {
+                return ep->ort_api.CreateStatus(
+                    ORT_INVALID_ARGUMENT,
+                    "[NvTensorRTRTX EP] SetDynamicOptionsImpl: option keys and values must not contain null entries");
+            }
+            if (std::strcmp(option_keys[i], onnxruntime::tensorrt_rtx::provider_option_names::kWeightStreamingBudget) ==
+                0)
+            {
+                requested_budget.emplace();
+                OrtStatus* parse_status = ParseWeightStreamingBudget(option_values[i], *requested_budget);
+                if (parse_status != nullptr)
+                {
+                    return parse_status;
+                }
+            }
+        }
+
+        // SetEpDynamicOptions broadcasts the same options to every EP. Ignore keys owned by other providers.
+        if (!requested_budget.has_value())
+        {
+            return nullptr;
+        }
+
+        return ep->ApplyRuntimeWeightStreamingBudget(*requested_budget);
+    }
+    catch (const std::exception& ex)
+    {
+        return ep->ort_api.CreateStatus(ORT_FAIL, ex.what());
+    }
+    catch (...)
+    {
+        return ep->ort_api.CreateStatus(ORT_FAIL,
+                                        "[NvTensorRTRTX EP] SetDynamicOptionsImpl failed with an unknown exception.");
+    }
+}
+
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::OnRunStartImpl(_In_ OrtEp* this_ptr,
                                                                      _In_ const OrtRunOptions* run_options) noexcept
 {
@@ -3949,6 +4656,18 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::OnRunStartImpl(_In_ OrtEp*
     }
 
     return nullptr;
+}
+
+OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::SyncImpl(_In_ OrtEp* this_ptr) noexcept
+{
+    if (this_ptr == nullptr)
+    {
+        return g_ort_api->CreateStatus(ORT_INVALID_ARGUMENT, "[NvTensorRTRTX EP] SyncImpl: this_ptr is null");
+    }
+
+    auto* ep = static_cast<TensorrtRtxExecutionProvider*>(this_ptr);
+
+    return CUDA_CALL(cudaStreamSynchronize(ep->stream_));
 }
 
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::OnRunEndImpl(_In_ OrtEp* this_ptr,
@@ -4256,125 +4975,6 @@ OrtStatus* TensorrtRtxExecutionProvider::RefitEngineImpl(
     return nullptr;
 }
 
-// Weightless capture path — uses the TRT-RTX ONNX parser refit-observer API (IRefitterObserver /
-// RefitRecord / setRefitObserver), guaranteed by the enforced TensorRT-RTX >= 1.6 minimum
-// (nv_includes.h / cmake). The TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED guard is retained defensively.
-#if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
-namespace
-{
-
-//! \brief Deep-copies every RefitRecord emitted during a refit pass into an owned
-//!        trt_rtx_ep::WeightlessRefitRecord list. RefitRecord's pointer fields are parser-owned
-//!        and only valid for the duration of onRefittableWeight(), hence the copy.
-class WeightlessRefitCaptureObserver : public nvonnxparser::IRefitterObserver
-{
-public:
-    std::vector<trt_rtx_ep::WeightlessRefitRecord> records;
-
-    void onRefittableWeight(nvonnxparser::RefitRecord const& src) noexcept override
-    {
-        // `src` is the parser-owned RefitRecord (camelCase SDK fields); `copy` is our owned
-        // trt_rtx_ep::WeightlessRefitRecord (snake_case). Keeping the two variable names distinct avoids
-        // the identical field names colliding.
-        trt_rtx_ep::WeightlessRefitRecord copy;
-        copy.trt_name = src.trtName != nullptr ? src.trtName : "";
-        copy.kind = static_cast<int32_t>(src.kind);
-        copy.onnx_dtype = src.onnxDtype;
-        copy.trt_dtype = static_cast<int32_t>(src.trtDtype);
-        copy.count = src.count;
-        copy.epsilon = src.epsilon;
-        copy.source_onnx_names.reserve(static_cast<size_t>(src.nbSources));
-        for (int32_t i = 0; i < src.nbSources; ++i)
-        {
-            copy.source_onnx_names.emplace_back(src.sourceOnnxNames[i] != nullptr ? src.sourceOnnxNames[i] : "");
-        }
-        if (src.fixedData != nullptr && src.fixedDataSize > 0)
-        {
-            const uint8_t* bytes = static_cast<const uint8_t*>(src.fixedData);
-            copy.fixed_data.assign(bytes, bytes + src.fixedDataSize);
-        }
-        records.push_back(std::move(copy));
-    }
-};
-
-}  // namespace
-
-OrtStatus* TensorrtRtxExecutionProvider::CaptureWeightlessRefitTable(
-    const nvinfer1::IHostMemory& serialized_engine, const std::string& serialized_model_proto,
-    const std::vector<TensorrtUserWeights>& user_weights, bool detailed_build_log,
-    std::vector<trt_rtx_ep::WeightlessRefitRecord>& records) noexcept
-{
-    records.clear();
-
-    TensorrtRtxLogger& trt_logger = GetTensorrtRtxLogger(detailed_build_log);
-
-    // This capture-only engine and its refitter are discarded once the observer has fired for
-    // every weight; they exist solely to drive IParserRefitter's normal refit traversal, not for
-    // inference. The `serialized_engine`/execution-context path built by the caller is untouched.
-    //
-    // Why re-deserialize instead of capturing on the just-built engine: the EP's build path uses
-    // IBuilder::buildSerializedNetwork() (see the engine build above), which returns serialized bytes
-    // directly and never materializes an nvinfer1::ICudaEngine. IParserRefitter requires an IRefitter,
-    // which requires a live ICudaEngine -- so there is no already-built engine object to capture on, and
-    // a one-time deserialize here is the only way to obtain a refittable engine. This runs only on
-    // weight-stripped (kSTRIP_PLAN) compiles and the engine is freed immediately after capture.
-    std::unique_ptr<nvinfer1::ICudaEngine> capture_engine(
-        runtime_->deserializeCudaEngine(serialized_engine.data(), serialized_engine.size()));
-    if (!capture_engine)
-    {
-        return ort_api.CreateStatus(
-            ORT_EP_FAIL,
-            "[NvTensorRTRTX EP] Failed to deserialize a throwaway engine to capture the weightless refit table.");
-    }
-
-    auto capture_refitter =
-        std::unique_ptr<nvinfer1::IRefitter>(nvinfer1::createInferRefitter(*capture_engine, trt_logger));
-    if (!capture_refitter)
-    {
-        return ort_api.CreateStatus(
-            ORT_EP_FAIL,
-            "[NvTensorRTRTX EP] createInferRefitter() returned null while capturing the weightless refit table.");
-    }
-
-    auto capture_parser_refitter = std::unique_ptr<nvonnxparser::IParserRefitter>(
-        nvonnxparser::createParserRefitter(*capture_refitter, trt_logger));
-    if (!capture_parser_refitter)
-    {
-        return ort_api.CreateStatus(
-            ORT_EP_FAIL,
-            "[NvTensorRTRTX EP] createParserRefitter() returned null while capturing the weightless refit table.");
-    }
-
-    WeightlessRefitCaptureObserver observer;
-    capture_parser_refitter->setRefitObserver(&observer);
-
-    if (!capture_parser_refitter->loadModelProto(serialized_model_proto.data(), serialized_model_proto.size(), nullptr))
-    {
-        return ort_api.CreateStatus(ORT_EP_FAIL,
-                                    "[NvTensorRTRTX EP] IParserRefitter could not load the model proto while "
-                                    "capturing the weightless refit table.");
-    }
-    for (const auto& weight : user_weights)
-    {
-        if (!capture_parser_refitter->loadInitializer(weight.Name(), weight.Data(), static_cast<size_t>(weight.Size())))
-        {
-            std::string error_msg = "[NvTensorRTRTX EP] IParserRefitter could not load initializer '" +
-                                    std::string(weight.Name()) + "' while capturing the weightless refit table.";
-            return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
-        }
-    }
-    if (!capture_parser_refitter->refitModelProto())
-    {
-        return ort_api.CreateStatus(ORT_EP_FAIL,
-                                    "[NvTensorRTRTX EP] IParserRefitter::refitModelProto() failed while capturing "
-                                    "the weightless refit table.");
-    }
-
-    records = std::move(observer.records);
-    return nullptr;
-}
-#endif  // TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
-
 // Bytes required to hold `count` elements of a TRT weight dtype, used to validate that a supplied
 // source buffer is large enough before it is handed to IRefitter::setNamedWeights (which reads
 // `count` elements and cannot detect a short buffer -> out-of-bounds read). Sub-byte types
@@ -4423,7 +5023,7 @@ static int64_t WeightlessRequiredBytes(nvinfer1::DataType t, int64_t count)
 }
 
 // Weightless replay path — the per-kind switch uses nvonnxparser::RefitTransformKind, guaranteed by
-// the enforced TensorRT-RTX >= 1.6 minimum (nv_includes.h / cmake). The
+// the enforced TensorRT-RTX >= 1.7 minimum (nv_includes.h / cmake). The
 // TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED guard is retained defensively.
 #if TRT_RTX_WEIGHTLESS_REFIT_SUPPORTED
 OrtStatus* TensorrtRtxExecutionProvider::WeightlessRefitEngineImpl(
@@ -4434,6 +5034,15 @@ try
 {
     TensorrtRtxLogger& trt_logger = GetTensorrtRtxLogger(detailed_build_log);
     auto refitter = std::unique_ptr<nvinfer1::IRefitter>(nvinfer1::createInferRefitter(*trt_engine, trt_logger));
+
+    // Parse-time-captured tables are a candidate superset of the engine's refittable weights (the
+    // builder may fold or absorb some), so skip records the engine does not report. Coverage is
+    // checked explicitly before the commit below: on TensorRT-RTX a weight-stripped engine reports no
+    // missing weights and refitCudaEngine() succeeds with weights left unset, so the refitter itself
+    // does not fail closed and a partially covered engine would run with unset weights silently.
+    const std::unordered_set<std::string> engine_names = EngineRefittableWeightNames(*refitter);
+    // Engine weights actually set below; compared against engine_names before committing.
+    std::unordered_set<std::string> refit_names;
 
     // nvinfer1::Weights only references memory, it does not copy it -- any transformed (cast or
     // batchnorm-folded) buffer must stay alive until refitCudaEngine() below runs.
@@ -4453,6 +5062,10 @@ try
 
     for (const auto& record : records)
     {
+        if (engine_names.find(record.trt_name) == engine_names.end())
+        {
+            continue;
+        }
         nvinfer1::Weights weights{};
         weights.type = static_cast<nvinfer1::DataType>(record.trt_dtype);
         weights.count = record.count;
@@ -4668,6 +5281,27 @@ try
                 "[NvTensorRTRTX EP] IRefitter::setNamedWeights failed for '" + record.trt_name + "'.";
             return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
         }
+        refit_names.insert(record.trt_name);
+    }
+
+    // Fail closed: every weight the engine reports as refittable must have been set by a record.
+    if (refit_names.size() != engine_names.size())
+    {
+        std::string uncovered;
+        for (const std::string& name : engine_names)
+        {
+            if (refit_names.find(name) == refit_names.end())
+            {
+                uncovered += uncovered.empty() ? "" : ", ";
+                uncovered += name;
+            }
+        }
+        std::string error_msg = "[NvTensorRTRTX EP] The weightless refit table does not cover " +
+                                std::to_string(engine_names.size() - refit_names.size()) + " of " +
+                                std::to_string(engine_names.size()) + " refittable engine weight(s): " + uncovered +
+                                ". The weight-stripped engine cannot be refitted from this EPContext model; "
+                                "recompile it with the weightless option enabled.";
+        return ort_api.CreateStatus(ORT_EP_FAIL, error_msg.c_str());
     }
 
     if (!refitter->refitCudaEngine())
@@ -4901,55 +5535,77 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::CreateStateImpl(OrtNodeComputeInfo* thi
 template <typename T>
 void GetShapeOfShapeTensor(Ort::ConstValue& input_tensor, void* shape_values, int shape_size, cudaStream_t stream)
 {
-    CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(shape_values, input_tensor.GetTensorData<T>(), shape_size * sizeof(T),
-                                         cudaMemcpyDeviceToHost, stream));
-    CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+    CUDA_CALL_THROW(cudaMemcpyAsync(shape_values, input_tensor.GetTensorData<T>(), shape_size * sizeof(T),
+                                    cudaMemcpyDeviceToHost, stream));
+    CUDA_CALL_THROW(cudaStreamSynchronize(stream));
 }
 
-#define CASE_GET_INPUT_TENSOR(DATA_TYPE, SrcT)                                        \
-    case DATA_TYPE:                                                                   \
-    {                                                                                 \
-        auto input_tensor_ptr = input_tensor.GetTensorData<SrcT>();                   \
-        if (input_tensor_ptr != nullptr && elem_cnt > 0)                              \
-        {                                                                             \
-            data = const_cast<SrcT*>(input_tensor_ptr);                               \
-        }                                                                             \
-        else                                                                          \
-        {                                                                             \
-            scratch_buffers.push_back(MakeUniquePtrFromOrtAllocator<void>(alloc, 1)); \
-            data = scratch_buffers.back().get();                                      \
-        }                                                                             \
-        break;                                                                        \
+//! \brief Returns a pointer to an input tensor's data, or a dummy 1-byte scratch buffer if the
+//! tensor is empty (elem_cnt == 0) — TensorRT requires a non-null, distinct address per binding
+//! even for empty tensors.
+template <typename SrcT, typename TensorT>
+static void* GetInputTensorDataPointer(TensorT& input_tensor, int64_t elem_cnt,
+                                       std::vector<AllocatorUniquePtr<void>>& scratch_buffers, OrtAllocator* alloc)
+{
+    auto input_tensor_ptr = input_tensor.template GetTensorData<SrcT>();
+    if (input_tensor_ptr != nullptr && elem_cnt > 0)
+    {
+        return const_cast<SrcT*>(input_tensor_ptr);
     }
+    scratch_buffers.push_back(MakeUniquePtrFromOrtAllocator<void>(alloc, 1));
+    return scratch_buffers.back().get();
+}
 
-#define CASE_GET_OUTPUT_TENSOR(DATA_TYPE, SrcT)                                       \
-    case DATA_TYPE:                                                                   \
-    {                                                                                 \
-        auto output_tensor_ptr = output_tensor.GetTensorMutableData<SrcT>();          \
-        data_ptr = output_tensor_ptr;                                                 \
-        if (output_tensor_ptr != nullptr && elem_cnt > 0)                             \
-        {                                                                             \
-            buffer = output_tensor_ptr;                                               \
-        }                                                                             \
-        else                                                                          \
-        {                                                                             \
-            scratch_buffers.push_back(MakeUniquePtrFromOrtAllocator<void>(alloc, 1)); \
-            buffer = scratch_buffers.back().get();                                    \
-        }                                                                             \
-        break;                                                                        \
+//! \brief Returns a pointer to an output tensor's mutable data (or a dummy 1-byte scratch buffer
+//! for an empty tensor, same reasoning as GetInputTensorDataPointer), and always writes the real
+//! tensor pointer (even if empty) out through \p data_ptr for the caller's bookkeeping.
+template <typename SrcT, typename TensorT>
+static void* GetOutputTensorDataPointer(TensorT& output_tensor, int64_t elem_cnt,
+                                        std::vector<AllocatorUniquePtr<void>>& scratch_buffers, OrtAllocator* alloc,
+                                        void*& data_ptr)
+{
+    auto output_tensor_ptr = output_tensor.template GetTensorMutableData<SrcT>();
+    data_ptr = output_tensor_ptr;
+    if (output_tensor_ptr != nullptr && elem_cnt > 0)
+    {
+        return output_tensor_ptr;
     }
+    scratch_buffers.push_back(MakeUniquePtrFromOrtAllocator<void>(alloc, 1));
+    return scratch_buffers.back().get();
+}
 
-#define CASE_COPY_TENSOR(DATA_TYPE, DstT)                                                                            \
-    case DATA_TYPE:                                                                                                  \
-    {                                                                                                                \
-        auto output_tensor_ptr = output_tensor.GetTensorMutableData<DstT>();                                         \
-        if (output_tensor_ptr != nullptr && elem_cnt > 0)                                                            \
-        {                                                                                                            \
-            CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(output_tensor_ptr, allocator->getBuffer(), elem_cnt * sizeof(DstT), \
-                                                 cudaMemcpyDeviceToDevice, stream));                                 \
-        }                                                                                                            \
-        break;                                                                                                       \
+//! \brief Copies a DDS (data-dependent-shape) output from its TensorRT-allocated buffer into the
+//! ORT kernel context output tensor, bounding the copy by the exact size TensorRT requested.
+//!
+//! copy_bytes is read from ORT's own GetTensorSizeInBytes() rather than recomputed from
+//! elem_cnt * sizeof(DstT), so packed sub-byte types (e.g. INT4, FLOAT4E2M1) are sized correctly
+//! without this function needing to know ONNX's packing rules itself.
+//!
+//! The bound uses getRequestedSize(), not getSize(): getSize() reports the padded raw allocation,
+//! but the aligned pointer getBuffer() actually returns can sit up to (alignment - 1) bytes after
+//! that allocation's base, so bounding by getSize() alone could still let a copy read past the
+//! true end of the buffer from that pointer. See OutputAllocator::getRequestedSize().
+template <typename DstT>
+static OrtStatusPtr CopyDdsOutputTensor(Ort::UnownedValue& output_tensor, OutputAllocator* allocator, int64_t elem_cnt,
+                                        cudaStream_t stream)
+{
+    auto output_tensor_ptr = output_tensor.GetTensorMutableData<DstT>();
+    if (output_tensor_ptr != nullptr && elem_cnt > 0)
+    {
+        uint64_t const copy_bytes = output_tensor.GetTensorSizeInBytes();
+        if (copy_bytes > allocator->getRequestedSize())
+        {
+            std::string error_msg =
+                "NvTensorRTRTX EP: ONNX-declared output dtype requires " + std::to_string(copy_bytes) +
+                " bytes, but TensorRT only requested " + std::to_string(allocator->getRequestedSize()) +
+                " bytes for this output; the ONNX-declared dtype does not match the engine's actual output size.";
+            return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
+        }
+        CUDA_RETURN_IF_ERROR(
+            cudaMemcpyAsync(output_tensor_ptr, allocator->getBuffer(), copy_bytes, cudaMemcpyDeviceToDevice, stream));
     }
+    return nullptr;
+}
 
 //!
 //! \brief Resolves a pointer to its device address for TensorRT binding.
@@ -5040,7 +5696,17 @@ OrtStatusPtr BindContextInput(Ort::KernelContext& ctx, nvinfer1::ICudaEngine* tr
         // Bind "shape tensor" input buffer
         skip_input_binding_allowed = false;  // Shape tensor input binding cannot be skipped
         // The shape of the "shape tensor" is either zero dimension (scalar) or 1-dimension
-        int shape_size = trt_engine->getTensorShape(input_name).nbDims == 0 ? 1 : static_cast<int>(tensor_shapes[0]);
+        const int shape_rank = trt_engine->getTensorShape(input_name).nbDims;
+        if (shape_rank < 0 || static_cast<size_t>(shape_rank) != tensor_shapes.size())
+        {
+            std::string error_input_name = input_name;
+            std::string error_msg =
+                "NvTensorRTRTX EP: engine-declared rank (" + std::to_string(shape_rank) + ") for shape input '" +
+                error_input_name + "' does not match the ONNX tensor's actual rank (" +
+                std::to_string(tensor_shapes.size()) + "); refusing to bind (engine/model mismatch).";
+            return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
+        }
+        int shape_size = shape_rank == 0 ? 1 : static_cast<int>(tensor_shapes[0]);
 
         switch (tensor_type)
         {
@@ -5105,10 +5771,18 @@ OrtStatusPtr BindContextInput(Ort::KernelContext& ctx, nvinfer1::ICudaEngine* tr
     }
     else
     {
-
         // Set shape for input tensor which is execution tensor
         nvinfer1::Dims dims = trt_context->getTensorShape(input_name);
         int nb_dims = dims.nbDims;
+        if (static_cast<size_t>(nb_dims) != tensor_shapes.size())
+        {
+            std::string error_input_name = input_name;
+            std::string error_msg =
+                "NvTensorRTRTX EP: engine-declared rank (" + std::to_string(nb_dims) + ") for input '" +
+                error_input_name + "' does not match the ONNX tensor's actual rank (" +
+                std::to_string(tensor_shapes.size()) + "); refusing to bind (engine/model mismatch).";
+            return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
+        }
         for (int j = 0, end = nb_dims; j < end; ++j)
         {
             dims.d[j] = static_cast<int32_t>(tensor_shapes[j]);
@@ -5132,17 +5806,39 @@ OrtStatusPtr BindContextInput(Ort::KernelContext& ctx, nvinfer1::ICudaEngine* tr
         const bool is_host_accessible_gpu_tensor = IsHostAccessibleGpuTensor(input_tensor);
         switch (tensor_type)
         {
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, float)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, uint16_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16, uint16_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, bool)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4, uint8_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, int8_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, uint8_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, int32_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, int64_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN, uint8_t)
-            CASE_GET_INPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1, uint8_t)
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+            data = GetInputTensorDataPointer<float>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+            data = GetInputTensorDataPointer<uint16_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+            data = GetInputTensorDataPointer<uint16_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+            data = GetInputTensorDataPointer<bool>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4:
+            data = GetInputTensorDataPointer<uint8_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+            data = GetInputTensorDataPointer<int8_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+            data = GetInputTensorDataPointer<uint8_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+            data = GetInputTensorDataPointer<int32_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+            data = GetInputTensorDataPointer<int64_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+            data = GetInputTensorDataPointer<uint8_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1:
+            data = GetInputTensorDataPointer<uint8_t>(input_tensor, elem_cnt, scratch_buffers, alloc);
+            break;
         default:
         {
             std::string error_msg =
@@ -5216,11 +5912,13 @@ OrtStatusPtr BindContextOutput(Ort::KernelContext& ctx, nvinfer1::IExecutionCont
         if (!known_DDS)
         {
             auto allocatorPtr = std::make_unique<OutputAllocator>(alloc);
-            trt_context->setOutputAllocator(output_name, allocatorPtr.get());
             dds_output_allocator_map[output_name] = std::move(allocatorPtr);
-            dims.nbDims = -1;    // Set to -1 to indicate that the shape is not known at this point.
-            data_ptr = nullptr;  // Set data_ptr to nullptr for DDS output binding.
         }
+
+        // Output allocator association is per execution context, so repeat it if the context was recreated.
+        trt_context->setOutputAllocator(output_name, dds_output_allocator_map.at(output_name).get());
+        dims.nbDims = -1;    // Set to -1 to indicate that the shape is not known at this point.
+        data_ptr = nullptr;  // Set data_ptr to nullptr for DDS output binding.
     }
     else
     {
@@ -5229,20 +5927,42 @@ OrtStatusPtr BindContextOutput(Ort::KernelContext& ctx, nvinfer1::IExecutionCont
         const bool is_host_accessible_gpu_tensor = IsHostAccessibleGpuTensor(output_tensor);
         void* buffer = nullptr;
 
+        // below calls also set data_ptr (see GetOutputTensorDataPointer)
         switch (output_type)
         {
-            // below macros set data_ptr and skip_output_binding_allowed variables
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, float)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, uint16_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16, uint16_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, bool)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4, uint8_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, int8_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, uint8_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, int32_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, int64_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN, uint8_t)
-            CASE_GET_OUTPUT_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1, uint8_t)
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+            buffer = GetOutputTensorDataPointer<float>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+            buffer = GetOutputTensorDataPointer<uint16_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+            buffer = GetOutputTensorDataPointer<uint16_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+            buffer = GetOutputTensorDataPointer<bool>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4:
+            buffer = GetOutputTensorDataPointer<uint8_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+            buffer = GetOutputTensorDataPointer<int8_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+            buffer = GetOutputTensorDataPointer<uint8_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+            buffer = GetOutputTensorDataPointer<int32_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+            buffer = GetOutputTensorDataPointer<int64_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+            buffer = GetOutputTensorDataPointer<uint8_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1:
+            buffer = GetOutputTensorDataPointer<uint8_t>(output_tensor, elem_cnt, scratch_buffers, alloc, data_ptr);
+            break;
         default:
         {
             std::string error_msg =
@@ -5402,17 +6122,28 @@ OrtStatusPtr BindKernelOutput(Ort::KernelContext& ctx, const OrtMemoryInfo* /*me
      */
     switch (output_type)
     {
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, float)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, uint16_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16, uint16_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, bool)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4, uint8_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, int8_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, uint8_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, int32_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, int64_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN, uint8_t)
-        CASE_COPY_TENSOR(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1, uint8_t)
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+        return CopyDdsOutputTensor<float>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        return CopyDdsOutputTensor<uint16_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+        return CopyDdsOutputTensor<uint16_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+        return CopyDdsOutputTensor<bool>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4:
+        return CopyDdsOutputTensor<uint8_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+        return CopyDdsOutputTensor<int8_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        return CopyDdsOutputTensor<uint8_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+        return CopyDdsOutputTensor<int32_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+        return CopyDdsOutputTensor<int64_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+        return CopyDdsOutputTensor<uint8_t>(output_tensor, allocator, elem_cnt, stream);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1:
+        return CopyDdsOutputTensor<uint8_t>(output_tensor, allocator, elem_cnt, stream);
     default:
     {
         std::string error_msg =
@@ -5420,8 +6151,6 @@ OrtStatusPtr BindKernelOutput(Ort::KernelContext& ctx, const OrtMemoryInfo* /*me
         return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
     }
     }
-
-    return nullptr;
 }
 
 OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
@@ -5466,6 +6195,16 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
     auto trt_context = compute_state_ptr->context->get();
     std::unordered_set<std::string> input_names;
 
+    // Check before using trt_engine and trt_context
+    if (trt_engine == nullptr)
+    {
+        return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No engine is found.");
+    }
+    if (trt_context == nullptr)
+    {
+        return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No execution context is available.");
+    }
+
     // Get default OrtMemoryInfo from factory
     const OrtMemoryInfo* mem_info = nullptr;
     if (ep.factory_.device_memory_infos.find(compute_state_ptr->device_id) != ep.factory_.device_memory_infos.end())
@@ -5496,20 +6235,20 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
     }
     ScopedCudaContext compute_stream_context(ep.compute_stream_context_);
 
+    bool optimization_profile_changed = false;
     if (compute_state_ptr->multi_profile_enable == true)
     {
-        if (!trt_context->setOptimizationProfileAsync(compute_state_ptr->trt_profile_index_, stream))
-            return ep.ort_api.CreateStatus(
-                ORT_EP_FAIL, "NvTensorRTRTX EP select an optimization profile for the current context failed");
-    }
-
-    // Check before using trt_engine
-    if (trt_engine == nullptr)
-    {
-        return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No engine is found.");
+        if (trt_context->getOptimizationProfile() != ep.ProfileIndex())
+        {
+            if (!trt_context->setOptimizationProfileAsync(ep.ProfileIndex(), stream))
+                return ep.ort_api.CreateStatus(
+                    ORT_EP_FAIL, "NvTensorRTRTX EP select an optimization profile for the current context failed");
+            optimization_profile_changed = true;
+        }
     }
 
     bool require_io_binding = IsIOBindingRequired(compute_state_ptr, kernel_context);
+    require_io_binding = require_io_binding || optimization_profile_changed;
 
     // Get Inputs and Outputs binding names
     int total_binding_count = trt_engine->getNbIOTensors();
@@ -5540,12 +6279,14 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
         {
             char const* input_name = input_binding_names[i];
 
-            size_t input_index = 0;
             const auto iter = input_indexes.find(input_name);
-            if (iter != input_indexes.end())
+            if (iter == input_indexes.end())
             {
-                input_index = iter->second;
+                std::string error_msg = "NvTensorRTRTX EP: engine input binding '" + std::string(input_name) +
+                                        "' has no corresponding ONNX input; refusing to bind (engine/model mismatch).";
+                return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+            size_t const input_index = iter->second;
 
             auto status =
                 BindContextInput(ort_ctx, trt_engine, trt_context, input_name, input_index, shape_tensor_values,
@@ -5567,12 +6308,14 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
         {
             char const* output_name = output_binding_names[i];
 
-            size_t output_index = 0;
             const auto& index_iter = output_indexes.find(output_name);
-            if (index_iter != output_indexes.end())
+            if (index_iter == output_indexes.end())
             {
-                output_index = index_iter->second;
+                std::string error_msg = "NvTensorRTRTX EP: engine output binding '" + std::string(output_name) +
+                                        "' has no corresponding ONNX output; refusing to bind (engine/model mismatch).";
+                return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+            size_t const output_index = index_iter->second;
 
             size_t output_type = 0;
             const auto type_iter = output_types.find(output_name);
@@ -5690,7 +6433,7 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
 
     if (ep.sync_stream_after_enqueue_)
     {
-        CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+        CUDA_CALL_THROW(cudaStreamSynchronize(stream));
     }
 
     // Assign TRT output back to ORT output
@@ -5709,12 +6452,14 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
 
         if (dds_output_allocator_map.find(output_name) != dds_output_allocator_map.end())
         {
-            size_t output_index = 0;
             const auto& index_iter = output_indexes.find(output_name);
-            if (index_iter != output_indexes.end())
+            if (index_iter == output_indexes.end())
             {
-                output_index = index_iter->second;
+                std::string error_msg = "NvTensorRTRTX EP: engine output binding '" + std::string(output_name) +
+                                        "' has no corresponding ONNX output; refusing to bind (engine/model mismatch).";
+                return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+            size_t const output_index = index_iter->second;
             auto status = BindKernelOutput(ort_ctx, mem_info, dds_output_allocator_map, output_name, output_index,
                                            output_type, stream);
             if (status != nullptr)
@@ -5857,6 +6602,17 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
     auto& dds_output_allocator_map = ep.dds_output_allocator_maps_[fused_node_name];
     auto trt_engine = trt_state->engine->get();
     auto trt_context = trt_state->context->get();
+
+    // Check before using trt_engine and trt_context
+    if (trt_engine == nullptr)
+    {
+        return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No engine is found.");
+    }
+    if (trt_context == nullptr)
+    {
+        return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No execution context is available.");
+    }
+
     std::unordered_map<std::string, std::vector<int32_t>>
         shape_tensor_values;  // This map holds "shape tensor -> shape values" for the shape tensor input across this
                               // inference run
@@ -5899,7 +6655,19 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
         return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No engine is found.");
     }
 
+    bool optimization_profile_changed = false;
+    if (trt_state->multi_profile_enable && trt_context->getOptimizationProfile() != ep.ProfileIndex())
+    {
+        if (!trt_context->setOptimizationProfileAsync(ep.ProfileIndex(), stream))
+        {
+            return ep.ort_api.CreateStatus(
+                ORT_EP_FAIL, "NvTensorRTRTX EP select an optimization profile for the current context failed");
+        }
+        optimization_profile_changed = true;
+    }
+
     bool require_io_binding = IsIOBindingRequired(trt_state, kernel_context);
+    require_io_binding = require_io_binding || optimization_profile_changed;
 
     // Get Inputs and Outputs binding names
     int total_binding_count = trt_engine->getNbIOTensors();
@@ -5930,12 +6698,14 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
         {
             char const* input_name = input_binding_names[i];
 
-            size_t input_index = 0;
             const auto iter = input_indexes.find(input_name);
-            if (iter != input_indexes.end())
+            if (iter == input_indexes.end())
             {
-                input_index = iter->second;
+                std::string error_msg = "NvTensorRTRTX EP: engine input binding '" + std::string(input_name) +
+                                        "' has no corresponding ONNX input; refusing to bind (engine/model mismatch).";
+                return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+            size_t const input_index = iter->second;
 
             auto status =
                 BindContextInput(ort_ctx, trt_engine, trt_context, input_name, input_index, shape_tensor_values,
@@ -5957,12 +6727,14 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
         {
             char const* output_name = output_binding_names[i];
 
-            size_t output_index = 0;
             const auto& index_iter = output_indexes.find(output_name);
-            if (index_iter != output_indexes.end())
+            if (index_iter == output_indexes.end())
             {
-                output_index = index_iter->second;
+                std::string error_msg = "NvTensorRTRTX EP: engine output binding '" + std::string(output_name) +
+                                        "' has no corresponding ONNX output; refusing to bind (engine/model mismatch).";
+                return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+            size_t const output_index = index_iter->second;
 
             size_t output_type = 0;
             const auto type_iter = output_types.find(output_name);
@@ -6098,7 +6870,7 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
 
     if (ep.sync_stream_after_enqueue_)
     {
-        CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+        CUDA_CALL_THROW(cudaStreamSynchronize(stream));
     }
 
     // Assign TRT output back to ORT output
@@ -6117,12 +6889,14 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
 
         if (dds_output_allocator_map.find(output_name) != dds_output_allocator_map.end())
         {
-            size_t output_index = 0;
             const auto& index_iter = output_indexes.find(output_name);
-            if (index_iter != output_indexes.end())
+            if (index_iter == output_indexes.end())
             {
-                output_index = index_iter->second;
+                std::string error_msg = "NvTensorRTRTX EP: engine output binding '" + std::string(output_name) +
+                                        "' has no corresponding ONNX output; refusing to bind (engine/model mismatch).";
+                return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+            size_t const output_index = index_iter->second;
             auto status = BindKernelOutput(ort_ctx, mem_info, dds_output_allocator_map, output_name, output_index,
                                            output_type, stream);
             if (status != nullptr)

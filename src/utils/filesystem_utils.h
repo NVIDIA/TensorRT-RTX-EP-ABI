@@ -24,6 +24,7 @@
 
 #include "onnxruntime_cxx_api.h"
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -255,9 +256,10 @@ public:
 //!
 //! \param path File to read. A missing file is treated as a cache miss.
 //! \param ort_api ORT API used to report file and allocation failures.
-//! \return The file contents, or an empty vector when the file does not exist or is empty.
+//! \param bytes_to_read Number of initial bytes to read. Zero reads the entire file.
+//! \return The requested file contents, or an empty vector when the file does not exist or is empty.
 //!
-inline std::vector<char> ReadFile(const std::filesystem::path& path, const OrtApi& ort_api)
+inline std::vector<char> ReadFile(const std::filesystem::path& path, const OrtApi& ort_api, size_t bytes_to_read = 0)
 {
     if (!std::filesystem::exists(path))
     {
@@ -282,7 +284,8 @@ inline std::vector<char> ReadFile(const std::filesystem::path& path, const OrtAp
     }
 
     // Explicitly cast to size_t after validation
-    size_t usize = static_cast<size_t>(size);
+    const size_t file_size = static_cast<size_t>(size);
+    const size_t usize = bytes_to_read == 0 ? file_size : (std::min)(bytes_to_read, file_size);
 
     // Allocate buffer with explicit error handling for allocation failures
     std::vector<char> buffer;
@@ -306,7 +309,7 @@ inline std::vector<char> ReadFile(const std::filesystem::path& path, const OrtAp
 }
 
 //! \brief Prevents narrow-string paths from bypassing explicit filesystem path handling.
-inline std::vector<char> ReadFile(const std::string&, const OrtApi&) = delete;
+inline std::vector<char> ReadFile(const std::string&, const OrtApi&, size_t = 0) = delete;
 
 //!
 //! \brief Writes a binary buffer to a file, replacing any existing contents.

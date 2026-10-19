@@ -3,7 +3,7 @@
 NVIDIA TensorRT RTX Execution Provider plugin for [ONNX Runtime](https://onnxruntime.ai/).
 
 Enables hardware-accelerated inference on NVIDIA RTX GPUs (Ampere / RTX 30xx and later) via the
-[ORT Plugin EP ABI](https://onnxruntime.ai/docs/execution-providers/plugin-ep-libraries.html).
+[ORT Plugin EP ABI](https://onnxruntime.ai/docs/execution-providers/plugin-ep-libraries/).
 
 ---
 
@@ -27,7 +27,7 @@ License agreement: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/refe
 - Release Notes: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/getting-started/release-notes.html
 - Support Matrix: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/getting-started/support-matrix.html
 - Installation Guide: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/installing-tensorrt-rtx/installation-overview.html
-- C++ API: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/cpp-api/index.html
+- C++ API: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/c-api/index.html
 - Python API: https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/_static/python-api/index.html
 
 ---

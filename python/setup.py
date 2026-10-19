@@ -24,15 +24,20 @@ _PLAT_TAG = {
     ("Windows", "x86_64"): "win_amd64",
     ("Windows", "AMD64"):  "win_amd64",
     ("Windows", "ARM64"):  "win_arm64",
+    ("Windows", "arm64"):  "win_arm64",
     ("Linux",   "x86_64"): "linux_x86_64",
 }
 
 
 class BinaryDistribution(Distribution):
+    """Describe a platform-specific distribution containing native DLLs."""
+
     def has_ext_modules(self):
+        """Mark the distribution as platform-specific despite having no extension module."""
         return True
 
     def parse_config_files(self):
+        """Apply the CUDA package suffix and render CUDA-specific package metadata."""
         super().parse_config_files()
         # Append CUDA suffix to the name read from pyproject.toml.
         # This runs after setuptools validates pyproject.toml, so the base name
@@ -53,7 +58,8 @@ class bdist_wheel(_bdist_wheel):
     """No Python ABI coupling — only packaged binaries + pure Python helpers."""
 
     def get_tag(self):
-        # NV_TARGET_PLAT lets build.bat override the tag when cross-compiling
+        """Return a Python-3, ABI-independent wheel tag for the target platform."""
+        # NV_TARGET_PLAT overrides the tag when cross-compiling
         # (e.g. building win_arm64 on an x64 host where platform.machine()=="AMD64").
         env_plat = os.environ.get("NV_TARGET_PLAT", "").strip()
         if env_plat:

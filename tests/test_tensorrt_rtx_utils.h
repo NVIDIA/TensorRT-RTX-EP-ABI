@@ -25,6 +25,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <limits.h>
+#include <unistd.h>
+#endif
+
 #include <onnxruntime_cxx_api.h>
 
 // =============================================================================
@@ -57,23 +64,50 @@ inline auto toOrtString(const std::filesystem::path& p)
 #endif
 }
 
-// MODEL_FILE is injected as a compile definition by CMake and points at the
-// download location used at configure time. To make tests portable across
-// machines (e.g. CI artifacts unzipped next to the test binary) we prefer a
-// copy of the model that sits in the executable's current working directory
-// when the tests run, and only fall back to the baked-in download path if
-// that local copy is not present.
+inline std::filesystem::path executableDirectory()
+{
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    std::vector<wchar_t> buffer(260);
+    for (;;)
+    {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0)
+        {
+            std::fprintf(stderr, "ERROR: Could not determine the test executable path (error %lu).\n", GetLastError());
+            return {};
+        }
+        if (length < buffer.size() - 1)
+        {
+            return fs::path(buffer.data(), buffer.data() + length).parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#else
+    char buffer[PATH_MAX];
+    const ssize_t length = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0)
+    {
+        std::fprintf(stderr, "ERROR: Could not determine the test executable path.\n");
+        return {};
+    }
+    buffer[length] = '\0';
+    return fs::path(buffer).parent_path();
+#endif
+}
+
 inline std::filesystem::path resolveModelPath()
 {
     namespace fs = std::filesystem;
-    const fs::path injected_path{MODEL_FILE};
+    constexpr const char* kModelFileName = "resnet18_Opset18_timm.onnx";
+    const fs::path model_path = executableDirectory() / kModelFileName;
     std::error_code ec;
-    const fs::path local_path = fs::current_path(ec) / injected_path.filename();
-    if (!ec && fs::is_regular_file(local_path, ec))
+    if (model_path.empty() || !fs::is_regular_file(model_path, ec))
     {
-        return local_path;
+        std::fprintf(stderr, "ERROR: Required ResNet-18 model is not present next to the test executable: %s\n",
+                     model_path.string().c_str());
     }
-    return injected_path;
+    return model_path;
 }
 
 inline const std::filesystem::path kModelPath = resolveModelPath();

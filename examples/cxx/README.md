@@ -38,8 +38,8 @@ All samples use the same V2 EP registration pattern:
 
 ```cpp
 // 1. Register EP libraries dynamically
-env.RegisterExecutionProviderLibrary("nv_tensorrt_rtx",
-    ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
+env.RegisterExecutionProviderLibrary("NvTensorRTRTXExecutionProvider",
+    ORT_TSTR("ep/onnxruntime_providers_nv_tensorrt_rtx.dll"));
 
 // 2. Enumerate and select EP devices
 auto ep_devices = env.GetEpDevices();
@@ -52,6 +52,14 @@ std::vector<Ort::ConstEpDevice> devices = {selected_device};
 session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 ```
 
+## Using the EP with Windows ML
+
+The ONNX Runtime concepts demonstrated by every sample in this directory  also apply when using Windows ML. 
+This OSS TensorRT RTX Execution Provider can be registered with Windows ML, allowing it to be discovered, prepared, and used through the Windows ML execution-provider catalog.
+
+For the Windows ML-specific setup and registration flow, see Microsoft's
+[WinMLEpCatalog sample](https://github.com/microsoft/WindowsAppSDK-Samples/tree/main/Samples/WindowsML/cpp-cmake/WinMLEpCatalog).
+
 ## Prerequisites
 
 | Component | Version | Download |
@@ -62,8 +70,9 @@ session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 | CMake | 3.20+ | [cmake.org](https://cmake.org/download/) |
 | Visual Studio | 2022+ | [visualstudio.com](https://visualstudio.microsoft.com/) |
 
-**Build the TRT RTX EP first** by following the [Build Guide](../doc/BUILD_GUIDE.md). Copy the
-resulting `onnxruntime_providers_nv_tensorrt_rtx.dll` into the ONNX Runtime `lib/` directory.
+**Build the TRT RTX EP first** by following the [Build Guide](../../docs/build-guide.md). In the
+root build, the sample executables and core ONNX Runtime binaries are placed in `bin/`, while
+`onnxruntime_providers_nv_tensorrt_rtx.dll` is generated in `bin/ep/`.
 
 ## Building the Examples
 
@@ -75,17 +84,15 @@ cmake --build build --config Release
 ```
 
 - `ONNX_RUNTIME_PATH`: Directory containing ONNX Runtime with `include/` and `lib/` subdirectories.
-  The `onnxruntime_providers_nv_tensorrt_rtx.dll` should be placed in the `lib/` directory.
 - `TRTRTX_RUNTIME_PATH` (optional): Root of TensorRT RTX package. Ensures `tensorrt_rtx_1_*.dll`
-  and `tensorrt_onnxparser_rtx_1_*.dll` are copied to the output directory.
+  and `tensorrt_onnxparser_rtx_1_*.dll` are copied to the `bin/ep` directory.
   If omitted, these DLLs must be on the system PATH.
 - `CUDAToolkit_ROOT` (optional): Set if CUDA is not found automatically (needed for sample 30).
   Sample 30 is skipped if CUDA is not available.
 
 The shared CMake module [`cmake/onnxruntimesetup.cmake`](cmake/onnxruntimesetup.cmake) handles
 finding ONNX Runtime and TensorRT RTX libraries, creates the `onnxruntime_interface` link target,
-and copies all required DLLs (ORT core, EP provider, TRT RTX runtime + parser) to each sample's
-output directory.
+and copies core ORT binaries to `bin/` and TensorRT RTX/CUDA runtime dependencies to `bin/ep/`.
 
 ## Directory Layout
 

@@ -31,4 +31,4 @@ SPDX-License-Identifier: Apache-2.0
 |----------|------|
 | ONNX Runtime documentation | [onnxruntime.ai/docs](https://onnxruntime.ai/docs/) |
 | ONNX Runtime releases (SDK downloads) | [github.com/microsoft/onnxruntime/releases](https://github.com/microsoft/onnxruntime/releases) |
-| Plugin EP ABI documentation | [Execution Providers — Plugin EP libraries](https://onnxruntime.ai/docs/execution-providers/plugin-ep-libraries.html) |
+| Plugin EP ABI documentation | [Execution Providers — Plugin EP libraries](https://onnxruntime.ai/docs/execution-providers/plugin-ep-libraries/) |

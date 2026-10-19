@@ -24,7 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Version stamped at build time by build.bat/build.sh into _version.py
+# Version stored in onnxruntime_ep_nv_tensorrt_rtx/_version.py.
 # Name suffix (e.g. -cu13) injected by BinaryDistribution.parse_config_files() in setup.py
 dynamic = ["version"]
 

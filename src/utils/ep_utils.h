@@ -17,8 +17,6 @@
 
 #include "onnxruntime_cxx_api.h"
 
-#include <cuda_runtime_api.h>
-
 #include <functional>
 #include <memory>
 #include <sstream>

@@ -13,7 +13,7 @@ import pytest
 
 onnx = pytest.importorskip("onnx")
 from python_tests import model_builder
-from python_tests.ort_helpers import clear_path, create_session, run_session_once
+from python_tests.ort_helpers import clear_path, create_session, read_profile_text, run_session_once
 
 MEM_ADDR_LOCATION = "_MEM_ADDR_"
 
@@ -51,7 +51,13 @@ def _assert_no_mem_addr_tensors(graph):
                 _assert_no_mem_addr_tensors(nested_graph)
 
 
-def _dumped_subgraphs_from_run(registered_ep, model_path: Path, work_dir: Path, provider_options=None):
+def _dumped_subgraphs_from_run(
+    registered_ep,
+    model_path: Path,
+    work_dir: Path,
+    provider_options=None,
+    allow_cpu_fallback=False,
+):
     before = {path.resolve() for path in work_dir.glob("*.onnx")}
     dump_options = {"nv_dump_subgraphs": "1"}
     dump_options.update(provider_options or {})
@@ -60,8 +66,14 @@ def _dumped_subgraphs_from_run(registered_ep, model_path: Path, work_dir: Path, 
             registered_ep,
             str(model_path),
             provider_options=dump_options,
+            profiling_prefix=work_dir / "subgraph_dump_profile" if allow_cpu_fallback else None,
+            allow_cpu_fallback=allow_cpu_fallback,
         )
         run_session_once(session)
+        if allow_cpu_fallback:
+            profile = read_profile_text(session)
+            assert registered_ep.ep_name in profile
+            assert "CPUExecutionProvider" in profile
         del session
         gc.collect()
 
@@ -111,6 +123,7 @@ def test_multiple_trt_subgraphs_create_unique_standalone_dumps(registered_ep, wo
         model_path,
         work_dir,
         provider_options={"nv_op_types_to_exclude": "FastGelu"},
+        allow_cpu_fallback=True,
     )
 
     assert len(dumps) >= 2

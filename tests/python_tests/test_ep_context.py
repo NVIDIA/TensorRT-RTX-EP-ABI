@@ -7,7 +7,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import re
 
+import numpy as np
 import pytest
 
 onnx = pytest.importorskip("onnx")
@@ -16,11 +18,18 @@ from python_tests import model_builder
 from python_tests.ort_helpers import (
     clear_path,
     count_nodes_by_op_type,
+    create_session,
+    make_session_options,
     require_model_compiler,
 )
 
 
 TESTS_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _ort_version_at_least(ort, major, minor):
+    numbers = [int(value) for value in re.findall(r"\d+", ort.__version__)[:2]]
+    return tuple(numbers) >= (major, minor)
 
 
 def _run_ep_context_worker(registered_ep, mode, model_path, profile_prefix, compiled_path=None):
@@ -131,6 +140,45 @@ def test_compile_lowered_asymmetric_dq_preserves_split_graph_and_output(register
     compiled_model = onnx.load(str(compiled_path))
     assert count_nodes_by_op_type(compiled_model, "EPContext") >= 1
     assert count_nodes_by_op_type(compiled_model, "FastGelu", "com.microsoft") == 1
+
+
+def test_compile_only_compile_reload_produces_correct_output(registered_ep, work_dir, capfdbinary):
+    ort = registered_ep.ort
+    if not _ort_version_at_least(ort, 1, 27):
+        pytest.skip("ORT >= 1.27 is required to activate compile-only mode in ModelCompiler")
+
+    compiler_type = require_model_compiler(ort)
+    model_path = work_dir / "compile_only_mode_source.onnx"
+    ctx_path = work_dir / "compile_only_mode_ctx.onnx"
+    clear_path(model_path)
+    clear_path(ctx_path)
+    model_builder.create_base_model(model_path, "CompileOnlyModeGraph")
+
+    compile_so = make_session_options(registered_ep)
+    compile_so.log_severity_level = 0
+    compiler = compiler_type(
+        compile_so,
+        str(model_path),
+        embed_compiled_data_into_model=True,
+    )
+    compiler.compile_to_file(str(ctx_path))
+    compile_logs = capfdbinary.readouterr()
+    compile_log_text = _decode_worker_output(compile_logs.out) + _decode_worker_output(compile_logs.err)
+    assert 'Compile-only session' in compile_log_text
+    assert ctx_path.is_file()
+    compiled = onnx.load(str(ctx_path))
+    assert count_nodes_by_op_type(compiled, "EPContext") >= 1
+
+    session = create_session(registered_ep, str(ctx_path))
+    feeds = {
+        "X": np.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]], dtype=np.float32),
+        "Y": np.full((1, 3, 2), 0.5, dtype=np.float32),
+        "Z": np.array([[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]], dtype=np.float32),
+        "S": np.array([1.0], dtype=np.float32),
+    }
+    output = session.run(["O"], feeds)[0]
+    expected = feeds["X"] + feeds["Y"] + feeds["Z"] + feeds["S"][0]
+    np.testing.assert_allclose(output, expected, rtol=0, atol=1e-3)
 
 
 @pytest.mark.parametrize(

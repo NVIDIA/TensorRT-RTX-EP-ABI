@@ -13,16 +13,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <memory>
+#include <optional>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "test_tensorrt_rtx_utils.h"
 #include <gtest/gtest.h>
 #include <onnxruntime_cxx_api.h>
+#include <onnxruntime_experimental_c_api.h>
 #include <onnxruntime_session_options_config_keys.h>
 
 // Use std::thread instead of std::async for concurrent tests.
@@ -122,6 +127,59 @@ struct CompileResult
         return !buffer.empty();
     }
 };
+
+struct EpContextCallbackStore
+{
+    std::mutex mutex;
+    std::string name;
+    std::vector<char> bytes;
+    size_t write_count = 0;
+    size_t read_count = 0;
+};
+
+OrtStatus* ORT_API_CALL WriteEpContextData(void* state, const char* name, const void* buffer, size_t size)
+{
+    auto& store = *static_cast<EpContextCallbackStore*>(state);
+    try
+    {
+        std::scoped_lock lock(store.mutex);
+        store.name = name == nullptr ? "" : name;
+        store.bytes.assign(static_cast<const char*>(buffer), static_cast<const char*>(buffer) + size);
+        ++store.write_count;
+        return nullptr;
+    }
+    catch (const std::exception& error)
+    {
+        return Ort::GetApi().CreateStatus(ORT_FAIL, error.what());
+    }
+}
+
+OrtStatus* ORT_API_CALL ReadEpContextData(void* state, const char* name, OrtAllocator* allocator, void** buffer,
+                                          size_t* size)
+{
+    auto& store = *static_cast<EpContextCallbackStore*>(state);
+    std::scoped_lock lock(store.mutex);
+    if (name == nullptr || store.name != name || store.bytes.empty())
+    {
+        return Ort::GetApi().CreateStatus(ORT_FAIL, "Unexpected EPContext data read request.");
+    }
+    void* destination = allocator->Alloc(allocator, store.bytes.size());
+    if (destination == nullptr)
+    {
+        return Ort::GetApi().CreateStatus(ORT_FAIL, "Failed to allocate EPContext callback buffer.");
+    }
+    std::memcpy(destination, store.bytes.data(), store.bytes.size());
+    *buffer = destination;
+    *size = store.bytes.size();
+    ++store.read_count;
+    return nullptr;
+}
+
+template <typename T>
+T get_experimental_function(const char* name)
+{
+    return reinterpret_cast<T>(Ort::GetApi().GetExperimentalFunction(name));
+}
 
 // ---------------------------------------------------------------------------
 // Session-option factory reused by every test.
@@ -259,6 +317,67 @@ Ort::Session make_session_from_result(const CompileResult& result)
     return Ort::Session(*ort_env, result.buffer.data(), result.buffer.size(), so);
 }
 
+// Points the process temporary directory at `path` until destruction.
+class ScopedTempDirectoryOverride
+{
+public:
+    explicit ScopedTempDirectoryOverride(const std::filesystem::path& path)
+    {
+        for (const char* name : kVariables)
+        {
+            saved_.emplace_back(name, GetVariable(name));
+            SetVariable(name, path.string());
+        }
+    }
+
+    ~ScopedTempDirectoryOverride()
+    {
+        for (const auto& [name, value] : saved_)
+            SetVariable(name, value);
+    }
+
+    ScopedTempDirectoryOverride(const ScopedTempDirectoryOverride&) = delete;
+    ScopedTempDirectoryOverride& operator=(const ScopedTempDirectoryOverride&) = delete;
+
+private:
+#ifdef _WIN32
+    static constexpr const char* kVariables[] = {"TMP", "TEMP"};
+
+    static std::optional<std::string> GetVariable(const char* name)
+    {
+        const DWORD size = GetEnvironmentVariableA(name, nullptr, 0);
+        if (size == 0)
+            return std::nullopt;
+        std::string value(size, '\0');
+        value.resize(GetEnvironmentVariableA(name, value.data(), size));
+        return value;
+    }
+
+    static void SetVariable(const char* name, const std::optional<std::string>& value)
+    {
+        SetEnvironmentVariableA(name, value ? value->c_str() : nullptr);
+    }
+#else
+    static constexpr const char* kVariables[] = {"TMPDIR"};
+
+    static std::optional<std::string> GetVariable(const char* name)
+    {
+        const char* value = std::getenv(name);
+        return value == nullptr ? std::nullopt : std::optional<std::string>(value);
+    }
+
+    static void SetVariable(const char* name, const std::optional<std::string>& value)
+    {
+        if (value)
+            setenv(name, value->c_str(), 1);
+        else
+            unsetenv(name);
+    }
+#endif
+
+    std::vector<std::pair<const char*, std::optional<std::string>>> saved_;
+};
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -270,6 +389,86 @@ class CompileModelParamTest
     , public ::testing::WithParamInterface<CompileConfig>
 {
 };
+
+TEST_F(CompileModelTest, EpContextDataCallbacksRoundTripWithoutEngineFile)
+{
+    const auto set_write_callback = get_experimental_function<
+        OrtExperimental_OrtCompileApi_ModelCompilationOptions_SetEpContextDataWriteFunc_SinceV28_Fn>(
+        kOrtExperimental_OrtCompileApi_ModelCompilationOptions_SetEpContextDataWriteFunc_SinceV28_FnName);
+    const auto set_read_callback =
+        get_experimental_function<OrtExperimental_OrtApi_SessionOptions_SetEpContextDataReadFunc_SinceV28_Fn>(
+            kOrtExperimental_OrtApi_SessionOptions_SetEpContextDataReadFunc_SinceV28_FnName);
+    ASSERT_NE(set_write_callback, nullptr);
+    ASSERT_NE(set_read_callback, nullptr);
+
+    EpContextCallbackStore store;
+    const auto output_path = std::filesystem::temp_directory_path() / "trt_rtx_ep_context_callback_test.onnx";
+    std::error_code error;
+    std::filesystem::remove(output_path, error);
+
+    auto compile_options = make_session_options();
+    Ort::ModelCompilationOptions compile(*ort_env, compile_options);
+    compile.SetEpContextEmbedMode(false);
+    compile.SetInputModelPath(toOrtString(kModelPath).c_str());
+    compile.SetOutputModelPath(toOrtString(output_path).c_str());
+    ASSERT_EQ(set_write_callback(compile, WriteEpContextData, &store), nullptr);
+    ASSERT_TRUE(Ort::CompileModel(*ort_env, compile).IsOK());
+
+    {
+        std::scoped_lock lock(store.mutex);
+        EXPECT_EQ(store.write_count, 1u);
+        EXPECT_FALSE(store.name.empty());
+        EXPECT_FALSE(store.bytes.empty());
+    }
+    ASSERT_TRUE(std::filesystem::is_regular_file(output_path));
+
+    auto load_options = make_session_options();
+    ASSERT_EQ(set_read_callback(load_options, ReadEpContextData, &store), nullptr);
+    Ort::Session session{nullptr};
+    ASSERT_NO_THROW(session = Ort::Session(*ort_env, toOrtString(output_path).c_str(), load_options));
+    EXPECT_EQ(session.GetInputCount(), 1u);
+    EXPECT_EQ(session.GetOutputCount(), 1u);
+    {
+        std::scoped_lock lock(store.mutex);
+        EXPECT_EQ(store.read_count, 1u);
+    }
+
+    std::filesystem::remove(output_path, error);
+}
+
+// Sandboxed hosts (e.g. the browser GPU and WebNN compiler processes) cannot create files in the temporary
+// directory, so engine builds that would stage the serialized engine there must build it in memory instead.
+TEST_F(CompileModelTest, BuildsEngineInMemoryWithoutUsableTempDirectory)
+{
+    const auto output_path = kModelPath.parent_path() / "context_without_temp_directory.onnx";
+    const auto missing_temp_dir = kModelPath.parent_path() / "missing_temp_directory";
+    std::error_code error;
+    std::filesystem::remove(output_path, error);
+    std::filesystem::remove_all(missing_temp_dir, error);
+
+    {
+        ScopedTempDirectoryOverride temp_dir_override(missing_temp_dir);
+
+        Ort::Session jit_session{nullptr};
+        ASSERT_NO_THROW(jit_session = Ort::Session(*ort_env, toOrtString(kModelPath).c_str(), make_session_options()));
+
+        auto compile_options = make_session_options();
+        Ort::ModelCompilationOptions compile(*ort_env, compile_options);
+        compile.SetEpContextEmbedMode(true);
+        compile.SetInputModelPath(toOrtString(kModelPath).c_str());
+        compile.SetOutputModelPath(toOrtString(output_path).c_str());
+        ASSERT_TRUE(Ort::CompileModel(*ort_env, compile).IsOK());
+    }
+    ASSERT_TRUE(std::filesystem::is_regular_file(output_path));
+    EXPECT_FALSE(std::filesystem::exists(missing_temp_dir));
+
+    Ort::Session session{nullptr};
+    ASSERT_NO_THROW(session = Ort::Session(*ort_env, toOrtString(output_path).c_str(), make_session_options()));
+    EXPECT_EQ(session.GetInputCount(), 1u);
+    EXPECT_EQ(session.GetOutputCount(), 1u);
+
+    std::filesystem::remove(output_path, error);
+}
 
 // ---------------------------------------------------------------------------
 // Test 1: single-threaded compile then session load + shape check.
