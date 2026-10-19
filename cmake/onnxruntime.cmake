@@ -4,7 +4,7 @@
 include_guard(GLOBAL)
 
 set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional path to ONNX Runtime SDK root directory (must contain include/ and lib/)")
-set(ONNXRUNTIME_VERSION "1.26.0" CACHE STRING "ONNX Runtime version to download when ONNXRUNTIME_ROOT is empty")
+set(ONNXRUNTIME_VERSION "1.30.0" CACHE STRING "ONNX Runtime version to download when ONNXRUNTIME_ROOT is empty")
 set(ONNXRUNTIME_DOWNLOAD_BASE_URL
     "https://github.com/microsoft/onnxruntime/releases/download"
     CACHE STRING "Base URL for ONNX Runtime release downloads")

@@ -29,7 +29,7 @@ onnxruntime-linux-*/
 *.obj
 *.o
 
-# Python wheel — _version.py is stamped at build time by build.bat/build.sh; keep repo copy at "0.0.0"
+# Python wheel — _version.py is set at release time (see python/meta/_version.txt)
 python/onnxruntime_ep_nv_tensorrt_rtx/_version.py
 
 # Sphinx docs build artifacts
