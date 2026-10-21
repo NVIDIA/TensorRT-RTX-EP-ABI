@@ -24,6 +24,7 @@
 #include "utils/ep_utils.h"
 
 #include "onnxruntime_cxx_api.h"
+#include "onnxruntime_experimental_c_api.h"
 
 #include <filesystem>
 #include <memory>
@@ -111,6 +112,17 @@ public:
         return allocated_size;
     }
 
+    //! \brief Returns the exact byte count TensorRT last requested via reallocateOutputAsync,
+    //! as opposed to getSize()'s padded raw allocation size. Since the aligned pointer returned
+    //! by getBuffer() can sit up to (alignment - 1) bytes after the raw allocation's base, a copy
+    //! bounded by getSize() alone can read past the true end of the buffer from that pointer;
+    //! bounding by this value instead cannot, since outputPtr + requested_size is always
+    //! within [outputPtrBase, outputPtrBase + allocated_size).
+    uint64_t getRequestedSize() const
+    {
+        return requested_size;
+    }
+
     ~OutputAllocator() override
     {
         if (alloc_ != nullptr)
@@ -125,6 +137,7 @@ private:
     void* outputPtr{nullptr};      // alignment-adjusted pointer returned to TRT / exposed via getBuffer()
     void* outputPtrBase{nullptr};  // original allocation base (used for Free)
     uint64_t allocated_size = 0;   // size of the raw (base) allocation
+    uint64_t requested_size = 0;   // exact byte count TensorRT last requested (see getRequestedSize())
     std::vector<int64_t> output_shapes;
 };
 
@@ -256,6 +269,12 @@ struct IExecutionContextDeleter
     //! \brief Retain EP-owned auxiliary streams until after the execution context is destroyed.
     void SetOwnedAuxStreams(std::vector<cudaStream_t>&& streams) noexcept;
 
+    //! \brief Release EP-owned auxiliary streams so they can survive an execution-context replacement.
+    std::vector<cudaStream_t> ReleaseOwnedAuxStreams() noexcept;
+
+    //! \brief Ensure enough EP-owned auxiliary streams exist and bind them to an execution context.
+    void EnsureAndBindOwnedAuxStreams(nvinfer1::ICudaEngine& engine, nvinfer1::IExecutionContext& context);
+
     //! \brief Bind the retained streams for the context's next enqueue, if any.
     void BindOwnedAuxStreams(nvinfer1::IExecutionContext& context) noexcept;
 
@@ -265,6 +284,14 @@ struct IExecutionContextDeleter
     //! \param context Execution context to destroy; nullptr is accepted as a no-op.
     //!
     void operator()(nvinfer1::IExecutionContext* context) noexcept;
+
+    //!
+    //! \brief Creates another execution context using the retained public runtime configuration.
+    //!
+    //! \param engine Engine whose prior execution context has already been destroyed.
+    //! \return A new execution context, or nullptr if TensorRT RTX could not create one.
+    //!
+    nvinfer1::IExecutionContext* CreateExecutionContext(nvinfer1::ICudaEngine& engine) const noexcept;
 
 private:
     //!
@@ -441,7 +468,6 @@ struct TensorrtRtxComputeState
     int auxiliary_streams = -1;
     bool cuda_graph_enable = 0;
     bool multi_profile_enable = false;
-    int trt_profile_index_ = 0;
     bool is_dynamic_shape = false;
     std::string cache_prefix;
     std::string cache_suffix;
@@ -466,6 +492,7 @@ struct TensorrtRtxEpContextNodeComputeState
     std::vector<std::unordered_map<std::string, size_t>> input_info;
     std::vector<std::unordered_map<std::string, size_t>> output_info;
     std::mutex* tensorrt_mu_ptr = nullptr;
+    bool multi_profile_enable = false;
     bool is_dynamic_shape = false;
     // runtime parameters
     std::vector<AllocatorUniquePtr<void>> scratch_buffers;
@@ -487,7 +514,7 @@ struct TensorrtRtxExecutionProvider
 {
     // Constructor - Initialize your EP here
     TensorrtRtxExecutionProvider(TensorrtRtxExecutionProviderFactory& factory, const std::string& name,
-                                 const OrtSessionOptions& session_options, const OrtLogger& logger);
+                                 const OrtSessionOptions& session_options, const OrtLogger& logger, int device_id);
 
     ~TensorrtRtxExecutionProvider();
 
@@ -545,20 +572,14 @@ struct TensorrtRtxExecutionProvider
         _In_ const std::unordered_map<std::string, std::pair<const void*, size_t>>& weight_data_by_name,
         _In_ nvinfer1::ICudaEngine* trt_engine, _In_ bool detailed_build_log) noexcept;
 
-    // Build-time counterpart of WeightlessRefitEngineImpl: runs one real refit pass (via
-    // IParserRefitter, same shape as RefitEngineImpl) over the just-built weight-stripped
-    // `serialized_engine`, with an IRefitterObserver attached, and deep-copies every emitted
-    // RefitRecord. Called right after buildSerializedNetwork succeeds, while the original ONNX
-    // structure (`serialized_model_proto`) and weights (`user_weights`) are still in scope. The
-    // deserialized capture engine is discarded afterward -- it exists only to drive the observer
-    // callback, not for inference.
-    OrtStatus* CaptureWeightlessRefitTable(_In_ const nvinfer1::IHostMemory& serialized_engine,
-                                           _In_ const std::string& serialized_model_proto,
-                                           _In_ const std::vector<TensorrtUserWeights>& user_weights,
-                                           _In_ bool detailed_build_log,
-                                           _Out_ std::vector<trt_rtx_ep::WeightlessRefitRecord>& records) noexcept;
+    int ProfileIndex() const noexcept
+    {
+        return trt_profile_index_;
+    }
 
 private:
+    friend class EPContextNodeReader;
+
     // ========================================
     // Required ORT EP Interface implementations
     // ========================================
@@ -586,10 +607,23 @@ private:
     static const char* ORT_API_CALL GetCompiledModelCompatibilityInfoImpl(_In_ OrtEp* this_ptr,
                                                                           _In_ const OrtGraph* graph) noexcept;
 
+    static OrtStatus* ORT_API_CALL IsConcurrentRunSupportedImpl(_In_ OrtEp* this_ptr,
+                                                                _Outptr_ bool* is_supported) noexcept;
+
+    static OrtStatus* ORT_API_CALL SetDynamicOptionsImpl(_In_ OrtEp* this_ptr,
+                                                         _In_reads_(num_options) const char* const* option_keys,
+                                                         _In_reads_(num_options) const char* const* option_values,
+                                                         _In_ size_t num_options) noexcept;
+
     static OrtStatus* ORT_API_CALL OnRunStartImpl(_In_ OrtEp* this_ptr, _In_ const OrtRunOptions* run_options) noexcept;
 
     static OrtStatus* ORT_API_CALL OnRunEndImpl(_In_ OrtEp* this_ptr, _In_ const OrtRunOptions* run_options,
                                                 _In_ bool sync_stream) noexcept;
+
+    static OrtStatus* ORT_API_CALL SyncImpl(_In_ OrtEp* this_ptr) noexcept;
+
+    OrtStatus* ApplyRuntimeWeightStreamingBudget(const TensorrtRtxWeightStreamingBudget& requested_budget);
+    OrtStatus* RecreateWeightStreamingContexts(const std::vector<std::string>& engine_names) noexcept;
 
     mutable TensorrtRtxExecutionProviderInfo info_;
     int device_id_ = 0;
@@ -630,6 +664,7 @@ private:
     // CreateNodeComputeInfoFromGraph to skip GPU deserialization and context creation.
     bool compile_only_mode_ = false;
     int ep_context_embed_mode_ = 0;
+    std::string target_sm_;
     std::string engine_cache_prefix_;
     std::string op_types_to_exclude_;
     int64_t multi_rotary_cache_concat_offset_ = 0;
@@ -776,6 +811,33 @@ public:
     {
         return ep_context_file_path_;
     }
+
+    bool HasEpContextDataReadCallback() const noexcept
+    {
+        return ep_context_data_read_func_ != nullptr;
+    }
+
+    bool HasEpContextDataWriteCallback() const noexcept
+    {
+        return ep_context_data_write_func_ != nullptr;
+    }
+
+    OrtStatus* ReadEpContextData(const char* name, OrtAllocator* allocator, void** buffer, size_t* size) const
+    {
+        return ep_context_data_read_func_(ep_context_data_read_state_, name, allocator, buffer, size);
+    }
+
+    OrtStatus* WriteEpContextData(const char* name, const void* buffer, size_t size) const
+    {
+        return ep_context_data_write_func_(ep_context_data_write_state_, name, buffer, size);
+    }
+
+    // Callbacks are copied from OrtEpContextConfig during EP creation. ORT does not own the
+    // application state, so callers must keep it valid for the EP/session lifetime.
+    OrtReadNamedBufferFunc ep_context_data_read_func_ = nullptr;
+    void* ep_context_data_read_state_ = nullptr;
+    OrtWriteNamedBufferFunc ep_context_data_write_func_ = nullptr;
+    void* ep_context_data_write_state_ = nullptr;
 };
 
 //!

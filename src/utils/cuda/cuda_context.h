@@ -15,7 +15,7 @@
 
 #pragma once
 
-#include "utils/ep_utils.h"
+#include "utils/cuda/cuda_call.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -24,13 +24,6 @@
 
 namespace trt_rtx_ep
 {
-
-inline const char* CudaDriverErrorString(CUresult result)
-{
-    const char* error_string = nullptr;
-    cuGetErrorString(result, &error_string);
-    return error_string ? error_string : "unknown error";
-}
 
 inline OrtStatus* CudaDriverStatus(const OrtApi& api, CUresult result, const char* what,
                                    OrtErrorCode error_code = ORT_EP_FAIL)
@@ -42,29 +35,8 @@ inline OrtStatus* CudaDriverStatus(const OrtApi& api, CUresult result, const cha
 
     std::string message = what;
     message += ": ";
-    message += CudaDriverErrorString(result);
+    message += CudaErrString(result);
     return api.CreateStatus(error_code, message.c_str());
-}
-
-inline void CudaDriverThrowIfError(CUresult result, const char* what)
-{
-    if (result == CUDA_SUCCESS)
-    {
-        return;
-    }
-
-    THROW("CUDA Driver Error: ", what, ": ", CudaDriverErrorString(result), " (error code: ", static_cast<int>(result),
-          ")");
-}
-
-inline void CudaRuntimeThrowIfError(cudaError_t result, const char* what)
-{
-    if (result == cudaSuccess)
-    {
-        return;
-    }
-
-    THROW("CUDA Error: ", what, ": ", cudaGetErrorString(result), " (error code: ", static_cast<int>(result), ")");
 }
 
 inline OrtStatus* GetCudaStreamContext(const OrtApi& api, cudaStream_t stream, CUcontext* context)
@@ -80,7 +52,7 @@ inline OrtStatus* GetCudaStreamContext(const OrtApi& api, cudaStream_t stream, C
 inline CUcontext GetCudaStreamContextOrThrow(cudaStream_t stream)
 {
     CUcontext context = nullptr;
-    CudaDriverThrowIfError(cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &context), "cuStreamGetCtx");
+    CUDA_DRIVER_CALL_THROW(cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &context));
     return context;
 }
 
@@ -95,10 +67,10 @@ public:
             return;
         }
 
-        CudaDriverThrowIfError(cuCtxGetCurrent(&previous_), "cuCtxGetCurrent");
+        CUDA_DRIVER_CALL_THROW(cuCtxGetCurrent(&previous_));
         if (previous_ != target_)
         {
-            CudaDriverThrowIfError(cuCtxSetCurrent(target_), "cuCtxSetCurrent");
+            CUDA_DRIVER_CALL_THROW(cuCtxSetCurrent(target_));
             changed_ = true;
         }
     }
@@ -183,14 +155,14 @@ public:
         : pushed_(true)
     {
         CUcontext context = nullptr;
-        CudaDriverThrowIfError(cuCtxGetCurrent(&context), "cuCtxGetCurrent");
+        CUDA_DRIVER_CALL_THROW(cuCtxGetCurrent(&context));
         if (context == nullptr)
         {
-            CudaRuntimeThrowIfError(cudaSetDevice(device_id), "cudaSetDevice");
-            CudaDriverThrowIfError(cuCtxGetCurrent(&context), "cuCtxGetCurrent");
+            CUDA_CALL_THROW(cudaSetDevice(device_id));
+            CUDA_DRIVER_CALL_THROW(cuCtxGetCurrent(&context));
         }
 
-        CudaDriverThrowIfError(cuCtxPushCurrent(context), "cuCtxPushCurrent");
+        CUDA_DRIVER_CALL_THROW(cuCtxPushCurrent(context));
     }
 
     explicit ScopedCudaContextPush(CUcontext context)
@@ -198,7 +170,7 @@ public:
     {
         if (context != nullptr)
         {
-            CudaDriverThrowIfError(cuCtxPushCurrent(context), "cuCtxPushCurrent");
+            CUDA_DRIVER_CALL_THROW(cuCtxPushCurrent(context));
         }
     }
 

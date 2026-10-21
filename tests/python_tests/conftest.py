@@ -41,7 +41,7 @@ def resnet18_model_path() -> Path:
         if candidate.is_file():
             return candidate
 
-    pytest.skip(
+    pytest.fail(
         f"{RESNET18_MODEL_NAME} was not found. Place it in the current "
         f"working directory or under {PACKAGE_DIR}."
     )
@@ -49,20 +49,30 @@ def resnet18_model_path() -> Path:
 
 @pytest.fixture(scope="session")
 def registered_ep() -> RegisteredEp:
-    ort = pytest.importorskip("onnxruntime")
-    ep_pkg = pytest.importorskip("onnxruntime_ep_nv_tensorrt_rtx")
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        pytest.fail(f"onnxruntime is required for the TRT RTX EP tests: {exc}", pytrace=False)
+
+    try:
+        import onnxruntime_ep_nv_tensorrt_rtx as ep_pkg
+    except ImportError as exc:
+        pytest.fail(
+            f"onnxruntime_ep_nv_tensorrt_rtx is required for the TRT RTX EP tests: {exc}",
+            pytrace=False,
+        )
 
     ep_name = ep_pkg.get_ep_name()
     library_path = Path(ep_pkg.get_library_path())
     if not ep_name:
-        pytest.skip("onnxruntime_ep_nv_tensorrt_rtx.get_ep_name() returned an empty name")
+        pytest.fail("onnxruntime_ep_nv_tensorrt_rtx.get_ep_name() returned an empty name")
     if not library_path.is_file():
-        pytest.skip(f"TRT RTX EP library path does not exist: {library_path}")
+        pytest.fail(f"TRT RTX EP library path does not exist: {library_path}")
 
     if not hasattr(ort, "register_execution_provider_library"):
-        pytest.skip("onnxruntime build does not expose register_execution_provider_library")
+        pytest.fail("onnxruntime build does not expose register_execution_provider_library")
     if not hasattr(ort, "get_ep_devices"):
-        pytest.skip("onnxruntime build does not expose get_ep_devices")
+        pytest.fail("onnxruntime build does not expose get_ep_devices")
 
     registered_by_fixture = False
     try:
@@ -74,7 +84,7 @@ def registered_ep() -> RegisteredEp:
             if getattr(d, "ep_name", None) == ep_name
         ]
         if not devices:
-            pytest.skip(f"Failed to register TRT RTX EP library: {exc}")
+            pytest.fail(f"Failed to register TRT RTX EP library: {exc}")
 
     yield RegisteredEp(
         ort=ort,

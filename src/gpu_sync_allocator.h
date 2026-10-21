@@ -43,7 +43,7 @@ namespace trt_rtx_ep
 //!          TensorRT RTX off its default allocator, whose allocateAsync() uses cudaMallocAsync when
 //!          CUDA memory pools are supported. On RTX products cudaMallocAsync has proven unreliable —
 //!          e.g. under CiG it can exhaust the process virtual address space while VRAM remains
-//!          available due to a known CUDA Windows driver bug. Forwarding to the device BFC arena (cudaMalloc)
+//!          available (CUDA Windows bug 5509073). Forwarding to the device BFC arena (cudaMalloc)
 //!          keeps allocation deterministic while reusing arena chunks.
 //!
 //! \note Header-only; included by tensorrt_rtx_provider_factory.h so the type is complete at the

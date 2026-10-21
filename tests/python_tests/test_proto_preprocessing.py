@@ -5,12 +5,20 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 onnx = pytest.importorskip("onnx")
 
 from python_tests import model_builder
-from python_tests.ort_helpers import clear_path, count_nodes_by_op_type, make_session_options, require_model_compiler
+from python_tests.ort_helpers import (
+    clear_path,
+    count_nodes_by_op_type,
+    create_session,
+    make_deterministic_feeds,
+    make_session_options,
+    require_model_compiler,
+)
 
 
 def _compile_to_ep_context(registered_ep, input_path, output_path):
@@ -26,6 +34,18 @@ def _compile_to_ep_context(registered_ep, input_path, output_path):
 
     compiled = onnx.load(str(output_path))
     assert count_nodes_by_op_type(compiled, "EPContext") >= 1
+
+    ep_session = create_session(registered_ep, str(output_path))
+    feeds = make_deterministic_feeds(ep_session)
+    cpu_session = registered_ep.ort.InferenceSession(
+        str(input_path),
+        providers=["CPUExecutionProvider"],
+    )
+    expected = cpu_session.run(None, feeds)
+    actual = ep_session.run(None, feeds)
+    assert len(actual) == len(expected)
+    for actual_value, expected_value in zip(actual, expected):
+        np.testing.assert_allclose(actual_value, expected_value, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize(

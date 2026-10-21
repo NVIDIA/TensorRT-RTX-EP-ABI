@@ -24,11 +24,14 @@ FIELD_MARKERS = {
     "type": "/// @par Type",
     "default": "/// @par Default",
     "values": "/// @par Accepted values",
+    "dynamic": "/// @par Dynamic updates",
 }
+OPTION_VALUE_TYPES = {"Boolean", "Integer", "String"}
 CONSTANT_RE = re.compile(
     r'constexpr\s+const\s+char\s*\*\s*(?P<symbol>\w+)\s*=\s*"(?P<name>[^"]+)"\s*;'
 )
 MARKDOWN_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+DEFAULT_VALUE_RE = re.compile(r"`[^`\n]+`")
 
 
 @dataclass(frozen=True)
@@ -39,7 +42,8 @@ class Option:
     value_type: str
     default: str
     description: str
-    values: str | None
+    values: str
+    dynamic: bool
 
 
 def parse_options(header: Path) -> list[Option]:
@@ -82,13 +86,28 @@ def parse_options(header: Path) -> list[Option]:
 
         match = CONSTANT_RE.fullmatch(line)
         if match and namespace in NAMESPACE_TITLES:
-            required = {"type", "default", "description"}
+            required = {"type", "default", "description", "values"}
             missing = {field for field in required if not fields.get(field)}
             if missing:
                 missing_text = ", ".join(sorted(missing))
                 raise ValueError(
                     f"{header}:{line_number}: {match['symbol']} is missing "
                     f"option documentation fields: {missing_text}"
+                )
+            if not DEFAULT_VALUE_RE.fullmatch(fields["default"]):
+                raise ValueError(
+                    f"{header}:{line_number}: {match['symbol']} default must be "
+                    "exactly one Markdown code-formatted value"
+                )
+            if fields["type"] not in OPTION_VALUE_TYPES:
+                raise ValueError(
+                    f"{header}:{line_number}: {match['symbol']} type must be one of "
+                    f"{', '.join(sorted(OPTION_VALUE_TYPES))}"
+                )
+            if fields["default"] not in fields["values"]:
+                raise ValueError(
+                    f"{header}:{line_number}: {match['symbol']} accepted values must "
+                    "explain the default value"
                 )
             options.append(
                 Option(
@@ -98,7 +117,8 @@ def parse_options(header: Path) -> list[Option]:
                     value_type=fields["type"],
                     default=fields["default"],
                     description=fields["description"],
-                    values=fields.get("values"),
+                    values=fields["values"],
+                    dynamic="dynamic" in fields,
                 )
             )
             fields = {}
@@ -137,6 +157,9 @@ def render(options: list[Option], header: Path) -> str:
         f"``{relative_header}``.",
         "",
         "All option values are passed to ONNX Runtime as strings.",
+        "For session provider options, *Dynamic updates* indicates whether the option can be",
+        "changed after session creation with ``Ort::Session::SetEpDynamicOptions``.",
+        "Dynamic updates do not apply to per-run options.",
         "",
     ]
 
@@ -147,24 +170,32 @@ def render(options: list[Option], header: Path) -> str:
                 "-" * len(title),
                 "",
                 ".. list-table::",
+                "   :class: provider-options-table",
                 "   :header-rows: 1",
-                "   :widths: 25 75",
+                "   :widths: 18 8 8 8 29 29",
                 "",
                 "   * - Option",
+                "     - Type",
+                "     - Default",
+                "     - Dynamic updates",
+                "     - Accepted values",
                 "     - Description",
             ]
         )
         for option in (item for item in options if item.namespace == namespace):
-            description = (
-                f"Type: {to_rst(option.value_type)}. "
-                f"{to_rst(option.description)} "
-                f"Default: {to_rst(option.default)}."
-            )
-            if option.values:
-                description += f" {to_rst(option.values)}"
+            description = to_rst(option.description)
+            accepted_values = to_rst(option.values)
+            if option.namespace == "run_option_names":
+                dynamic = "N/A"
+            else:
+                dynamic = "Yes" if option.dynamic else "No"
             lines.extend(
                 [
                     f"   * - ``{option.name}``",
+                    f"     - {to_rst(option.value_type)}",
+                    f"     - {to_rst(option.default)}",
+                    f"     - {dynamic}",
+                    f"     - {accepted_values}",
                     f"     - {description}",
                 ]
             )

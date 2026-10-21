@@ -23,8 +23,8 @@ inference devices via the V2 device-based APIs. This involves 3 steps:
 ### 1. Registration of execution provider libraries
 ```cpp
 auto env = Ort::Env(ORT_LOGGING_LEVEL_WARNING);
-env.RegisterExecutionProviderLibrary("nv_tensorrt_rtx",
-    ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
+env.RegisterExecutionProviderLibrary("NvTensorRTRTXExecutionProvider",
+    ORT_TSTR("ep/onnxruntime_providers_nv_tensorrt_rtx.dll"));
 ```
 
 ### 2. Querying and selecting EP Devices

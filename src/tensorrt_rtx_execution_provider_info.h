@@ -63,6 +63,9 @@ struct TensorrtRtxExecutionProviderInfo
     // Set internally by OrtCompileAPI::CompileModel(). When true, the EP skips GPU
     // deserialization and execution context creation since the session will not run inference.
     bool compile_only_mode{false};
+    // GPU compute capability string for AOT compilation without a live GPU (e.g. "sm120").
+    // When non-empty, CUDA runtime initialization is skipped in the EP constructor.
+    std::string target_sm{""};
     std::string engine_cache_prefix{""};
     std::string op_types_to_exclude{""};
     bool enable_profiling{false};

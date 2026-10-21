@@ -295,7 +295,11 @@ TEST(TensorRTRTXEpTest_Profiler, CudaGraphConflictNoError)
 TEST(TensorRTRTXEpTest_Profiler, BadOutputFilePath)
 {
     const std::string model = MakeTestModel("profiler_bad_path.onnx");
-    const std::string bad_path = "Z:\\nonexistent\\dir\\profile.json";
+    // A Windows drive-style path is a valid relative filename on Linux. Use a
+    // missing parent directory so opening the output fails on every platform.
+    const auto bad_parent = std::filesystem::temp_directory_path() / "trt_rtx_profiler_missing_parent";
+    std::filesystem::remove_all(bad_parent);
+    const std::string bad_path = (bad_parent / "profile.json").string();
     const std::string good_path = "profiler_bad_path_recovery.json";
     clearFileIfExists(good_path);
 
@@ -307,6 +311,8 @@ TEST(TensorRTRTXEpTest_Profiler, BadOutputFilePath)
         // No file should appear at the bad path (can't create it) — no crash expected.
         EXPECT_FALSE(std::filesystem::exists(bad_path));
     }) << "Session must not throw when the profiling output path is invalid.";
+
+    std::filesystem::remove_all(bad_parent);
 }
 
 // 11. After N runs, the JSON contains N sections with tid values 0..N-1.

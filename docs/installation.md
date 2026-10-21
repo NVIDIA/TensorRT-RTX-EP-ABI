@@ -67,9 +67,9 @@ The `onnxruntime_ep_nv_tensorrt_rtx` package exposes three helper functions:
 
 | Function | Returns |
 |----------|---------|
-| `get_ep_name()` | `"nv_tensorrt_rtx"` — the EP provider name used for registration and device filtering |
+| `get_ep_name()` | `"NvTensorRTRTXExecutionProvider"` — the EP provider name used for registration and device filtering |
 | `get_library_path()` | Absolute path to the bundled EP plugin DLL / SO |
-| `get_ep_names()` | `["nv_tensorrt_rtx"]` — list form of the above |
+| `get_ep_names()` | `["NvTensorRTRTXExecutionProvider"]` — list form of the above |
 
 For the full Python and C++ usage patterns including provider options, see the
 [integration guide](integration-guide.md).

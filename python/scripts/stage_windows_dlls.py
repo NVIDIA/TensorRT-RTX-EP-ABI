@@ -5,10 +5,6 @@
 Copy the EP DLL, TensorRT RTX DLLs, CUDA runtime, docs, and optional plugin DLLs
 into the Python package directory before building a wheel.
 
-The EP enforces loading TensorRT RTX DLLs only from the same directory as the EP DLL
-(see secure_load.cc). All DLLs must sit next to each other inside
-onnxruntime_ep_nv_tensorrt_rtx/.
-
 Note: the EP links against nvcudart_hybrid64.dll (NVIDIA driver component), not
 cudart64_*.dll directly. cudart64_*.dll is bundled as a redistribution requirement.
 
@@ -22,7 +18,7 @@ Environment variables (used when CLI args omitted):
 
 Example:
   python scripts/stage_windows_dlls.py ^
-    --ep-dll ..\\TensorRT-RTX-EP-ABI\\build\\Release\\onnxruntime_providers_nv_tensorrt_rtx.dll ^
+    --ep-dll ..\\trt-rtx-ep-abi\\build\\Release\\onnxruntime_providers_nv_tensorrt_rtx.dll ^
     --trt-lib-dir C:\\TensorRT-RTX\\bin ^
     --cuda-bin "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\x64" ^
     --trt-doc-dir C:\\TensorRT-RTX\\doc ^
@@ -39,10 +35,12 @@ from pathlib import Path
 
 
 def _package_dir() -> Path:
+    """Return the default Python package directory used for DLL staging."""
     return Path(__file__).resolve().parent.parent / "onnxruntime_ep_nv_tensorrt_rtx"
 
 
 def _glob_one(pattern: str, directory: Path) -> Path:
+    """Return the unique file matching pattern under directory."""
     matches = sorted(directory.glob(pattern))
     if not matches:
         raise FileNotFoundError(f"No file matching {pattern!r} under {directory}")
@@ -89,6 +87,15 @@ def _find_cudart(cuda_bin: Path) -> Path:
     )
 
 
+def _clear_dlls(directory: Path) -> None:
+    """Remove previously staged DLLs from directory when it exists."""
+    if not directory.is_dir():
+        return
+    for stale in directory.glob("*.dll"):
+        stale.unlink()
+        print(f"Removed stale {stale}")
+
+
 def stage(
     ep_dll: Path,
     trt_lib_dir: Path,
@@ -97,6 +104,7 @@ def stage(
     trt_doc_dir: Path | None = None,
     plugin_dir: Path | None = None,
 ) -> None:
+    """Stage a standalone EP and its flat runtime dependencies for a wheel."""
     dest.mkdir(parents=True, exist_ok=True)
 
     if not ep_dll.is_file():
@@ -109,9 +117,10 @@ def stage(
     # Without this, upgrading (e.g. tensorrt_rtx_1_0.dll -> 1_1.dll) leaves both
     # in the directory and both get packaged into the wheel.
     # Use TRTRTX_*.txt rather than *.txt to avoid deleting any checked-in package files.
-    for stale in list(dest.glob("*.dll")) + list(dest.glob("TRTRTX_*.txt")):
+    for stale in dest.glob("TRTRTX_*.txt"):
         stale.unlink()
         print(f"Removed stale {stale}")
+    _clear_dlls(dest)
 
     # Copy EP DLL
     shutil.copy2(ep_dll, dest / ep_dll.name)
@@ -168,6 +177,7 @@ def stage(
 
 
 def main() -> int:
+    """Parse staging arguments and stage a standalone EP package."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--ep-dll",
@@ -210,6 +220,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    dest = args.dest if args.dest is not None else _package_dir()
+
     ep_dll = args.ep_dll
     if ep_dll is None:
         env_ep = os.environ.get("NV_TRT_RTX_EP_DLL")
@@ -244,8 +256,6 @@ def main() -> int:
         if env_plugin:
             plugin_dir = Path(env_plugin)
 
-    dest = args.dest if args.dest is not None else _package_dir()
-
     try:
         stage(
             ep_dll.resolve(),
@@ -255,7 +265,7 @@ def main() -> int:
             trt_doc_dir.resolve() if trt_doc_dir is not None else None,
             plugin_dir.resolve() if plugin_dir is not None else None,
         )
-    except (FileNotFoundError, OSError) as e:
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

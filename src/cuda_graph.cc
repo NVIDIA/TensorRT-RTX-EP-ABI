@@ -94,7 +94,7 @@ void CUDAGraphManager::CaptureEnd(CudaGraphAnnotation_t cuda_graph_annotation_id
     CUDA_CALL_THROW(cudaGraphDestroy(graph));
 
     // Currently all the captured graphs will be tied to the session's lifecycle
-    // TODO: Add an interface to free captured graphs
+    // TODO(wy): Addd an interface to free captured graphs
     cuda_graph_set_.Put(cuda_graph_annotation_id, graph_exec);
 }
 

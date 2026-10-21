@@ -78,6 +78,11 @@ public:
     std::unordered_map<uint32_t, MemoryInfoUniquePtr> device_memory_infos;  //!< Device ID -> memory info
     std::unordered_map<uint32_t, MemoryInfoUniquePtr> pinned_memory_infos;  //!< Device ID -> pinned memory info
 
+    // Hardware devices this factory described itself rather than discovered, used when the
+    // process cannot reach the driver (see GetSupportedDevicesImpl). They must outlive the
+    // OrtEpDevice instances built from them, so the factory owns them.
+    std::vector<OrtHardwareDevice*> described_devices;
+
     // Keeps allocators per EP device in factory so they can be shared across sessions.
     std::unordered_map<uint32_t, std::unique_ptr<ArenaAllocator>>
         device_allocators;  //!< Device ID -> BFC arena allocator
@@ -100,8 +105,8 @@ public:
     //! \brief Whether the async CUDA mempool is currently usable for the device:
     //! created+probed and not latched off by a runtime failure. Used by the compute
     //! path and CUDA graph capture to pick async vs synchronous behavior.
-    //! Thread-safe: device_mempool_allocators is immutable after session setup; the
-    //! disabled set is guarded by mempool_state_mutex_.
+    //! Thread-safe: device_mempool_allocators (which CreateAllocatorImpl may insert
+    //! into concurrently) and the disabled set are guarded by mempool_state_mutex_.
     //! \param[in]  device_id  GPU device ID.
     bool IsAsyncMempoolEnabledForDevice(uint32_t device_id) const;
 

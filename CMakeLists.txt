@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 
 # Enable MSBuild multi-tool task scheduling: each source file becomes an
 # independent MSBuild task, allowing the scheduler to interleave compilations
@@ -30,16 +30,90 @@ endif()
 project(trt-rtx-ep LANGUAGES CXX)
 
 # =============================================================================
+# Target Architecture
+# =============================================================================
+# Visual Studio generators expose the selected target through
+# CMAKE_GENERATOR_PLATFORM. Ninja does not, so it uses the MSVC developer
+# environment or an explicit TRT_RTX_EP_TARGET_ARCH. ARM64EC must not be
+# inferred from C++ compiler macros because it has x64-compatible ABI traits.
+set(TRT_RTX_EP_TARGET_ARCH "" CACHE STRING
+    "Target architecture (x64, arm64ec, or arm64). Inferred from the generator or MSVC environment.")
+set_property(CACHE TRT_RTX_EP_TARGET_ARCH PROPERTY STRINGS x64 arm64ec arm64)
+set(TRT_RTX_EP_OUTPUT_NAME "onnxruntime_providers_nv_tensorrt_rtx")
+set(TRT_RTX_EP_DEPENDENCY_SUBDIR "")
+
+if(WIN32)
+    string(TOLOWER "${TRT_RTX_EP_TARGET_ARCH}" TRT_RTX_EP_TARGET_ARCH)
+    set(_trt_rtx_detected_arch "")
+
+    # Visual Studio provides -A through CMAKE_GENERATOR_PLATFORM. Ninja's
+    # selected MSVC target comes from the developer environment instead.
+    if(CMAKE_GENERATOR_PLATFORM)
+        string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" _trt_rtx_detected_arch)
+    elseif(NOT TRT_RTX_EP_TARGET_ARCH AND
+           DEFINED ENV{VSCMD_ARG_TGT_ARCH} AND
+           NOT "$ENV{VSCMD_ARG_TGT_ARCH}" STREQUAL "")
+        string(TOLOWER "$ENV{VSCMD_ARG_TGT_ARCH}" _trt_rtx_detected_arch)
+    elseif(NOT TRT_RTX_EP_TARGET_ARCH)
+        # CLion can configure Ninja with an absolute cl.exe path without the
+        # developer-prompt environment.
+        get_filename_component(_trt_rtx_compiler_dir
+            "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        get_filename_component(_trt_rtx_detected_arch
+            "${_trt_rtx_compiler_dir}" NAME)
+        string(TOLOWER "${_trt_rtx_detected_arch}" _trt_rtx_detected_arch)
+    endif()
+
+    if(_trt_rtx_detected_arch STREQUAL "amd64")
+        set(_trt_rtx_detected_arch "x64")
+    endif()
+    if(_trt_rtx_detected_arch AND
+       NOT _trt_rtx_detected_arch MATCHES "^(x64|arm64ec|arm64)$")
+        message(FATAL_ERROR
+            "Unable to infer a supported Windows target architecture from "
+            "'${_trt_rtx_detected_arch}'. Set TRT_RTX_EP_TARGET_ARCH to x64, arm64ec, or arm64.")
+    endif()
+
+    if(NOT TRT_RTX_EP_TARGET_ARCH)
+        set(TRT_RTX_EP_TARGET_ARCH "${_trt_rtx_detected_arch}")
+    elseif(CMAKE_GENERATOR_PLATFORM AND
+           NOT TRT_RTX_EP_TARGET_ARCH STREQUAL _trt_rtx_detected_arch)
+        message(FATAL_ERROR
+            "TRT_RTX_EP_TARGET_ARCH='${TRT_RTX_EP_TARGET_ARCH}' conflicts with "
+            "CMAKE_GENERATOR_PLATFORM='${CMAKE_GENERATOR_PLATFORM}'.")
+    endif()
+
+    if(NOT TRT_RTX_EP_TARGET_ARCH MATCHES "^(x64|arm64ec|arm64)$")
+        message(FATAL_ERROR
+            "Unsupported TRT_RTX_EP_TARGET_ARCH='${TRT_RTX_EP_TARGET_ARCH}'. "
+            "Expected x64, arm64ec, or arm64.")
+    endif()
+
+    # Standalone x64 and ARM64 builds both retain the public unsuffixed DLL
+    # name and flat dependency layout.
+
+    message(STATUS "TensorRT RTX EP target architecture: ${TRT_RTX_EP_TARGET_ARCH}")
+    message(STATUS "TensorRT RTX EP output name: ${TRT_RTX_EP_OUTPUT_NAME}")
+endif()
+
+# =============================================================================
 # Project Version Configuration
 # =============================================================================
 # Default 0.0.0 for local/dev builds. CI overrides via:
 #   cmake -DTRT_RTX_EP_VERSION=1.2.3 ..
 set(TRT_RTX_EP_VERSION "0.0.0" CACHE STRING "EP version (set by CI)")
+if(TRT_RTX_EP_VERSION STREQUAL "")
+    set(TRT_RTX_EP_VERSION "0.0.0")
+endif()
+if(NOT TRT_RTX_EP_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR
+        "TRT_RTX_EP_VERSION must use M.m.p format, got '${TRT_RTX_EP_VERSION}'.")
+endif()
 
 message(STATUS "TensorRT RTX EP version: ${TRT_RTX_EP_VERSION}")
 
 # Split version string into components for Windows VERSIONINFO resource
-string(REPLACE "." ";" TRT_RTX_EP_VERSION_LIST ${TRT_RTX_EP_VERSION})
+string(REPLACE "." ";" TRT_RTX_EP_VERSION_LIST "${TRT_RTX_EP_VERSION}")
 list(GET TRT_RTX_EP_VERSION_LIST 0 TRT_RTX_EP_VERSION_MAJOR)
 list(GET TRT_RTX_EP_VERSION_LIST 1 TRT_RTX_EP_VERSION_MINOR)
 list(GET TRT_RTX_EP_VERSION_LIST 2 TRT_RTX_EP_VERSION_PATCH)
@@ -67,6 +141,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Position-independent code (required for shared libraries on some platforms)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+set(TRT_RTX_BIN_DIR "${CMAKE_BINARY_DIR}/bin")
+# Keep build-tree executables, the EP, and all runtime DLLs together. Install
+# rules below create the separately packaged executable/test/EP layouts.
+set(TRT_RTX_EP_BIN_DIR "${TRT_RTX_BIN_DIR}")
+set(TRT_RTX_ARCHIVE_DIR "${CMAKE_BINARY_DIR}/lib")
+
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${TRT_RTX_ARCHIVE_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${TRT_RTX_BIN_DIR}")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${TRT_RTX_BIN_DIR}")
+
+function(trt_rtx_set_target_output_directory target directory)
+    set_target_properties(${target} PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY "${TRT_RTX_ARCHIVE_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY "${directory}"
+        RUNTIME_OUTPUT_DIRECTORY "${directory}"
+    )
+endfunction()
+
 # =============================================================================
 # Compiler Warning Flags
 # =============================================================================
@@ -89,11 +181,31 @@ endif()
 
 # Security-related compiler flags for MSVC (Windows)
 if(MSVC)
+    if(WIN32 AND TRT_RTX_EP_TARGET_ARCH STREQUAL "x64")
+        set(_trt_rtx_spectre_default ON)
+    else()
+        # ARM64/ARM64EC Spectre-mitigated CRT libraries are an optional Visual
+        # Studio component and are not present in the standard cross toolchain.
+        set(_trt_rtx_spectre_default OFF)
+    endif()
+    option(TRT_RTX_EP_ENABLE_SPECTRE_MITIGATIONS
+        "Compile with /Qspectre (requires architecture-specific Spectre libraries)"
+        ${_trt_rtx_spectre_default})
+
     # /GS - Buffer security check (enabled by default, but explicit)
-    # /Qspectre - Spectre mitigation
     # /guard:cf - Control Flow Guard
     # /sdl - Security Development Lifecycle checks
-    add_compile_options(/GS /Qspectre /guard:cf /sdl)
+    add_compile_options(/GS /guard:cf /sdl)
+    if(TRT_RTX_EP_ENABLE_SPECTRE_MITIGATIONS)
+        # /Qspectre - Spectre mitigation
+        add_compile_options(/Qspectre)
+    elseif(WIN32 AND NOT TRT_RTX_EP_TARGET_ARCH STREQUAL "x64")
+        message(STATUS
+            "ARM Spectre mitigation disabled. In Visual Studio Installer, select "
+            "Individual components > MSVC v143 - VS 2022 C++ ARM64/ARM64EC "
+            "Spectre-mitigated libs (Latest), then set "
+            "TRT_RTX_EP_ENABLE_SPECTRE_MITIGATIONS=ON for production builds.")
+    endif()
     # /sdl can promote deprecation diagnostics after the earlier /wd4996.
     # Repeat it here so MSVC keeps third-party deprecated API uses as warnings. Added due to protobuf
     add_compile_options(/wd4996)
@@ -110,10 +222,117 @@ if(MSVC)
 endif()
 
 # Find CUDA Toolkit (required)
+#
+# NVIDIA's combined Windows ARM64 toolkit layout contains both lib/x64 and
+# lib/arm64. FindCUDAToolkit currently searches the host ABI first, so an
+# ARM64 cross-build can otherwise be configured with x64 import libraries and
+# fail only at the final link step. Seed the architecture-specific libraries
+# before the imported CUDA targets are created.
+set(TRT_RTX_EP_CUDA_LIBRARY_DIR "" CACHE PATH
+    "CUDA import-library directory. Inferred from CUDAToolkit_ROOT on Windows.")
+if(WIN32 AND NOT TRT_RTX_EP_CUDA_LIBRARY_DIR AND CUDAToolkit_ROOT)
+    if(TRT_RTX_EP_TARGET_ARCH STREQUAL "arm64")
+        set(_trt_rtx_cuda_library_arch "arm64")
+    else()
+        # ARM64EC applications use the x64 ABI surface of CUDA.
+        set(_trt_rtx_cuda_library_arch "x64")
+    endif()
+
+    set(_trt_rtx_cuda_library_candidate
+        "${CUDAToolkit_ROOT}/lib/${_trt_rtx_cuda_library_arch}")
+    if(EXISTS "${_trt_rtx_cuda_library_candidate}/cudart.lib" AND
+       EXISTS "${_trt_rtx_cuda_library_candidate}/cuda.lib" AND
+       EXISTS "${_trt_rtx_cuda_library_candidate}/nvml.lib")
+        set(TRT_RTX_EP_CUDA_LIBRARY_DIR
+            "${_trt_rtx_cuda_library_candidate}" CACHE PATH
+            "CUDA import-library directory. Inferred from CUDAToolkit_ROOT on Windows."
+            FORCE)
+    endif()
+endif()
+
+if(WIN32 AND TRT_RTX_EP_CUDA_LIBRARY_DIR)
+    foreach(_cuda_library IN ITEMS cudart cuda nvml)
+        if(NOT EXISTS "${TRT_RTX_EP_CUDA_LIBRARY_DIR}/${_cuda_library}.lib")
+            message(FATAL_ERROR
+                "TRT_RTX_EP_CUDA_LIBRARY_DIR is missing ${_cuda_library}.lib: "
+                "${TRT_RTX_EP_CUDA_LIBRARY_DIR}")
+        endif()
+    endforeach()
+
+    # These are the cache variables consumed by FindCUDAToolkit when it
+    # constructs CUDA::cudart, CUDA::cuda_driver, and CUDA::nvml.
+    set(CUDA_CUDART "${TRT_RTX_EP_CUDA_LIBRARY_DIR}/cudart.lib"
+        CACHE FILEPATH "CUDA runtime import library" FORCE)
+    set(CUDA_cudart_LIBRARY "${TRT_RTX_EP_CUDA_LIBRARY_DIR}/cudart.lib"
+        CACHE FILEPATH "CUDA runtime import library" FORCE)
+    set(CUDA_cuda_driver_LIBRARY "${TRT_RTX_EP_CUDA_LIBRARY_DIR}/cuda.lib"
+        CACHE FILEPATH "CUDA driver import library" FORCE)
+    set(CUDA_nvml_LIBRARY "${TRT_RTX_EP_CUDA_LIBRARY_DIR}/nvml.lib"
+        CACHE FILEPATH "NVML import library" FORCE)
+    message(STATUS
+        "CUDA import libraries for ${TRT_RTX_EP_TARGET_ARCH}: "
+        "${TRT_RTX_EP_CUDA_LIBRARY_DIR}")
+endif()
+
 find_package(CUDAToolkit 12.9 REQUIRED CUDA::cudart CUDA::cuda_driver CUDA::nvml)
+
+# Some redistributable CUDA SDK layouts include nvcc and version.json but do
+# not expose a version through FindCUDAToolkit. Recover it from NVIDIA's
+# version manifest so delay-load names and staging remain deterministic.
+if(NOT CUDAToolkit_VERSION_MAJOR AND
+   EXISTS "${CUDAToolkit_ROOT}/version.json")
+    file(READ "${CUDAToolkit_ROOT}/version.json" _cuda_version_manifest)
+    string(JSON CUDAToolkit_VERSION ERROR_VARIABLE _cuda_version_error
+        GET "${_cuda_version_manifest}" cuda version)
+    if(NOT _cuda_version_error)
+        string(REPLACE "." ";" _cuda_version_parts "${CUDAToolkit_VERSION}")
+        list(GET _cuda_version_parts 0 CUDAToolkit_VERSION_MAJOR)
+        list(GET _cuda_version_parts 1 CUDAToolkit_VERSION_MINOR)
+        list(GET _cuda_version_parts 2 CUDAToolkit_VERSION_PATCH)
+        message(STATUS
+            "Recovered CUDA Toolkit version from version.json: ${CUDAToolkit_VERSION}")
+    endif()
+endif()
+if(NOT CUDAToolkit_VERSION_MAJOR)
+    message(FATAL_ERROR
+        "Could not determine the CUDA Toolkit major version from FindCUDAToolkit "
+        "or ${CUDAToolkit_ROOT}/version.json.")
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/onnxruntime.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/tensorrt_rtx.cmake")
+
+set(_onnxruntime_runtime_files "")
+if(WIN32)
+    if(ONNXRUNTIME_DLL)
+        list(APPEND _onnxruntime_runtime_files "${ONNXRUNTIME_DLL}")
+    endif()
+    if(ONNXRUNTIME_PROVIDERS_SHARED_DLL)
+        list(APPEND _onnxruntime_runtime_files "${ONNXRUNTIME_PROVIDERS_SHARED_DLL}")
+    endif()
+else()
+    if(ONNXRUNTIME_LIB)
+        list(APPEND _onnxruntime_runtime_files "${ONNXRUNTIME_LIB}")
+    endif()
+    if(ONNXRUNTIME_PROVIDERS_SHARED_LIB)
+        list(APPEND _onnxruntime_runtime_files "${ONNXRUNTIME_PROVIDERS_SHARED_LIB}")
+    endif()
+endif()
+
+if(_onnxruntime_runtime_files)
+    add_custom_target(onnxruntime_runtime_dependencies
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TRT_RTX_BIN_DIR}/$<CONFIG>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_onnxruntime_runtime_files}
+            "${TRT_RTX_BIN_DIR}/$<CONFIG>"
+        COMMENT "Copying ONNX Runtime runtime dependencies"
+        VERBATIM
+    )
+    add_dependencies(onnxruntime::onnxruntime onnxruntime_runtime_dependencies)
+    add_dependencies(onnxruntime_interface onnxruntime_runtime_dependencies)
+endif()
+set(TRT_RTX_ORT_RUNTIME_FILES ${_onnxruntime_runtime_files})
+unset(_onnxruntime_runtime_files)
 
 # =============================================================================
 # Source Files
@@ -144,22 +363,10 @@ endif()
 # =============================================================================
 option(USE_VCPKG "use vcpkg package manager" OFF)
 option(USE_PRECOMPILED_HOST_PROTOC "Use a precompiled win-x64 host protoc when building protobuf/ONNX" OFF)
+option(TRT_RTX_EP_ENABLE_NVTX3 "Enable NVTX3 instrumentation in the TensorRT RTX EP" OFF)
 
 if(USE_VCPKG MATCHES "OFF")
     include(FetchContent)
-
-    function(fetch_content_make_available_exclude_from_all)
-        foreach(_name IN LISTS ARGN)
-            string(TOLOWER "${_name}" _name_lower)
-            FetchContent_GetProperties(${_name})
-            if(NOT ${_name_lower}_POPULATED)
-                FetchContent_Populate(${_name})
-                if(EXISTS "${${_name_lower}_SOURCE_DIR}/CMakeLists.txt")
-                    add_subdirectory("${${_name_lower}_SOURCE_DIR}" "${${_name_lower}_BINARY_DIR}" EXCLUDE_FROM_ALL)
-                endif()
-            endif()
-        endforeach()
-    endfunction()
 
     set(_ORTTRTRTX_HOST_PROTOC "")
     if(USE_PRECOMPILED_HOST_PROTOC)
@@ -210,11 +417,12 @@ if(USE_VCPKG MATCHES "OFF")
             protobuf
             GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
             GIT_TAG        v31.1
+            EXCLUDE_FROM_ALL
         )
         set(protobuf_BUILD_TESTS         OFF CACHE INTERNAL "")
         set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE INTERNAL "")
         set(protobuf_BUILD_PROTOC_BINARIES OFF CACHE BOOL "" FORCE)
-        fetch_content_make_available_exclude_from_all(protobuf)
+        FetchContent_MakeAvailable(protobuf)
     endif()
 
     # Add ONNX
@@ -222,6 +430,7 @@ if(USE_VCPKG MATCHES "OFF")
         onnx
         GIT_REPOSITORY https://github.com/onnx/onnx.git
         GIT_TAG        v1.21.0
+        EXCLUDE_FROM_ALL
     )
 
     if(_ORTTRTRTX_HOST_PROTOC)
@@ -229,7 +438,7 @@ if(USE_VCPKG MATCHES "OFF")
         set(Protobuf_PROTOC_EXECUTABLE    "${_ORTTRTRTX_HOST_PROTOC}" CACHE FILEPATH "" FORCE)
     endif()
 
-    fetch_content_make_available_exclude_from_all(onnx)
+    FetchContent_MakeAvailable(onnx)
 
     if(MSVC)
         # Protobuf builds as third-party code under our MSVC flags. Disable /sdl
@@ -258,6 +467,19 @@ endif()
 # Build Configuration Options
 # =============================================================================
 option(TRT_RTX_EP_PRODUCTION_BUILD "Enable production build with signature verification" OFF)
+set(TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS "" CACHE STRING
+    "Additional architecture-specific NVIDIA DLL names to delay-load from the EP dependency directory")
+set(_TRT_RTX_EP_EFFECTIVE_DELAYLOAD_DLLS ${TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS})
+if(WIN32 AND NOT TRT_RTX_EP_TARGET_ARCH STREQUAL "x64")
+    # CUDA 12+ uses a major-versioned runtime DLL. If the selected CUDA import
+    # library instead targets NVIDIA's ARM64X hybrid runtime, LINK emits LNK4199
+    # and ignores this unused /DELAYLOAD entry; the system hybrid stays a normal
+    # import. If it targets cudart64_N.dll, this keeps the two architectures
+    # isolated in their dependency directories.
+    list(APPEND _TRT_RTX_EP_EFFECTIVE_DELAYLOAD_DLLS
+        "cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
+endif()
+list(REMOVE_DUPLICATES _TRT_RTX_EP_EFFECTIVE_DELAYLOAD_DLLS)
 
 # =============================================================================
 # Platform-Specific Configuration
@@ -278,6 +500,12 @@ if(WIN32)
 
     # Add delay load linker flags
     set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${TRT_RTX_DLL_NAME} /DELAYLOAD:${TRT_ONNX_PARSER_DLL_NAME} /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:nvcuda.dll")
+    foreach(_delay_dll IN LISTS _TRT_RTX_EP_EFFECTIVE_DELAYLOAD_DLLS)
+        if(_delay_dll)
+            message(STATUS "Additional delay load DLL: ${_delay_dll}")
+            set(TRT_EP_LIB_LINK_FLAG "${TRT_EP_LIB_LINK_FLAG} /DELAYLOAD:${_delay_dll}")
+        endif()
+    endforeach()
 else()
     if(USE_VCPKG MATCHES "OFF")
         # # Linux
@@ -322,6 +550,7 @@ target_compile_definitions(TensorRTRtxEp PRIVATE
     # Ort::InitApi(). Mixing manual and default init across TUs is rejected by
     # ORT's #pragma detect_mismatch, so the definition must be consistent.
     ORT_API_MANUAL_INIT
+        NOMINMAX=1
 )
 
 if(NV_TRT_MAJOR_RTX)
@@ -334,9 +563,13 @@ endif()
 
 # Pass DLL names to source code for delay load verification (Windows only)
 if(WIN32)
+    string(JOIN "|" _trt_rtx_additional_delayload_dlls ${_TRT_RTX_EP_EFFECTIVE_DELAYLOAD_DLLS})
     target_compile_definitions(TensorRTRtxEp PRIVATE
         TRT_RTX_DLL_NAME="${TRT_RTX_DLL_NAME}"
         TRT_ONNX_PARSER_DLL_NAME="${TRT_ONNX_PARSER_DLL_NAME}"
+        TRT_RTX_EP_TARGET_ARCH="${TRT_RTX_EP_TARGET_ARCH}"
+        TRT_RTX_EP_DEPENDENCY_SUBDIR="${TRT_RTX_EP_DEPENDENCY_SUBDIR}"
+        TRT_RTX_EP_ADDITIONAL_DELAYLOAD_DLLS="${_trt_rtx_additional_delayload_dlls}"
     )
     
     # Production build flag for signature verification
@@ -376,6 +609,14 @@ target_link_libraries(TensorRTRtxEp PRIVATE
     CUDA::nvml
 )
 
+if(TRT_RTX_EP_ENABLE_NVTX3)
+    find_package(CUDAToolkit 12.9 REQUIRED CUDA::nvtx3)
+    target_link_libraries(TensorRTRtxEp PRIVATE CUDA::nvtx3)
+    target_compile_definitions(TensorRTRtxEp PRIVATE TRT_RTX_EP_ENABLE_NVTX3=1)
+else()
+    target_compile_definitions(TensorRTRtxEp PRIVATE TRT_RTX_EP_ENABLE_NVTX3=0)
+endif()
+
 # Link delay load support library (Windows only)
 if(WIN32)
     target_link_libraries(TensorRTRtxEp PRIVATE delayimp d3d12 dxgi)
@@ -385,11 +626,12 @@ endif()
 # Target Properties
 # =============================================================================
 set_target_properties(TensorRTRtxEp PROPERTIES
-    OUTPUT_NAME "onnxruntime_providers_nv_tensorrt_rtx"
+    OUTPUT_NAME "${TRT_RTX_EP_OUTPUT_NAME}"
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF
 )
+trt_rtx_set_target_output_directory(TensorRTRtxEp "${TRT_RTX_EP_BIN_DIR}")
 
 # Apply DEF file on Windows to export symbols
 if(WIN32)
@@ -397,6 +639,66 @@ if(WIN32)
         LINK_FLAGS ${TRT_EP_LIB_LINK_FLAG}
     )
 endif()
+
+# The provider and all of its delay-loaded runtime dependencies share bin with
+# the host executables in the build tree.
+set(_trt_rtx_ep_runtime_files "")
+if(WIN32)
+    if(TRT_RTX_DLL)
+        list(APPEND _trt_rtx_ep_runtime_files "${TRT_RTX_DLL}")
+    endif()
+    if(TRT_ONNX_PARSER_DLL)
+        list(APPEND _trt_rtx_ep_runtime_files "${TRT_ONNX_PARSER_DLL}")
+    endif()
+
+    get_target_property(_cudart_loc CUDA::cudart IMPORTED_LOCATION_RELEASE)
+    if(NOT _cudart_loc)
+        get_target_property(_cudart_loc CUDA::cudart IMPORTED_LOCATION)
+    endif()
+    if(_cudart_loc)
+        get_filename_component(_cudart_dir "${_cudart_loc}" DIRECTORY)
+        get_filename_component(_cudart_name "${_cudart_loc}" NAME_WE)
+        # CUDA 12 toolkits ship the runtime DLL in bin/; CUDA 13 Windows toolkits (installer and redist
+        # layouts alike) moved it to bin/x64/, so search both.
+        find_file(CUDART_DLL
+            NAMES "${_cudart_name}.dll" "cudart64_${CUDAToolkit_VERSION_MAJOR}.dll" "cudart64_12.dll" "cudart64.dll"
+            HINTS "${CUDAToolkit_BIN_DIR}" "${CUDAToolkit_BIN_DIR}/x64"
+                  "${_cudart_dir}" "${_cudart_dir}/../bin" "${_cudart_dir}/../bin/x64"
+            REQUIRED)
+        list(APPEND _trt_rtx_ep_runtime_files "${CUDART_DLL}")
+    endif()
+else()
+    list(APPEND _trt_rtx_ep_runtime_files
+        "${TRT_RTX_LIB}"
+        "${TRT_ONNX_PARSER_LIB}"
+    )
+
+    get_target_property(_cudart_loc CUDA::cudart IMPORTED_LOCATION_RELEASE)
+    if(NOT _cudart_loc)
+        get_target_property(_cudart_loc CUDA::cudart IMPORTED_LOCATION)
+    endif()
+    if(_cudart_loc)
+        list(APPEND _trt_rtx_ep_runtime_files "${_cudart_loc}")
+    endif()
+endif()
+
+if(_trt_rtx_ep_runtime_files)
+    add_custom_target(trt_rtx_ep_runtime_dependencies
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TRT_RTX_BIN_DIR}/$<CONFIG>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_trt_rtx_ep_runtime_files}
+            "${TRT_RTX_BIN_DIR}/$<CONFIG>"
+        COMMENT "Copying TensorRT RTX EP runtime dependencies"
+        VERBATIM
+    )
+    add_dependencies(TensorRTRtxEp trt_rtx_ep_runtime_dependencies)
+endif()
+if(TARGET onnxruntime_runtime_dependencies)
+    # Building the provider also produces a runnable bin/<configuration> layout.
+    add_dependencies(TensorRTRtxEp onnxruntime_runtime_dependencies)
+endif()
+set(TRT_RTX_EP_RUNTIME_FILES ${_trt_rtx_ep_runtime_files})
+unset(_trt_rtx_ep_runtime_files)
 
 # =============================================================================
 # Tests
@@ -407,6 +709,14 @@ enable_testing()
 option(BUILD_TESTS "Build tests" ON)
 if(BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+# =============================================================================
+# Benchmark
+# =============================================================================
+option(BUILD_BENCHMARK "Build cached EP-context benchmark tools" ON)
+if(BUILD_BENCHMARK)
+    add_subdirectory(tools/benchmark)
 endif()
 
 # =============================================================================
@@ -432,22 +742,69 @@ if(BUILD_EXAMPLES)
             $<$<BOOL:${ONNXRUNTIME_PROVIDERS_SHARED_LIB}>:${ONNXRUNTIME_PROVIDERS_SHARED_LIB}>)
     endif()
     add_subdirectory(examples/cxx)
+endif()
 
-    foreach(_example_target
-        ep-device-selection
-        devicetensors-datatransfer
-        devicetensors-datatransfer-async
-        syncstreams_cuda
-        sample
-        sample_buffer
-        sample_weightless
-        sample_weightless_buffer
-    )
-        if(TARGET ${_example_target})
-            # DLL copy is handled by copy_ep_dll_post_build() in each example's own
-            # CMakeLists.txt (add_custom_command(TARGET ...) must run in the same
-            # directory scope the target was created in, so it can't be done here).
-            add_dependencies(${_example_target} TensorRTRtxEp)
-        endif()
-    endforeach()
+# =============================================================================
+# Install layout
+# =============================================================================
+# The build tree intentionally keeps every runtime dependency in bin/<config>.
+# Installation separates the deliverables so each can be shipped independently:
+# regular examples and unittests carry their own ORT runtime, while the EP
+# package contains the provider, TensorRT/CUDA dependencies, and its public
+# provider-options header.
+if(TARGET TensorRTRtxEp)
+    install(TARGETS TensorRTRtxEp
+        RUNTIME DESTINATION lib COMPONENT ep
+        LIBRARY DESTINATION lib COMPONENT ep
+        ARCHIVE DESTINATION lib COMPONENT ep)
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tensorrt_rtx_provider_options.h"
+        DESTINATION include
+        COMPONENT ep)
+    if(TRT_RTX_EP_RUNTIME_FILES)
+        install(FILES ${TRT_RTX_EP_RUNTIME_FILES}
+            DESTINATION lib
+            COMPONENT ep)
+    endif()
+endif()
+
+if(TARGET unittests)
+    install(TARGETS unittests
+        RUNTIME DESTINATION bin/tests COMPONENT tests
+        LIBRARY DESTINATION bin/tests COMPONENT tests
+        ARCHIVE DESTINATION lib COMPONENT tests)
+    if(TRT_RTX_ORT_RUNTIME_FILES)
+        install(FILES ${TRT_RTX_ORT_RUNTIME_FILES}
+            DESTINATION bin/tests
+            COMPONENT tests)
+    endif()
+endif()
+
+get_property(_trt_rtx_cxx_examples GLOBAL PROPERTY TRT_RTX_CXX_EXAMPLE_TARGETS)
+set(_trt_rtx_regular_examples)
+foreach(_trt_rtx_example IN LISTS _trt_rtx_cxx_examples)
+    if(NOT TARGET ${_trt_rtx_example})
+        continue()
+    endif()
+    get_property(_trt_rtx_component TARGET ${_trt_rtx_example} PROPERTY TRT_RTX_INSTALL_COMPONENT)
+    list(APPEND _trt_rtx_regular_examples ${_trt_rtx_example})
+endforeach()
+
+set(_trt_rtx_sample_assets
+    "${CMAKE_BINARY_DIR}/examples/cxx/candy.onnx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/examples/cxx/assets/Input.png")
+if(_trt_rtx_regular_examples)
+    install(TARGETS ${_trt_rtx_regular_examples}
+        RUNTIME DESTINATION bin/examples COMPONENT examples
+        LIBRARY DESTINATION bin/examples COMPONENT examples
+        ARCHIVE DESTINATION lib COMPONENT examples)
+    install(FILES ${_trt_rtx_sample_assets}
+        DESTINATION bin/examples
+        OPTIONAL
+        COMPONENT examples)
+    if(TRT_RTX_ORT_RUNTIME_FILES)
+        install(FILES ${TRT_RTX_ORT_RUNTIME_FILES}
+            DESTINATION bin/examples
+            COMPONENT examples)
+    endif()
 endif()

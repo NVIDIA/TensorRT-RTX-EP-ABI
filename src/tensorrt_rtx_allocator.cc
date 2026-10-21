@@ -29,6 +29,7 @@
 
 #include "tensorrt_rtx_allocator.h"
 
+#include "utils/cuda/cuda_call.h"
 #include "utils/ort_api_init.h"
 
 #include <cuda_runtime_api.h>
@@ -43,16 +44,6 @@ namespace trt_rtx_ep
 // Maximum allowed single allocation size (256GB) to prevent potential integer overflow
 // or denial-of-service attacks through excessive memory requests
 constexpr size_t kMaxAllowedAllocationSize = 256ULL * 1024 * 1024 * 1024;
-
-//!
-//! \brief Error handling utility for CUDA operations
-//!
-//! \param res CUDA error code to check
-//! \throws Implementation-defined error handling (see tensorrt_rtx_execution_provider.cc)
-//!
-//! \note Forward declaration - actual implementation in tensorrt_rtx_execution_provider.cc
-//!
-void CUDA_RETURN_IF_ERROR(cudaError_t res);
 
 // ========================================
 // TensorrtRtxAllocator (Device Memory)
@@ -132,7 +123,7 @@ void TensorrtRtxAllocator::CheckDevice(bool throw_when_fail) const
     }
     else if (throw_when_fail)
     {
-        CUDA_RETURN_IF_ERROR(cuda_err);
+        CUDA_CALL_THROW(cuda_err);
     }
 #else
     (void)throw_when_fail;  // Suppress unused parameter warning in release builds
@@ -170,7 +161,7 @@ void TensorrtRtxAllocator::SetDevice(bool throw_when_fail) const
 
     if (cuda_err != cudaSuccess && throw_when_fail)
     {
-        CUDA_RETURN_IF_ERROR(cuda_err);
+        CUDA_CALL_THROW(cuda_err);
     }
 }
 
@@ -204,7 +195,7 @@ void* TensorrtRtxAllocator::Alloc(size_t size)
     if (size > 0)
     {
         // BFCArena was updated recently to handle the exception and adjust the request size
-        CUDA_RETURN_IF_ERROR(cudaMalloc((void**)&p, size));
+        CUDA_CALL_THROW(cudaMalloc((void**)&p, size));
     }
     return p;
 }
@@ -333,7 +324,7 @@ void* TensorrtRtxPinnedAllocator::Alloc(size_t size)
     if (size > 0)
     {
         // Allocate page-locked memory for faster host-device transfers
-        CUDA_RETURN_IF_ERROR(cudaMallocHost((void**)&p, size));
+        CUDA_CALL_THROW(cudaMallocHost((void**)&p, size));
     }
     return p;
 }

@@ -2,7 +2,7 @@
 onnxruntime_ep_nv_tensorrt_rtx/*.dll
 onnxruntime_ep_nv_tensorrt_rtx/*.txt
 
-# Generated version files (written at build time by build.bat / build.sh)
+# Generated version files (written at release time)
 onnxruntime_ep_nv_tensorrt_rtx/_version.py
 meta/_version.txt
 

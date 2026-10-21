@@ -40,14 +40,14 @@ These samples use the same EP registration pattern as the other examples in this
 
 ```cpp
 // 1. Register the EP library
-env.RegisterExecutionProviderLibrary("nv_tensorrt_rtx",
-    ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll"));
+env.RegisterExecutionProviderLibrary("NvTensorRTRTXExecutionProvider",
+    ORT_TSTR("ep/onnxruntime_providers_nv_tensorrt_rtx.dll"));
 
 // 2. Enumerate and select EP devices
 Ort::ConstEpDevice trt_device = {};
 for (auto& device : env.GetEpDevices())
 {
-    if (std::strcmp(device.EpName(), "nv_tensorrt_rtx") == 0)
+    if (std::strcmp(device.EpName(), "NvTensorRTRTXExecutionProvider") == 0)
     {
         trt_device = device;
         break;
@@ -72,6 +72,7 @@ session_options.AppendExecutionProvider_V2(env, devices, ep_options);
 * Loads an ONNX model from disk (defaults to `candy.onnx` next to the executable).
 * Compiles it with the TensorRT RTX EP.
 * Saves compiled ONNX file.
+* Validates the freshly generated EP Context compatibility information against the selected device and demonstrates that malformed compatibility information is rejected.
 * Loads the compiled model and measures load times.
 
 ```

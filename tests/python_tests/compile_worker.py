@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 
@@ -25,10 +26,16 @@ def _bool_arg(value: str) -> bool:
 
 def _register_ep() -> RegisteredEp:
     import onnxruntime as ort
-    import onnxruntime_ep_nv_tensorrt_rtx as ep_pkg
 
-    ep_name = ep_pkg.get_ep_name()
-    library_path = Path(ep_pkg.get_library_path())
+    library_override = os.environ.get("NV_TRT_RTX_EP_LIBRARY_PATH")
+    if library_override:
+        ep_name = os.environ.get("NV_TRT_RTX_EP_NAME", "nv_tensorrt_rtx")
+        library_path = Path(library_override)
+    else:
+        import onnxruntime_ep_nv_tensorrt_rtx as ep_pkg
+
+        ep_name = ep_pkg.get_ep_name()
+        library_path = Path(ep_pkg.get_library_path())
     if not ep_name:
         raise RuntimeError("onnxruntime_ep_nv_tensorrt_rtx.get_ep_name() returned an empty name")
     if not library_path.is_file():
@@ -60,6 +67,7 @@ def _get_trt_rtx_devices(registered_ep: RegisteredEp):
 def _make_session_options(registered_ep: RegisteredEp, cache_dir: Path):
     ort = registered_ep.ort
     so = ort.SessionOptions()
+    so.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     if not hasattr(so, "add_provider_for_devices"):
         raise RuntimeError("onnxruntime.SessionOptions does not expose add_provider_for_devices")
 

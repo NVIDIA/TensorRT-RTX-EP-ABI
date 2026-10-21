@@ -151,6 +151,23 @@ def create_initializer_matmul_model(path):
     save_model(make_model(graph), path)
 
 
+def create_external_initializer_matmul_model(model_path, data_path):
+    model_path = Path(model_path)
+    data_path = Path(data_path)
+    create_initializer_matmul_model(model_path)
+    model = onnx.load(str(model_path))
+    data_path.unlink(missing_ok=True)
+    onnx.save_model(
+        model,
+        str(model_path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_path.name,
+        size_threshold=0,
+    )
+    assert data_path.is_file()
+
+
 def create_two_initializer_matmul_subgraphs_model(path):
     weights_1 = np.eye(4, dtype=np.float32)
     weights_2 = np.array(
