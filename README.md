@@ -17,7 +17,7 @@ RTX GPUs (Ampere and later).
 | 0.1 | 1.24.0 | 1.24.0 only | 1.4.x.x | Initial **Windows** Support |
 | 0.3 | 1.25.2 | 1.24.4 – 1.25.2 | 1.5.x.x | Linux Support, Weight Streaming, CIG Interop, ORT Version Negotiation |
 | 0.4 | 1.27.1 | 1.25.0 – 1.27.1 | 1.6.x.x | Sync GPU Allocator, iGPU Zero-Copy, Vulkan/CiG Import, Compile-Only Mode, Weightless EP Context, MSFT Profiler Support, Windows-on-Arm Build Support |
-| 0.5 | 1.30.0 | 1.24.x – 1.30.0 | 1.7.x.x | Runtime Weight-Streaming Budget Updates, CUDA Graph Capture Stability Fixes, Sandbox-Safe CPU-Only AOT Compile, Opt-in Persistent Execution Context Memory, Deferred/Streamed Weight Loading, WebNN Sandboxed-Browser Crash Fix, Discrete-GPU Zero-Copy Fix |
+| 0.5 | 1.30.0 | 1.25.0 – 1.30.0 | 1.7.x.x | Runtime Weight-Streaming Budget Updates, CUDA Graph Capture Stability Fixes, Sandbox-Safe CPU-Only AOT Compile, Opt-in Persistent Execution Context Memory, Deferred/Streamed Weight Loading, WebNN Sandboxed-Browser Crash Fix, Discrete-GPU Zero-Copy Fix |
 
 ## Documentation
 
