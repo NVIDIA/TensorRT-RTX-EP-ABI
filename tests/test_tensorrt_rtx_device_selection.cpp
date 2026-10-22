@@ -269,6 +269,33 @@ static int ResolveExpectedCudaDevice(const OrtEpDevice* ep_device)
     int device_index = -1;
     if (cudaDeviceGetByPCIBusId(&device_index, pci_bus_id) != cudaSuccess)
     {
+        // WSL2 reports a Microsoft virtual adapter: vendor 0x1414 with a bus id the CUDA driver
+        // rejects (for example 3dc3:00:00.0), which is the exact condition the EP's WSL2 fallback
+        // handles. There is no PCI identity to match on, so the EP pairs the adapter with the
+        // lowest supported visible CUDA device. Reproduce that rule here so this cross-check stays
+        // independent of the EP's own resolution instead of failing on an unmatchable bus id.
+        if (api.HardwareDevice_VendorId(hw) != 0x1414)
+        {
+            return -1;
+        }
+
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess)
+        {
+            return -1;
+        }
+        for (int i = 0; i < device_count; ++i)
+        {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, i) != cudaSuccess)
+            {
+                continue;
+            }
+            if (onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(prop.major, prop.minor))
+            {
+                return i;
+            }
+        }
         return -1;
     }
     return device_index;
