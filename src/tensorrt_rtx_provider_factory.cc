@@ -17,6 +17,7 @@
 
 #include "ep_arena.h"
 #include "tensorrt_rtx_allocator.h"
+#include "tensorrt_rtx_device_selection.h"
 #include "tensorrt_rtx_execution_provider.h"
 #include "tensorrt_rtx_execution_provider_custom_ops.h"
 #include "tensorrt_rtx_execution_provider_data_transfer.h"
@@ -50,7 +51,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -1069,38 +1074,39 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::CreateMemoryInfoForDevices(int n
     return nullptr;
 }
 
-//!
-//! \brief Checks if a given OrtHardwareDevice is a supported NVIDIA GPU.
-//!
-//! This function verifies if the provided hardware device corresponds to a physical
-//! NVIDIA GPU that meets the minimum compute capability requirements for this execution provider.
-//!
-//! The check is performed by:
-//! 1. Extracting the LUID (Locally Unique Identifier) from the device's metadata.
-//! 2. Converting the string LUID to a 64-bit integer.
-//! 3. Iterating through all available CUDA devices on the system.
-//! 4. For each CUDA device, constructing its 64-bit LUID from its properties.
-//! 5. Comparing the LUIDs. If a match is found, it checks if the device's
-//!    compute capability is supported by TensorRT RTX.
-//!
-//! \param device The OrtHardwareDevice to check.
-//! \param ort_api The ORT API interface for accessing device metadata.
-//! \param major Optional output parameter for the major compute capability version.
-//! \param minor Optional output parameter for the minor compute capability version.
-//! \param cuda_device_id Optional output parameter for the matching CUDA device ordinal.
-//! \return True if the device is a supported NVIDIA GPU, false otherwise.
-//!
-static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const OrtApi& ort_api, int* major = nullptr,
-                                         int* minor = nullptr, int* cuda_device_id = nullptr)
+// Why a probe could not map an ORT hardware device to a CUDA runtime index.
+enum class HardwareProbeStatus
 {
+    kNoIdentity,
+    kMapped,
+    kPciLookupFailed,
+};
+
+struct HardwareProbe
+{
+    HardwareProbeStatus status = HardwareProbeStatus::kNoIdentity;
+    int cuda_index = -1;
+    int compute_capability_major = 0;
+    int compute_capability_minor = 0;
+};
+
+//!
+//! \brief Resolves an ORT hardware device to a CUDA runtime index, without applying the
+//! compute-capability gate or the WSL virtual-adapter pairing rules.
+//!
+//! Windows matches the device LUID against every visible CUDA device. Linux matches pci_bus_id
+//! via cudaDeviceGetByPCIBusId. A failed PCI lookup is reported separately so the caller can
+//! treat a Microsoft virtual adapter (WSL2) as unmapped instead of binding it to CUDA device 0.
+//!
+static HardwareProbe ProbeOrtHardwareDevice(const OrtHardwareDevice* device, const OrtApi& ort_api)
+{
+    HardwareProbe probe;
 #if defined(_WIN32)
-    // Get device metadata using API
     const OrtKeyValuePairs* metadata = ort_api.HardwareDevice_Metadata(device);
     const char* luid_str = ort_api.GetKeyValue(metadata, "LUID");
-
     if (luid_str == nullptr)
     {
-        return false;
+        return probe;
     }
 
     uint64_t target_luid;
@@ -1110,13 +1116,13 @@ static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const 
     }
     catch (const std::exception&)
     {
-        return false;
+        return probe;
     }
 
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess)
     {
-        return false;
+        return probe;
     }
 
     for (int i = 0; i < device_count; ++i)
@@ -1134,67 +1140,222 @@ static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const 
             continue;
         }
 
-        // Ensure the LUID is 8 bytes and reinterpret it directly as a uint64_t for comparison.
         static_assert(sizeof(prop.luid) == sizeof(uint64_t), "cudaDeviceProp::luid should be 8 bytes");
         uint64_t current_luid = *reinterpret_cast<const uint64_t*>(prop.luid);
-
         if (current_luid == target_luid)
         {
-            // Set output parameters if provided
-            if (major != nullptr)
-            {
-                *major = prop.major;
-            }
-            if (minor != nullptr)
-            {
-                *minor = prop.minor;
-            }
-            if (cuda_device_id != nullptr)
-            {
-                *cuda_device_id = i;
-            }
-            return onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(prop.major, prop.minor);
+            probe.status = HardwareProbeStatus::kMapped;
+            probe.cuda_index = i;
+            probe.compute_capability_major = prop.major;
+            probe.compute_capability_minor = prop.minor;
+            return probe;
         }
     }
 
-    return false;
+    return probe;
 #else
-    // Linux: Use PCI bus ID
     const OrtKeyValuePairs* metadata = ort_api.HardwareDevice_Metadata(device);
     const char* pci_bus_id = ort_api.GetKeyValue(metadata, "pci_bus_id");
-
     if (pci_bus_id == nullptr)
     {
-        return false;
+        return probe;
     }
 
     int cuda_device_idx = 0;
     if (cudaDeviceGetByPCIBusId(&cuda_device_idx, pci_bus_id) != cudaSuccess)
     {
-        return false;
+        // WSL2 reports a virtual bus id (for example 0283:00:00.0) that CUDA rejects with
+        // cudaErrorInvalidDevice. Leave the CUDA index unresolved; pairing happens later.
+        probe.status = HardwareProbeStatus::kPciLookupFailed;
+        return probe;
     }
 
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, cuda_device_idx) != cudaSuccess)
     {
+        return probe;
+    }
+
+    probe.status = HardwareProbeStatus::kMapped;
+    probe.cuda_index = cuda_device_idx;
+    probe.compute_capability_major = prop.major;
+    probe.compute_capability_minor = prop.minor;
+    return probe;
+#endif
+}
+
+static std::vector<VisibleCudaDevice> EnumerateVisibleCudaDevices()
+{
+    std::vector<VisibleCudaDevice> cuda_devices;
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0)
+    {
+        return cuda_devices;
+    }
+
+    cuda_devices.reserve(static_cast<size_t>(device_count));
+    for (int i = 0; i < device_count; ++i)
+    {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess)
+        {
+            continue;
+        }
+        cuda_devices.push_back(VisibleCudaDevice{i, prop.major, prop.minor});
+    }
+    return cuda_devices;
+}
+
+static HardwareDeviceMatch ClassifyHardwareDevice(const OrtHardwareDevice* device, const OrtApi& ort_api,
+                                                  uint32_t vendor_id, int ordinal)
+{
+    HardwareDeviceMatch match;
+    match.ordinal = ordinal;
+
+    const HardwareProbe probe = ProbeOrtHardwareDevice(device, ort_api);
+    if (probe.status == HardwareProbeStatus::kMapped)
+    {
+        match.kind = HardwareMatchKind::kMappedToCudaDevice;
+        match.cuda_index = probe.cuda_index;
+        match.compute_capability_major = probe.compute_capability_major;
+        match.compute_capability_minor = probe.compute_capability_minor;
+        return match;
+    }
+
+    // Only a failed PCI lookup on a Microsoft virtual adapter is the WSL2 case. A real NVIDIA
+    // device whose bus id does not resolve stays rejected rather than being aliased onto device 0.
+    if (probe.status == HardwareProbeStatus::kPciLookupFailed && vendor_id == kMicrosoftVirtualPciVendorId)
+    {
+        match.kind = HardwareMatchKind::kVirtualAdapterUnmapped;
+    }
+    return match;
+}
+
+static bool LookupCudaCapability(const std::vector<VisibleCudaDevice>& cuda_devices, int cuda_index, int& major,
+                                 int& minor)
+{
+    for (const VisibleCudaDevice& cuda_device : cuda_devices)
+    {
+        if (cuda_device.index == cuda_index)
+        {
+            major = cuda_device.compute_capability_major;
+            minor = cuda_device.compute_capability_minor;
+            return true;
+        }
+    }
+    return false;
+}
+
+//!
+//! \brief Checks if a given OrtHardwareDevice is a supported NVIDIA GPU.
+//!
+//! This function verifies if the provided hardware device corresponds to a physical
+//! NVIDIA GPU that meets the minimum compute capability requirements for this execution provider.
+//!
+//! The check is performed by:
+//! 1. Extracting the device identity (LUID on Windows, pci_bus_id on Linux) from its metadata.
+//! 2. Resolving it to a CUDA runtime index via ProbeOrtHardwareDevice.
+//! 3. If a device is found, checking whether its compute capability is supported by TensorRT RTX.
+//!
+//! This is the strict single-device query: it never applies the WSL2 virtual-adapter pairing
+//! rules, so a device whose identity cannot be resolved is reported unsupported rather than
+//! being aliased onto another CUDA device. Device enumeration goes through
+//! ClassifyHardwareDevice / SelectSupportedEpDevices instead.
+//!
+//! \param device The OrtHardwareDevice to check.
+//! \param ort_api The ORT API interface for accessing device metadata.
+//! \param major Optional output parameter for the major compute capability version.
+//! \param minor Optional output parameter for the minor compute capability version.
+//! \param cuda_device_id Optional output parameter for the matching CUDA device ordinal.
+//! \return True if the device is a supported NVIDIA GPU, false otherwise.
+//!
+static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const OrtApi& ort_api, int* major = nullptr,
+                                        int* minor = nullptr, int* cuda_device_id = nullptr)
+{
+    const HardwareProbe probe = ProbeOrtHardwareDevice(device, ort_api);
+    if (probe.status != HardwareProbeStatus::kMapped)
+    {
         return false;
     }
 
-    // Set output parameters if provided
     if (major != nullptr)
     {
-        *major = prop.major;
+        *major = probe.compute_capability_major;
     }
     if (minor != nullptr)
     {
-        *minor = prop.minor;
+        *minor = probe.compute_capability_minor;
     }
     if (cuda_device_id != nullptr)
     {
-        *cuda_device_id = cuda_device_idx;
+        *cuda_device_id = probe.cuda_index;
     }
-    return onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(prop.major, prop.minor);
-#endif
+    return onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(probe.compute_capability_major,
+                                                                  probe.compute_capability_minor);
+}
+
+//!
+//! \brief Resolves the CUDA ordinal for the hardware device a session is being created on.
+//!
+//! Prefers the ordinal discovery already decided on, which it publishes as "device_id" metadata on
+//! the OrtEpDevice. That decision cannot be reproduced here: the WSL2 pairing rules need the whole
+//! hardware list, and a virtual adapter's PCI bus id never resolves on its own. Falling back to a
+//! per-device probe keeps hosts whose metadata predates that key working, and covers callers that
+//! pass a hardware device straight through.
+//!
+//! \param factory The owning factory (for its ORT API handles).
+//! \param device The hardware device selected for the session.
+//! \param metadata The session's per-device EP metadata array, as passed to CreateEpImpl.
+//! \param cuda_device_id Output parameter for the resolved CUDA ordinal.
+//! \return nullptr on success, or an OrtStatus describing why the device could not be resolved.
+//!
+static OrtStatus* ResolveSelectedCudaDevice(const TensorrtRtxExecutionProviderFactory& factory,
+                                            const OrtHardwareDevice* device,
+                                            const OrtKeyValuePairs* const* metadata, int* cuda_device_id)
+{
+    if (metadata != nullptr && metadata[0] != nullptr)
+    {
+        const char* device_id_str = factory.ort_api.GetKeyValue(metadata[0], "device_id");
+        if (device_id_str != nullptr)
+        {
+            char* parse_end = nullptr;
+            errno = 0;
+            const long parsed = strtol(device_id_str, &parse_end, 10);
+            if (parse_end != device_id_str && *parse_end == '\0' && errno != ERANGE && parsed >= 0 &&
+                parsed <= static_cast<long>(INT32_MAX))
+            {
+                *cuda_device_id = static_cast<int>(parsed);
+                return nullptr;
+            }
+        }
+    }
+
+    // No discovery decision available: resolve this device directly. This cannot succeed for a WSL2
+    // virtual adapter, so it only serves the mapped-device paths.
+    if (IsOrtHardwareDeviceSupported(device, factory.ort_api, nullptr, nullptr, cuda_device_id))
+    {
+        return nullptr;
+    }
+
+    // Still unresolved: re-run discovery's own pairing rules for this device alone. A WSL2 virtual
+    // adapter has no resolvable identity, so it takes the lowest supported CUDA device -- exactly
+    // what GetSupportedDevicesImpl would have chosen for it had it been the only candidate.
+    const uint32_t vendor_id = factory.ort_api.HardwareDevice_VendorId(device);
+    if (IsEligibleGpuVendor(vendor_id))
+    {
+        const std::vector<VisibleCudaDevice> cuda_devices = EnumerateVisibleCudaDevices();
+        const HardwareDeviceMatch match = ClassifyHardwareDevice(device, factory.ort_api, vendor_id, 0);
+        const std::vector<SelectedEpDevice> selected = SelectSupportedEpDevices({match}, cuda_devices);
+        if (!selected.empty() && selected.front().cuda_index >= 0)
+        {
+            *cuda_device_id = selected.front().cuda_index;
+            return nullptr;
+        }
+    }
+
+    return factory.ort_api.CreateStatus(
+        ORT_INVALID_ARGUMENT,
+        "[NvTensorRTRTX EP] Selected hardware device could not be resolved to a supported CUDA device.");
 }
 
 //!
@@ -1302,13 +1463,12 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
                                              "[NvTensorRTRTX EP] Invalid arguments: hw or details is null");
     }
 
-    // Check if the device is a GPU from NVIDIA vendor
+    // Same vendor gate as GetSupportedDevicesImpl, including the WSL2 Microsoft virtual vendor.
     OrtHardwareDeviceType device_type = factory->ort_api.HardwareDevice_Type(hw);
     uint32_t vendor_id = factory->ort_api.HardwareDevice_VendorId(hw);
 
-    if (device_type != OrtHardwareDeviceType::OrtHardwareDeviceType_GPU || vendor_id != factory->vendor_id_)
+    if (device_type != OrtHardwareDeviceType::OrtHardwareDeviceType_GPU || !IsEligibleGpuVendor(vendor_id))
     {
-        // Not a NVIDIA GPU - device type/vendor incompatible
         uint32_t reasons = OrtDeviceEpIncompatibility_DEVICE_INCOMPATIBLE;
         return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(
             details, reasons,
@@ -1316,11 +1476,31 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
             "NvTensorRTRTX EP only supports NVIDIA GPU devices");
     }
 
-    // Check compute capability and get major/minor for driver version check
+    // Resolve this device with the same probe and pairing rules discovery uses. A single-device
+    // query has nothing else claimed, so a virtual adapter resolves to the lowest supported
+    // visible CUDA device. Discovery still registers each CUDA device only once.
+    const std::vector<VisibleCudaDevice> cuda_devices = EnumerateVisibleCudaDevices();
+    const HardwareDeviceMatch match = ClassifyHardwareDevice(hw, factory->ort_api, vendor_id, 0);
+    const std::vector<SelectedEpDevice> selected = SelectSupportedEpDevices({match}, cuda_devices);
+
     int compute_capability_major = 0;
     int compute_capability_minor = 0;
-    if (!IsOrtHardwareDeviceSupported(hw, factory->ort_api, &compute_capability_major, &compute_capability_minor))
+    const bool supported =
+        !selected.empty() && LookupCudaCapability(cuda_devices, selected.front().cuda_index, compute_capability_major,
+                                                  compute_capability_minor);
+    if (!supported)
     {
+        if (match.kind == HardwareMatchKind::kMappedToCudaDevice)
+        {
+            compute_capability_major = match.compute_capability_major;
+            compute_capability_minor = match.compute_capability_minor;
+        }
+        else if (match.kind == HardwareMatchKind::kVirtualAdapterUnmapped && !cuda_devices.empty())
+        {
+            compute_capability_major = cuda_devices.front().compute_capability_major;
+            compute_capability_minor = cuda_devices.front().compute_capability_minor;
+        }
+
         uint32_t reasons = OrtDeviceEpIncompatibility_DEVICE_INCOMPATIBLE;
 
         // CC remains 0.0 only when the device was never matched in the CUDA device list
@@ -1553,54 +1733,99 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
 
     // Normal (non-sandboxed) path: enumerate real CUDA devices.
     int num_cuda_devices = 0;
-    cudaGetDeviceCount(&num_cuda_devices);
+    if (cudaGetDeviceCount(&num_cuda_devices) != cudaSuccess || num_cuda_devices < 0)
+    {
+        num_cuda_devices = 0;
+    }
     RETURN_IF_ERROR(factory->CreateMemoryInfoForDevices(num_cuda_devices));
 
-    // Lambda that builds an OrtEpDevice entry and appends it to the output array.
-    // cuda_device_id and major/minor are already resolved by IsOrtHardwareDeviceSupported.
-    auto register_device = [&](const OrtHardwareDevice* device, int cuda_device_id, int major, int minor) -> OrtStatus*
-    {
-        OrtKeyValuePairs* ep_metadata = nullptr;
-        factory->ort_api.CreateKeyValuePairs(&ep_metadata);
-        // Surface the EP's negotiated ORT API version on EpDevice metadata so callers (notably
-        // tests) can gate version-specific behavior without touching EP-internal symbols.
-        factory->ort_api.AddKeyValuePair(ep_metadata, "nv_ep_ort_api_version",
-                                         std::to_string(NegotiatedOrtApiVersion()).c_str());
-
-        // Publish the compute capability so Chrome can carry it to the Compiler process.
-        // Format: "sm" + (major * 10 + minor), e.g. SM 8.6 -> "sm86", SM 12.0 -> "sm120".
-        std::string sm_str = "sm" + std::to_string(major * 10 + minor);
-        factory->ort_api.AddKeyValuePair(ep_metadata, "target_architecture", sm_str.c_str());
-
-        RETURN_IF_ERROR(
-            factory->ep_api.CreateEpDevice(factory, device, ep_metadata, nullptr, &ep_devices[num_ep_devices]));
-        factory->ort_api.ReleaseKeyValuePairs(ep_metadata);
-
-        const OrtMemoryInfo* gpu_mem_info = factory->device_memory_infos[cuda_device_id].get();
-        const OrtMemoryInfo* host_accessible_mem_info = factory->pinned_memory_infos[cuda_device_id].get();
-
-        RETURN_IF_ERROR(factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], gpu_mem_info));
-        RETURN_IF_ERROR(
-            factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], host_accessible_mem_info));
-        num_ep_devices++;
-        return nullptr;
-    };
-
-    // std::to_string may throw std::bad_alloc or std::bad_array_new_length on memory allocation failure
+    // std::to_string and the selection vectors may throw on allocation failure.
     try
     {
-        for (size_t i = 0; i < num_devices && num_ep_devices < max_ep_devices; ++i)
+        const std::vector<VisibleCudaDevice> cuda_devices = EnumerateVisibleCudaDevices();
+        std::vector<HardwareDeviceMatch> matches;
+        matches.reserve(num_devices);
+        for (size_t i = 0; i < num_devices; ++i)
         {
             const OrtHardwareDevice* device = devices[i];
-            int sm_major = 0, sm_minor = 0;
-            int cuda_device_id = 0;
-
-            if (factory->ort_api.HardwareDevice_Type(device) == OrtHardwareDeviceType::OrtHardwareDeviceType_GPU &&
-                factory->ort_api.HardwareDevice_VendorId(device) == factory->vendor_id_ &&
-                IsOrtHardwareDeviceSupported(device, factory->ort_api, &sm_major, &sm_minor, &cuda_device_id))
+            if (device == nullptr ||
+                factory->ort_api.HardwareDevice_Type(device) != OrtHardwareDeviceType::OrtHardwareDeviceType_GPU)
             {
-                RETURN_IF_ERROR(register_device(device, cuda_device_id, sm_major, sm_minor));
+                continue;
             }
+            const uint32_t vendor_id = factory->ort_api.HardwareDevice_VendorId(device);
+            if (!IsEligibleGpuVendor(vendor_id))
+            {
+                continue;
+            }
+            HardwareDeviceMatch match =
+                ClassifyHardwareDevice(device, factory->ort_api, vendor_id, static_cast<int>(i));
+            if (match.kind != HardwareMatchKind::kRejected)
+            {
+                matches.push_back(match);
+            }
+        }
+
+        const std::vector<SelectedEpDevice> selected = SelectSupportedEpDevices(matches, cuda_devices);
+        for (const SelectedEpDevice& ep_device : selected)
+        {
+            if (num_ep_devices >= max_ep_devices)
+            {
+                break;
+            }
+            if (ep_device.hardware_ordinal < 0 || static_cast<size_t>(ep_device.hardware_ordinal) >= num_devices ||
+                ep_device.cuda_index < 0)
+            {
+                return factory->ort_api.CreateStatus(
+                    ORT_FAIL, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: resolved device index is out of range");
+            }
+
+            const uint32_t cuda_index = static_cast<uint32_t>(ep_device.cuda_index);
+            const auto gpu_info = factory->device_memory_infos.find(cuda_index);
+            const auto host_info = factory->pinned_memory_infos.find(cuda_index);
+            if (gpu_info == factory->device_memory_infos.end() || gpu_info->second == nullptr ||
+                host_info == factory->pinned_memory_infos.end() || host_info->second == nullptr)
+            {
+                return factory->ort_api.CreateStatus(
+                    ORT_FAIL, "[NvTensorRTRTX EP] GetSupportedDevicesImpl: no memory info for resolved CUDA device");
+            }
+
+            const OrtHardwareDevice* device = devices[ep_device.hardware_ordinal];
+            OrtKeyValuePairs* ep_metadata = nullptr;
+            factory->ort_api.CreateKeyValuePairs(&ep_metadata);
+            // The resolved CUDA ordinal is published as metadata, not as an EP option. ep_options are
+            // auto-forwarded into session config as "ep.<name>.<key>" and validated by
+            // ProviderOptionsParser, which has no "device_id" parser (the manual device_id provider
+            // option was removed) and would reject the key as unknown. Metadata also carries the
+            // discovery-time decision through to CreateEpImpl for devices the driver cannot map.
+            factory->ort_api.AddKeyValuePair(ep_metadata, "device_id", std::to_string(cuda_index).c_str());
+
+            // Surface the EP's negotiated ORT API version on EpDevice metadata so callers (notably
+            // tests) can gate version-specific behavior without touching EP-internal symbols. Key
+            // and write APIs both exist at our minimum supported ORT version (1.24), so this is
+            // safe regardless of which SDK the EP was compiled with.
+            factory->ort_api.AddKeyValuePair(ep_metadata, "nv_ep_ort_api_version",
+                                             std::to_string(NegotiatedOrtApiVersion()).c_str());
+
+            // Publish the compute capability so Chrome can carry it to the Compiler process.
+            // Format: "sm" + (major * 10 + minor), e.g. SM 8.6 -> "sm86", SM 12.0 -> "sm120".
+            int capability_major = 0;
+            int capability_minor = 0;
+            if (LookupCudaCapability(cuda_devices, ep_device.cuda_index, capability_major, capability_minor))
+            {
+                std::string sm_str = "sm" + std::to_string(capability_major * 10 + capability_minor);
+                factory->ort_api.AddKeyValuePair(ep_metadata, "target_architecture", sm_str.c_str());
+            }
+
+            RETURN_IF_ERROR(factory->ort_api.GetEpApi()->CreateEpDevice(factory, device, ep_metadata, nullptr,
+                                                                        &ep_devices[num_ep_devices]));
+            factory->ort_api.ReleaseKeyValuePairs(ep_metadata);
+
+            RETURN_IF_ERROR(
+                factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], gpu_info->second.get()));
+            RETURN_IF_ERROR(
+                factory->ep_api.EpDevice_AddAllocatorInfo(ep_devices[num_ep_devices], host_info->second.get()));
+            num_ep_devices++;
         }
     }
     catch (const std::exception& e)
@@ -1650,6 +1875,11 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
                                                        "Creating Execution Provider", ORT_FILE, __LINE__,
                                                        __FUNCTION__));
 
+    // Resolve the CUDA ordinal the way discovery did, not with the strict single-device lookup.
+    // Discovery (GetSupportedDevicesImpl) is the only place that can apply the WSL2 pairing rules,
+    // because they need the whole hardware list: under WSL2 the GPU is reported as a Microsoft
+    // virtual adapter whose PCI bus id CUDA rejects, so a per-device lookup here would always fail
+    // and the EP could never be created. Discovery publishes its decision as "device_id" metadata.
     int cuda_device_id = 0;
     if (!IsWin32kLockdownActive())
     {
@@ -1658,11 +1888,7 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
             return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "EP requires one non-null hardware device.");
         }
 
-        if (!IsOrtHardwareDeviceSupported(devices[0], factory->ort_api, nullptr, nullptr, &cuda_device_id))
-        {
-            return factory->ort_api.CreateStatus(
-                ORT_INVALID_ARGUMENT, "Selected hardware device could not be resolved to a supported CUDA device.");
-        }
+        RETURN_IF_ERROR(ResolveSelectedCudaDevice(*factory, devices[0], ep_metadata, &cuda_device_id));
     }
     else
     {
