@@ -4,24 +4,45 @@
 include_guard(GLOBAL)
 
 set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional path to ONNX Runtime SDK root directory (must contain include/ and lib/)")
-set(ONNXRUNTIME_VERSION "1.26.0" CACHE STRING "ONNX Runtime version to download when ONNXRUNTIME_ROOT is empty")
+set(ONNXRUNTIME_VERSION "1.30.0" CACHE STRING "ONNX Runtime version to download when ONNXRUNTIME_ROOT is empty")
 set(ONNXRUNTIME_DOWNLOAD_BASE_URL
     "https://github.com/microsoft/onnxruntime/releases/download"
     CACHE STRING "Base URL for ONNX Runtime release downloads")
 string(REGEX REPLACE "^v" "" _onnxruntime_version "${ONNXRUNTIME_VERSION}")
 
-set(_onnxruntime_arch "x64")
+if(WIN32 AND TRT_RTX_EP_TARGET_ARCH)
+    set(_onnxruntime_arch "${TRT_RTX_EP_TARGET_ARCH}")
+else()
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _onnxruntime_arch)
+    if(_onnxruntime_arch MATCHES "^(amd64|x86_64)$")
+        set(_onnxruntime_arch "x64")
+    elseif(_onnxruntime_arch MATCHES "^(aarch64|arm64)$")
+        set(_onnxruntime_arch "arm64")
+    endif()
+endif()
 if(NOT ONNXRUNTIME_ROOT)
     if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
         if(_onnxruntime_arch STREQUAL "x64")
             set(_onnxruntime_package_platform "win-x64")
+        elseif(_onnxruntime_arch STREQUAL "arm64ec")
+            # ARM64EC follows the x64 ABI and can link to the x64 ORT import
+            # library. At runtime an x64/ARM64EC process uses the x64-compatible
+            # view of ONNX Runtime.
+            set(_onnxruntime_package_platform "win-x64")
+        elseif(_onnxruntime_arch STREQUAL "arm64")
+            set(_onnxruntime_package_platform "win-arm64")
         else()
-            message(FATAL_ERROR "Unsupported ONNX Runtime Windows architecture: ${_onnxruntime_arch}")
+            message(FATAL_ERROR
+                "Automatic ONNX Runtime SDK download is not configured for Windows "
+                "architecture '${_onnxruntime_arch}'. Set ONNXRUNTIME_ROOT explicitly.")
         endif()
         set(_onnxruntime_archive_extension "zip")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         if(_onnxruntime_arch STREQUAL "x64")
             set(_onnxruntime_package_platform "linux-x64")
+            set(_onnxruntime_archive_extension "tgz")
+        elseif (_onnxruntime_arch STREQUAL "arm64")
+            set(_onnxruntime_package_platform "linux-aarch64")
             set(_onnxruntime_archive_extension "tgz")
         else ()
             message(FATAL_ERROR "Only ONNX Runtime linux-x64 downloads are configured. Set ONNXRUNTIME_ROOT for ${_onnxruntime_arch}.")

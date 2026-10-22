@@ -43,14 +43,22 @@ else()
     message(STATUS "Can't find NV_TRT_MAJOR_RTX macro")
 endif()
 
-# Weightless EPContext refit requires TensorRT-RTX >= 1.6 (weight-strip build capability +
-# IRefitterObserver/RefitRecord parser API). Enforce the minimum at configure time -- building this EP
-# against an older TensorRT-RTX is not supported. See src/nv_includes.h and doc/TECHNICAL_NOTES.md.
-if(NV_TRT_MAJOR_RTX AND NV_TRT_MINOR_RTX AND "${NV_TRT_MAJOR_RTX}.${NV_TRT_MINOR_RTX}" VERSION_LESS "1.6")
+# Weightless EPContext refit requires TensorRT-RTX >= 1.7 (weight-strip builds, IRefitterObserver/RefitRecord,
+# IParser::setRefitObserver). The minimum is enforced here at configure time and re-checked by the
+# compile-time guard in src/nv_includes.h; see docs/technical-notes.md.
+#
+# Compare on non-empty strings rather than truthiness: if(<var>) is false for the value "0", so a minor
+# version of 0 would silently skip the check.
+if("${NV_TRT_MAJOR_RTX}" STREQUAL "" OR "${NV_TRT_MINOR_RTX}" STREQUAL "")
+    message(FATAL_ERROR
+        "Could not read TRT_MAJOR_RTX/TRT_MINOR_RTX from ${TENSORRT_RTX_INCLUDE_DIR}/NvInferVersion.h. "
+        "Point -DTRT_RTX_ROOT at a TensorRT-RTX 1.7 or newer SDK.")
+endif()
+if("${NV_TRT_MAJOR_RTX}.${NV_TRT_MINOR_RTX}" VERSION_LESS "1.7")
     message(FATAL_ERROR
         "Unsupported TensorRT-RTX version ${NV_TRT_MAJOR_RTX}.${NV_TRT_MINOR_RTX}: this EP requires "
-        "TensorRT-RTX >= 1.6 (weightless EPContext refit / weight-stripped engine). "
-        "Point -DTRT_RTX_ROOT at a TensorRT-RTX 1.6 or newer SDK.")
+        "TensorRT-RTX >= 1.7 (weightless EPContext refit). Point -DTRT_RTX_ROOT at a TensorRT-RTX 1.7 or "
+        "newer SDK.")
 endif()
 
 if(WIN32 AND NV_TRT_MAJOR_RTX)

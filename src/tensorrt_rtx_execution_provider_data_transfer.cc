@@ -63,9 +63,16 @@ bool ORT_API_CALL TensorrtRtxDataTransfer::CanCopyImpl(const OrtDataTransferImpl
     auto src_vendor_id = impl.ep_api.MemoryDevice_GetVendorId(src_memory_device);
     auto dst_vendor_id = impl.ep_api.MemoryDevice_GetVendorId(dst_memory_device);
 
-    // If src or dst is GPU type, verify it has NVIDIA vendor ID
-    if ((src_type == OrtMemoryInfoDeviceType_GPU && src_vendor_id != impl.nvidia_vendor_id_) ||
-        (dst_type == OrtMemoryInfoDeviceType_GPU && dst_vendor_id != impl.nvidia_vendor_id_))
+    const auto is_supported_gpu_memory =
+        [&](OrtMemoryInfoDeviceType type, uint32_t vendor_id, const OrtMemoryDevice* memory_device)
+    {
+        return type != OrtMemoryInfoDeviceType_GPU || vendor_id == impl.nvidia_vendor_id_ ||
+               (vendor_id == kNonPCIVendorId &&
+                impl.ep_api.MemoryDevice_GetMemoryType(memory_device) == OrtDeviceMemoryType_HOST_ACCESSIBLE);
+    };
+
+    if (!is_supported_gpu_memory(src_type, src_vendor_id, src_memory_device) ||
+        !is_supported_gpu_memory(dst_type, dst_vendor_id, dst_memory_device))
     {
         return false;
     }

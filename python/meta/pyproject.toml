@@ -5,7 +5,7 @@
 # End users run:  pip install onnxruntime-ep-nv-tensorrt-rtx
 # CUDA 12 users:  pip install onnxruntime-ep-nv-tensorrt-rtx-cu12
 #
-# _version.txt is written by build.bat / build.sh at release time (gitignored).
+# _version.txt is written at release time (gitignored).
 
 [build-system]
 requires = ["setuptools>=77.0.0"]

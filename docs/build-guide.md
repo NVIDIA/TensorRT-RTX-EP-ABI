@@ -8,11 +8,6 @@ SPDX-License-Identifier: Apache-2.0
 This guide covers everything needed to build the TensorRT RTX Execution Provider
 from source on Windows, Windows ARM64, and Linux, including the Python wheel.
 
-> **Note:** The repository also provides convenience scripts `build.bat` (Windows)
-> and `build.sh` (Linux) that wrap the CMake steps below and add path validation,
-> vcpkg bootstrapping, and wheel packaging. The plain CMake commands documented
-> here are sufficient for all standard builds.
-
 ## Prerequisites
 
 ### Software requirements
@@ -104,11 +99,14 @@ python scripts/stage_windows_dlls.py `
 
 For Linux use `python scripts/stage_linux_so.py` with equivalent arguments.
 
-**Step 3** — Build the wheel:
+**Step 3** — Build the wheel. Set `NV_CUDA_MAJOR` to the CUDA major version you built
+against (`12` or `13`); it selects the package name (`...-cu12` / `...-cu13`). If it is unset,
+the wheel is built without the CUDA suffix.
 
 Windows:
 
 ```powershell
+$env:NV_CUDA_MAJOR = "<12|13>"
 $env:TRT_RTX_EP_VERSION = "<M.m.p>"
 python -m build --wheel --no-isolation --outdir dist
 ```
@@ -116,7 +114,7 @@ python -m build --wheel --no-isolation --outdir dist
 Linux:
 
 ```bash
-TRT_RTX_EP_VERSION="<M.m.p>" python -m build --wheel --no-isolation --outdir dist
+NV_CUDA_MAJOR=<12|13> TRT_RTX_EP_VERSION="<M.m.p>" python -m build --wheel --no-isolation --outdir dist
 ```
 
 **Outputs** (under `python\dist\` / `python/dist/`):
@@ -126,9 +124,6 @@ TRT_RTX_EP_VERSION="<M.m.p>" python -m build --wheel --no-isolation --outdir dis
 
 The meta wheel (`onnxruntime-ep-nv-tensorrt-rtx`) defaults to the cu13 variant.
 CUDA 12 users must install `onnxruntime-ep-nv-tensorrt-rtx-cu12` explicitly.
-
-> **Note:** `build.bat --build_wheel` / `build.sh --build_wheel` automate all three
-> steps above in a single command.
 
 ## CMake options reference
 

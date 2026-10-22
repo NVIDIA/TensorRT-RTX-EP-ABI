@@ -26,9 +26,14 @@
 
 #include "utils/cuda/cuda_common.h"
 #include "utils/cuda/cuda_context.h"
+#include "utils/filesystem_utils.h"
 #include "utils/ort_api_init.h"
+#include "utils/path_string.h"
+#include "utils/win32k_lockdown.h"
 
 #include "onnxruntime_cxx_api.h"
+#include "onnxruntime_env_config_keys.h"
+#include "onnxruntime_session_options_config_keys.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -44,11 +49,20 @@
 #include <d3d12.h>
 #endif
 
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <charconv>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #if defined(_WIN32)
@@ -62,6 +76,80 @@ namespace trt_rtx_ep
 
 namespace
 {
+using InitPlugins = bool (*)();
+
+#if defined(_WIN32)
+using LibraryHandle = HMODULE;
+
+LibraryHandle OpenLibrary(const std::filesystem::path& path, std::string& error_suffix)
+{
+    LibraryHandle library = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (library == nullptr)
+    {
+        const DWORD error_code = GetLastError();
+        error_suffix = " (Windows error " + std::to_string(error_code) +
+                       "): " + std::system_category().message(static_cast<int>(error_code));
+    }
+    else
+    {
+        // Pin the plugin DLL permanently — same rationale as dll_main.cc: plugin
+        // static registrations must outlive any FreeLibrary call from ORT teardown
+        // or the host. PIN makes subsequent FreeLibrary calls no-ops at the OS
+        // level, so the local handle going out of scope here is safe.
+        HMODULE pinned = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(library), &pinned);
+    }
+    return library;
+}
+
+InitPlugins GetFunction(LibraryHandle library, const char* name)
+{
+    return reinterpret_cast<InitPlugins>(GetProcAddress(library, name));
+}
+#else
+using LibraryHandle = void*;
+
+LibraryHandle OpenLibrary(const std::filesystem::path& path, std::string& error_suffix)
+{
+    LibraryHandle library = dlopen(path.c_str(), RTLD_LAZY);
+    if (library == nullptr)
+    {
+        if (const char* error = dlerror())
+        {
+            error_suffix = ": " + std::string(error);
+        }
+    }
+    return library;
+}
+
+InitPlugins GetFunction(LibraryHandle library, const char* name)
+{
+    return reinterpret_cast<InitPlugins>(dlsym(library, name));
+}
+#endif
+
+void LoadExternalPlugins(const OrtApi& ort_api, const OrtLogger* logger, const std::filesystem::path& plugin_path)
+{
+    std::string error_suffix;
+    LibraryHandle plugin_library = OpenLibrary(plugin_path, error_suffix);
+    if (plugin_library == nullptr)
+    {
+        const std::string message = "[NvTensorRTRTX EP] Failed to load tensorrt_plugins '" +
+                                    PathToUTF8String(plugin_path.native()) + "'" + error_suffix;
+        ort_api.Logger_LogMessage(logger, ORT_LOGGING_LEVEL_INFO, message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+        return;
+    }
+
+    // Plugins can either register explicitly after the library loader releases its lock or register statically while
+    // the library is loading.
+    InitPlugins init_plugins = GetFunction(plugin_library, "initLibNvTensorRTRtxPlugins");
+    const char* message = init_plugins == nullptr || init_plugins()
+                              ? "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins"
+                              : "[NvTensorRTRTX EP] Failed to initialize tensorrt_plugins";
+    ort_api.Logger_LogMessage(logger, ORT_LOGGING_LEVEL_INFO, message, ORT_FILE, __LINE__, __FUNCTION__);
+}
+
 bool TryHexStringToBinary(const char* hex, std::vector<uint8_t>& out, std::string& error_message)
 {
     if (hex == nullptr)
@@ -702,6 +790,21 @@ TensorrtRtxExecutionProviderFactory::~TensorrtRtxExecutionProviderFactory() noex
     }
     custom_op_domains_.clear();
 
+    for (auto* dev : described_devices)
+    {
+        if (dev != nullptr)
+        {
+            try
+            {
+                ep_api.ReleaseHardwareDevice(dev);
+            }
+            catch (...)
+            {
+            }
+        }
+    }
+    described_devices.clear();
+
     if (kernel_registry_ != nullptr)
     {
         try
@@ -717,11 +820,22 @@ TensorrtRtxExecutionProviderFactory::~TensorrtRtxExecutionProviderFactory() noex
 
 OrtStatus* TensorrtRtxExecutionProviderFactory::ShrinkCudaMempoolAllocators(uint32_t device_id)
 {
-    std::lock_guard<std::mutex> lock(mempool_state_mutex_);
-    auto it_mempool = device_mempool_allocators.find(device_id);
-    if (it_mempool != device_mempool_allocators.end())
+    // Copy the pointer out under mempool_state_mutex_ (the lock CreateAllocatorImpl
+    // holds when inserting) so a CreateAllocator on another device cannot race the
+    // lookup. Shrink() runs outside the lock: entries are never erased, so the
+    // allocator stays alive, and the CUDA trim must not block compute-path lookups.
+    CudaMempoolAllocator* mempool = nullptr;
     {
-        RETURN_IF_ERROR(it_mempool->second->Shrink());
+        std::lock_guard<std::mutex> lock(mempool_state_mutex_);
+        auto it_mempool = device_mempool_allocators.find(device_id);
+        if (it_mempool != device_mempool_allocators.end())
+        {
+            mempool = it_mempool->second.get();
+        }
+    }
+    if (mempool != nullptr)
+    {
+        RETURN_IF_ERROR(mempool->Shrink());
     }
 
     return nullptr;
@@ -924,6 +1038,9 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::CreateMemoryInfoForDevices(int n
     // Create memory info objects for each device
     for (int device_id = 0; device_id < num_devices; ++device_id)
     {
+        int is_integrated = 0;
+        CUDA_RETURN_IF_ERROR(cudaDeviceGetAttribute(&is_integrated, cudaDevAttrIntegrated, device_id));
+
         // Create device memory info (OrtDeviceMemoryType_DEFAULT)
         OrtMemoryInfo* device_memory_info = nullptr;
         RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("TensorRTRTX", OrtMemoryInfoDeviceType_GPU, vendor_id_, device_id,
@@ -938,9 +1055,12 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::CreateMemoryInfoForDevices(int n
                                                              });
 
         // Create pinned/host-accessible memory info (OrtDeviceMemoryType_HOST_ACCESSIBLE)
+        // A distinct vendor ID makes ORT stage mapped host memory through device-local memory.
+        const uint32_t host_accessible_vendor_id = is_integrated ? vendor_id_ : kNonPCIVendorId;
         OrtMemoryInfo* pinned_memory_info = nullptr;
         RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("TensorRTRTX host accessible", OrtMemoryInfoDeviceType_GPU,
-                                                    vendor_id_, device_id, OrtDeviceMemoryType_HOST_ACCESSIBLE,
+                                                    host_accessible_vendor_id, device_id,
+                                                    OrtDeviceMemoryType_HOST_ACCESSIBLE,
                                                     0,  // alignment
                                                     OrtAllocatorType::OrtDeviceAllocator, &pinned_memory_info));
 
@@ -954,6 +1074,7 @@ OrtStatus* TensorrtRtxExecutionProviderFactory::CreateMemoryInfoForDevices(int n
     return nullptr;
 }
 
+// Why a probe could not map an ORT hardware device to a CUDA runtime index.
 enum class HardwareProbeStatus
 {
     kNoIdentity,
@@ -1126,6 +1247,118 @@ static bool LookupCudaCapability(const std::vector<VisibleCudaDevice>& cuda_devi
 }
 
 //!
+//! \brief Checks if a given OrtHardwareDevice is a supported NVIDIA GPU.
+//!
+//! This function verifies if the provided hardware device corresponds to a physical
+//! NVIDIA GPU that meets the minimum compute capability requirements for this execution provider.
+//!
+//! The check is performed by:
+//! 1. Extracting the device identity (LUID on Windows, pci_bus_id on Linux) from its metadata.
+//! 2. Resolving it to a CUDA runtime index via ProbeOrtHardwareDevice.
+//! 3. If a device is found, checking whether its compute capability is supported by TensorRT RTX.
+//!
+//! This is the strict single-device query: it never applies the WSL2 virtual-adapter pairing
+//! rules, so a device whose identity cannot be resolved is reported unsupported rather than
+//! being aliased onto another CUDA device. Device enumeration goes through
+//! ClassifyHardwareDevice / SelectSupportedEpDevices instead.
+//!
+//! \param device The OrtHardwareDevice to check.
+//! \param ort_api The ORT API interface for accessing device metadata.
+//! \param major Optional output parameter for the major compute capability version.
+//! \param minor Optional output parameter for the minor compute capability version.
+//! \param cuda_device_id Optional output parameter for the matching CUDA device ordinal.
+//! \return True if the device is a supported NVIDIA GPU, false otherwise.
+//!
+static bool IsOrtHardwareDeviceSupported(const OrtHardwareDevice* device, const OrtApi& ort_api, int* major = nullptr,
+                                        int* minor = nullptr, int* cuda_device_id = nullptr)
+{
+    const HardwareProbe probe = ProbeOrtHardwareDevice(device, ort_api);
+    if (probe.status != HardwareProbeStatus::kMapped)
+    {
+        return false;
+    }
+
+    if (major != nullptr)
+    {
+        *major = probe.compute_capability_major;
+    }
+    if (minor != nullptr)
+    {
+        *minor = probe.compute_capability_minor;
+    }
+    if (cuda_device_id != nullptr)
+    {
+        *cuda_device_id = probe.cuda_index;
+    }
+    return onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(probe.compute_capability_major,
+                                                                  probe.compute_capability_minor);
+}
+
+//!
+//! \brief Resolves the CUDA ordinal for the hardware device a session is being created on.
+//!
+//! Prefers the ordinal discovery already decided on, which it publishes as "device_id" metadata on
+//! the OrtEpDevice. That decision cannot be reproduced here: the WSL2 pairing rules need the whole
+//! hardware list, and a virtual adapter's PCI bus id never resolves on its own. Falling back to a
+//! per-device probe keeps hosts whose metadata predates that key working, and covers callers that
+//! pass a hardware device straight through.
+//!
+//! \param factory The owning factory (for its ORT API handles).
+//! \param device The hardware device selected for the session.
+//! \param metadata The session's per-device EP metadata array, as passed to CreateEpImpl.
+//! \param cuda_device_id Output parameter for the resolved CUDA ordinal.
+//! \return nullptr on success, or an OrtStatus describing why the device could not be resolved.
+//!
+static OrtStatus* ResolveSelectedCudaDevice(const TensorrtRtxExecutionProviderFactory& factory,
+                                            const OrtHardwareDevice* device,
+                                            const OrtKeyValuePairs* const* metadata, int* cuda_device_id)
+{
+    if (metadata != nullptr && metadata[0] != nullptr)
+    {
+        const char* device_id_str = factory.ort_api.GetKeyValue(metadata[0], "device_id");
+        if (device_id_str != nullptr)
+        {
+            char* parse_end = nullptr;
+            errno = 0;
+            const long parsed = strtol(device_id_str, &parse_end, 10);
+            if (parse_end != device_id_str && *parse_end == '\0' && errno != ERANGE && parsed >= 0 &&
+                parsed <= static_cast<long>(INT32_MAX))
+            {
+                *cuda_device_id = static_cast<int>(parsed);
+                return nullptr;
+            }
+        }
+    }
+
+    // No discovery decision available: resolve this device directly. This cannot succeed for a WSL2
+    // virtual adapter, so it only serves the mapped-device paths.
+    if (IsOrtHardwareDeviceSupported(device, factory.ort_api, nullptr, nullptr, cuda_device_id))
+    {
+        return nullptr;
+    }
+
+    // Still unresolved: re-run discovery's own pairing rules for this device alone. A WSL2 virtual
+    // adapter has no resolvable identity, so it takes the lowest supported CUDA device -- exactly
+    // what GetSupportedDevicesImpl would have chosen for it had it been the only candidate.
+    const uint32_t vendor_id = factory.ort_api.HardwareDevice_VendorId(device);
+    if (IsEligibleGpuVendor(vendor_id))
+    {
+        const std::vector<VisibleCudaDevice> cuda_devices = EnumerateVisibleCudaDevices();
+        const HardwareDeviceMatch match = ClassifyHardwareDevice(device, factory.ort_api, vendor_id, 0);
+        const std::vector<SelectedEpDevice> selected = SelectSupportedEpDevices({match}, cuda_devices);
+        if (!selected.empty() && selected.front().cuda_index >= 0)
+        {
+            *cuda_device_id = selected.front().cuda_index;
+            return nullptr;
+        }
+    }
+
+    return factory.ort_api.CreateStatus(
+        ORT_INVALID_ARGUMENT,
+        "[NvTensorRTRTX EP] Selected hardware device could not be resolved to a supported CUDA device.");
+}
+
+//!
 //! \brief Parses an NVML driver version string and compares it with a minimum required version.
 //!
 //! NVML returns "major.minor" on Windows (e.g., "581.80") and "major.minor.patch" on Linux
@@ -1209,7 +1442,7 @@ static bool CompareNVMLDriverVersion(const std::string& driver_version_str, cons
 //! this execution provider.
 //!
 //! Currently checks:
-//! - Compute capability: Requires Ampere (8.0) or newer GPU architecture
+//! - Compute capability: Requires 8.6, 8.9, or 12.0 and newer
 //! - Driver version: Uses NVML to check NVIDIA graphics driver version
 //!   - Ampere/Ada (CC 8.x): Requires >= 555.85
 //!   - Blackwell (CC 12.x): Requires >= 570.00
@@ -1283,11 +1516,11 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
                 "Ensure the NVIDIA driver and CUDA runtime are correctly installed.");
         }
 
-        // Device was found but its architecture is below the minimum requirement.
+        // Device was found but its architecture is unsupported.
         std::string cc_string =
             std::to_string(compute_capability_major) + "." + std::to_string(compute_capability_minor);
         std::string msg = "NvTensorRTRTX EP does not support GPU with Compute Capability " + cc_string +
-                          ". Minimum required: Compute Capability 8.0 (Ampere architecture or newer).";
+                          ". Supported compute capabilities are 8.6, 8.9, and 12.0 or newer.";
         return factory->ep_api.DeviceEpIncompatibilityDetails_SetDetails(details, reasons,
                                                                          0,  // error_code
                                                                          msg.c_str());
@@ -1358,6 +1591,34 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetHardwareDeviceIn
     return nullptr;
 }
 
+// Read a single value from the ORT environment's config entries (the global table supplied
+// at OrtEnvCreationOptions::config_entries time). Returns an empty string if the key is absent.
+// Fetches and releases the container internally: GetKeyValue returns a pointer into that
+// container's storage, so returning it would hand the caller a view that dies with the container.
+static std::string GetEnvironmentConfigEntry(const OrtApi& ort_api, const OrtEpApi& ep_api, const char* key)
+{
+    OrtKeyValuePairs* config_entries = nullptr;
+    if (ep_api.GetEnvConfigEntries(&config_entries) != nullptr || config_entries == nullptr)
+    {
+        return {};
+    }
+
+    const char* entry = ort_api.GetKeyValue(config_entries, key);
+    const std::string value = entry != nullptr ? std::string(entry) : std::string();
+
+    ort_api.ReleaseKeyValuePairs(config_entries);
+    return value;
+}
+
+// Look up a value for the per-EP key "ep_factory.<ep_name>.<key>".
+// Returns an empty string if absent.
+static std::string GetEpEnvironmentConfigEntry(const OrtApi& ort_api, const OrtEpApi& ep_api,
+                                               const std::string& ep_name, const char* key)
+{
+    std::string full_key = std::string("ep_factory.") + ep_name + "." + key;
+    return GetEnvironmentConfigEntry(ort_api, ep_api, full_key.c_str());
+}
+
 OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevicesImpl(
     OrtEpFactory* this_ptr, const OrtHardwareDevice* const* devices, size_t num_devices, OrtEpDevice** ep_devices,
     size_t max_ep_devices, size_t* p_num_ep_devices) noexcept
@@ -1390,6 +1651,87 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
 
     size_t& num_ep_devices = *p_num_ep_devices;
 
+    // In a sandboxed Compiler process the CUDA driver is inaccessible. Detect this via the
+    // Win32k syscall lockdown flag, which the browser applies before EP library load.
+    // When active: skip the driver query entirely and instead describe a virtual device from
+    // the environment config keys that Chrome supplied at library registration time.
+    if (IsWin32kLockdownActive())
+    {
+        // Honour the host's opt-in: only describe a virtual device if the application
+        // set allow_virtual_devices=1. Publishing a device the host never asked for is wrong.
+        const bool allow_virtual =
+            GetEnvironmentConfigEntry(factory->ort_api, factory->ep_api, kOrtEnvAllowVirtualDevices) == "1";
+
+        // The architecture to compile for, supplied by the host (e.g. Chrome) via env config
+        // after reading it from the GPU process's OrtEpDevice metadata.
+        const std::string target_sm_str =
+            GetEpEnvironmentConfigEntry(factory->ort_api, factory->ep_api, factory->ep_name_,
+                                        onnxruntime::tensorrt_rtx::env_config_names::kTargetSM);
+
+        if (!allow_virtual || target_sm_str.empty() ||
+            !onnxruntime::tensorrt_rtx::IsTargetSMSupported(target_sm_str.c_str()))
+        {
+            // Not opted in, or no valid target SM — cannot describe any device.
+            return nullptr;
+        }
+
+        // The hardware device ID matching the physical GPU in the GPU process, supplied via
+        // env config. Chrome writes it as lowercase hex (e.g. "2c02"); parse as base 16.
+        const std::string hw_device_id_str =
+            GetEpEnvironmentConfigEntry(factory->ort_api, factory->ep_api, factory->ep_name_,
+                                        onnxruntime::tensorrt_rtx::env_config_names::kHardwareDeviceId);
+        uint32_t hw_device_id = 0;
+        if (!hw_device_id_str.empty())
+        {
+            std::from_chars(hw_device_id_str.data(), hw_device_id_str.data() + hw_device_id_str.size(), hw_device_id,
+                            16);
+        }
+
+        if (num_ep_devices >= max_ep_devices)
+        {
+            return nullptr;
+        }
+
+        // Create a virtual OrtHardwareDevice that describes the target GPU without
+        // needing the driver. ORT's allow_virtual_devices mechanism lets EPs register
+        // devices they cannot enumerate live (e.g. compile-only sandbox).
+        OrtHardwareDevice* virtual_device = nullptr;
+        RETURN_IF_ERROR(factory->ep_api.CreateHardwareDevice(OrtHardwareDeviceType_GPU, factory->vendor_id_,
+                                                             hw_device_id, "NVIDIA", nullptr, &virtual_device));
+        factory->described_devices.push_back(virtual_device);
+
+        // Build the default EP options for this described device. The target_sm is
+        // forwarded so that every session created on it inherits the compile target.
+        OrtKeyValuePairs* ep_options = nullptr;
+        OrtKeyValuePairs* ep_metadata = nullptr;
+        factory->ort_api.CreateKeyValuePairs(&ep_options);
+        factory->ort_api.CreateKeyValuePairs(&ep_metadata);
+        factory->ort_api.AddKeyValuePair(ep_options, onnxruntime::tensorrt_rtx::provider_option_names::kTargetSM,
+                                         target_sm_str.c_str());
+        factory->ort_api.AddKeyValuePair(ep_metadata, "nv_ep_ort_api_version",
+                                         std::to_string(NegotiatedOrtApiVersion()).c_str());
+        // Virtual devices have no LUID/pci_bus_id metadata (created with metadata=nullptr below),
+        // so IsOrtHardwareDeviceSupported can never resolve a CUDA ordinal for them. Stash a
+        // device_id here so ParseDeviceIdFromEpDevice can fall back to it for this device (used by
+        // graphics-interop entry points). This must go in ep_metadata, not ep_options: ep_options
+        // is auto-forwarded into session config as "ep.<name>.device_id" and parsed by
+        // ProviderOptionsParser, which has no registered parser for "device_id" (removed with the
+        // rest of the manual device_id option) and would reject it as an unknown provider option.
+        factory->ort_api.AddKeyValuePair(ep_metadata, "device_id", "0");
+
+        OrtStatus* status = factory->ep_api.CreateEpDevice(factory, virtual_device, ep_metadata, ep_options,
+                                                           &ep_devices[num_ep_devices]);
+        factory->ort_api.ReleaseKeyValuePairs(ep_options);
+        factory->ort_api.ReleaseKeyValuePairs(ep_metadata);
+        RETURN_IF_ERROR(status);
+
+        // Virtual devices have no memory allocators — the compile path doesn't allocate
+        // GPU memory, so skip CreateMemoryInfoForDevices / EpDevice_AddAllocatorInfo.
+        num_ep_devices++;
+        return nullptr;
+    }
+
+    // Normal (non-sandboxed) path: enumerate real CUDA devices.
     int num_cuda_devices = 0;
     if (cudaGetDeviceCount(&num_cuda_devices) != cudaSuccess || num_cuda_devices < 0)
     {
@@ -1449,11 +1791,14 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
             }
 
             const OrtHardwareDevice* device = devices[ep_device.hardware_ordinal];
-            OrtKeyValuePairs* ep_options = nullptr;
             OrtKeyValuePairs* ep_metadata = nullptr;
-            factory->ort_api.CreateKeyValuePairs(&ep_options);
             factory->ort_api.CreateKeyValuePairs(&ep_metadata);
-            factory->ort_api.AddKeyValuePair(ep_options, "device_id", std::to_string(cuda_index).c_str());
+            // The resolved CUDA ordinal is published as metadata, not as an EP option. ep_options are
+            // auto-forwarded into session config as "ep.<name>.<key>" and validated by
+            // ProviderOptionsParser, which has no "device_id" parser (the manual device_id provider
+            // option was removed) and would reject the key as unknown. Metadata also carries the
+            // discovery-time decision through to CreateEpImpl for devices the driver cannot map.
+            factory->ort_api.AddKeyValuePair(ep_metadata, "device_id", std::to_string(cuda_index).c_str());
 
             // Surface the EP's negotiated ORT API version on EpDevice metadata so callers (notably
             // tests) can gate version-specific behavior without touching EP-internal symbols. Key
@@ -1462,9 +1807,18 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::GetSupportedDevices
             factory->ort_api.AddKeyValuePair(ep_metadata, "nv_ep_ort_api_version",
                                              std::to_string(NegotiatedOrtApiVersion()).c_str());
 
-            RETURN_IF_ERROR(factory->ort_api.GetEpApi()->CreateEpDevice(factory, device, ep_metadata, ep_options,
+            // Publish the compute capability so Chrome can carry it to the Compiler process.
+            // Format: "sm" + (major * 10 + minor), e.g. SM 8.6 -> "sm86", SM 12.0 -> "sm120".
+            int capability_major = 0;
+            int capability_minor = 0;
+            if (LookupCudaCapability(cuda_devices, ep_device.cuda_index, capability_major, capability_minor))
+            {
+                std::string sm_str = "sm" + std::to_string(capability_major * 10 + capability_minor);
+                factory->ort_api.AddKeyValuePair(ep_metadata, "target_architecture", sm_str.c_str());
+            }
+
+            RETURN_IF_ERROR(factory->ort_api.GetEpApi()->CreateEpDevice(factory, device, ep_metadata, nullptr,
                                                                         &ep_devices[num_ep_devices]));
-            factory->ort_api.ReleaseKeyValuePairs(ep_options);
             factory->ort_api.ReleaseKeyValuePairs(ep_metadata);
 
             RETURN_IF_ERROR(
@@ -1521,10 +1875,49 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateEpImpl(
                                                        "Creating Execution Provider", ORT_FILE, __LINE__,
                                                        __FUNCTION__));
 
+    // Resolve the CUDA ordinal the way discovery did, not with the strict single-device lookup.
+    // Discovery (GetSupportedDevicesImpl) is the only place that can apply the WSL2 pairing rules,
+    // because they need the whole hardware list: under WSL2 the GPU is reported as a Microsoft
+    // virtual adapter whose PCI bus id CUDA rejects, so a per-device lookup here would always fail
+    // and the EP could never be created. Discovery publishes its decision as "device_id" metadata.
+    int cuda_device_id = 0;
+    if (!IsWin32kLockdownActive())
+    {
+        if (devices == nullptr || devices[0] == nullptr)
+        {
+            return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "EP requires one non-null hardware device.");
+        }
+
+        RETURN_IF_ERROR(ResolveSelectedCudaDevice(*factory, devices[0], ep_metadata, &cuda_device_id));
+    }
+    else
+    {
+        // Under Win32k lockdown there is no driver access, so the hardware device (the virtual
+        // device from GetSupportedDevicesImpl) can never be resolved to a real CUDA ordinal here.
+        // Leaving cuda_device_id at 0 is only safe when the EP constructor will itself skip live
+        // device init (compile-only session with a target SM already supplied) -- otherwise it
+        // would silently cudaSetDevice(0)/query device 0 regardless of which device was actually
+        // selected. Fail fast instead of allowing that silent wrong-GPU bind.
+        const char* compile_only_key = kOrtSessionOptionCompileOnly;
+        OrtKeyValuePairs* key_value_pairs = nullptr;
+        RETURN_IF_ERROR(factory->ort_api.GetSessionOptionsConfigEntries(session_options, &key_value_pairs));
+        const char* compile_only_value = factory->ort_api.GetKeyValue(key_value_pairs, compile_only_key);
+        const bool is_compile_only = compile_only_value != nullptr && strcmp(compile_only_value, "1") == 0;
+        factory->ort_api.ReleaseKeyValuePairs(key_value_pairs);
+
+        if (!is_compile_only)
+        {
+            return factory->ort_api.CreateStatus(
+                ORT_INVALID_ARGUMENT,
+                "[NvTensorRTRTX EP] EP is running under Win32k lockdown but the session is not compile-only; "
+                "no CUDA device is accessible in this sandboxed process.");
+        }
+    }
+
     try
     {
-        auto execution_provider =
-            std::make_unique<TensorrtRtxExecutionProvider>(*factory, factory->ep_name_, *session_options, *logger);
+        auto execution_provider = std::make_unique<TensorrtRtxExecutionProvider>(
+            *factory, factory->ep_name_, *session_options, *logger, cuda_device_id);
         *ep = execution_provider.release();
     }
     catch (const std::exception& e)
@@ -1595,8 +1988,10 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::CreateAllocatorImpl
         }
 
         // CUDA mempool allocator for shared activation memory. If the creation-time
-        // probe fails, skip registering it: the compute path then uses the BFC arena
-        // (below) and graph capture is off. Create() logs the fallback WARNING.
+        // probe fails, or the driver is inaccessible (sandbox), skip registering it:
+        // the compute path then uses the BFC arena (below) and graph capture is off.
+        // Create() logs the fallback WARNING.
+        if (!IsWin32kLockdownActive())
         {
             std::unique_ptr<CudaMempoolAllocator> mempool_allocator;
             RETURN_IF_ERROR(CudaMempoolAllocator::Create(memory_info, static_cast<DeviceId>(device_id), factory.ort_api,
@@ -1969,24 +2364,38 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProviderFactory::ValidateCompiledMod
 static OrtStatus* ParseDeviceIdFromEpDevice(const TensorrtRtxExecutionProviderFactory& factory,
                                             const OrtEpDevice* ep_device, const char* caller, int32_t* out_device_id)
 {
-    const OrtKeyValuePairs* ep_options = factory.ort_api.EpDevice_EpOptions(ep_device);
-    const char* device_id_str = factory.ort_api.GetKeyValue(ep_options, "device_id");
-    if (device_id_str == nullptr)
+    const OrtHardwareDevice* hardware_device = factory.ort_api.EpDevice_Device(ep_device);
+    int cuda_device_id = 0;
+    if (hardware_device != nullptr &&
+        IsOrtHardwareDeviceSupported(hardware_device, factory.ort_api, nullptr, nullptr, &cuda_device_id))
     {
-        std::string msg = std::string("[NvTensorRTRTX EP] ") + caller + ": device_id not found in ep_device options";
-        return factory.ort_api.CreateStatus(ORT_FAIL, msg.c_str());
+        *out_device_id = static_cast<int32_t>(cuda_device_id);
+        return nullptr;
     }
-    char* parse_end = nullptr;
-    errno = 0;
-    long device_id_long = strtol(device_id_str, &parse_end, 10);
-    if (parse_end == device_id_str || *parse_end != '\0' || errno == ERANGE ||
-        device_id_long < static_cast<long>(INT32_MIN) || device_id_long > static_cast<long>(INT32_MAX))
+
+    // Described/virtual devices (e.g. the compile-only device published under Win32k lockdown,
+    // see GetSupportedDevicesImpl) have no LUID/pci_bus_id metadata for the driver lookup above
+    // to resolve, so fall back to the device_id stashed in ep_metadata for exactly this case.
+    // (Deliberately ep_metadata, not EpDevice_EpOptions: ep_options is auto-forwarded into session
+    // config and parsed by ProviderOptionsParser, which would reject an unknown "device_id" key.)
+    const OrtKeyValuePairs* ep_metadata = factory.ort_api.EpDevice_EpMetadata(ep_device);
+    const char* device_id_str = factory.ort_api.GetKeyValue(ep_metadata, "device_id");
+    if (device_id_str != nullptr)
     {
-        std::string msg = std::string("[NvTensorRTRTX EP] ") + caller + ": invalid device_id in ep_device options";
-        return factory.ort_api.CreateStatus(ORT_INVALID_ARGUMENT, msg.c_str());
+        char* parse_end = nullptr;
+        errno = 0;
+        long device_id_long = strtol(device_id_str, &parse_end, 10);
+        if (parse_end != device_id_str && *parse_end == '\0' && errno != ERANGE &&
+            device_id_long >= static_cast<long>(INT32_MIN) && device_id_long <= static_cast<long>(INT32_MAX))
+        {
+            *out_device_id = static_cast<int32_t>(device_id_long);
+            return nullptr;
+        }
     }
-    *out_device_id = static_cast<int32_t>(device_id_long);
-    return nullptr;
+
+    std::string msg = std::string("[NvTensorRTRTX EP] ") + caller +
+                      ": hardware device could not be resolved to a supported CUDA device";
+    return factory.ort_api.CreateStatus(ORT_FAIL, msg.c_str());
 }
 
 CUcontext TensorrtRtxExecutionProviderFactory::GetCigContext(int32_t device_id) const
@@ -2395,91 +2804,37 @@ extern "C"
         // Load external tensorrt_plugins library from EP directory
         // This library contains GroupQueryAttention and RotaryEmbedding plugins for transformer models
         static std::once_flag plugins_load_flag;
-        std::call_once(
-            plugins_load_flag,
-            [&]()
-            {
-                try
-                {
+        std::call_once(plugins_load_flag,
+                       [&]()
+                       {
+                           try
+                           {
+                               std::filesystem::path plugin_path;
 #if defined(_WIN32)
-                    // Get EP DLL path using GetModuleHandleExW (wide string version)
-                    HMODULE hModule = NULL;
-                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                           (LPCWSTR)&CreateEpFactories, &hModule))
-                    {
-                        wchar_t path[MAX_PATH];
-                        GetModuleFileNameW(hModule, path, MAX_PATH);
-                        std::filesystem::path ep_dir = std::filesystem::path(path).parent_path();
-                        auto plugin_path = ep_dir / L"tensorrt_plugins.dll";
-
-                        // Use LoadLibraryExW to use search path control flags
-                        HMODULE plugin_dll =
-                            LoadLibraryExW(plugin_path.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-                        if (plugin_dll)
-                        {
-                            // Pin the plugin DLL permanently — same rationale as dll_main.cc:
-                            // plugin static registrations must outlive any FreeLibrary call
-                            // from ORT teardown or the host. PIN makes subsequent FreeLibrary
-                            // calls no-ops at the OS level, so the local handle going out of
-                            // scope here is safe.
-                            HMODULE pinned = nullptr;
-                            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                                               reinterpret_cast<LPCWSTR>(plugin_dll), &pinned);
-                            // Log success
-                            std::string msg = "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins";
-                            ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO, msg.c_str(), ORT_FILE,
-                                                       __LINE__, __FUNCTION__);
-                        }
-                        else
-                        {
-                            // Log failure
-                            DWORD error_code = GetLastError();
-                            LPWSTR error_msg = nullptr;
-                            FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                                               FORMAT_MESSAGE_IGNORE_INSERTS,
-                                           nullptr, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                                           (LPWSTR)&error_msg, 0, nullptr);
-
-                            std::wstring wide_path = plugin_path.wstring();
-                            std::string path_str(wide_path.begin(), wide_path.end());
-                            std::string msg = "[NvTensorRTRTX EP] Failed to load tensorrt_plugins " + path_str +
-                                              " (Error " + std::to_string(error_code) + ")";
-                            if (error_msg)
-                            {
-                                std::wstring wide_err(error_msg);
-                                std::string err_str(wide_err.begin(), wide_err.end());
-                                msg += ": " + err_str;
-                                LocalFree(error_msg);
-                            }
-                            ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO, msg.c_str(), ORT_FILE,
-                                                       __LINE__, __FUNCTION__);
-                        }
-                    }
+                               const std::filesystem::path dependency_dir =
+                                   trt_rtx_ep::utils::FileSystemUtils::GetCurrentModuleDirectory(&CreateEpFactories);
+                               if (dependency_dir.empty())
+                               {
+                                   return;
+                               }
+                               plugin_path = dependency_dir / L"tensorrt_plugins.dll";
 #else
-                    // Linux: Use dladdr to get .so path
-                    Dl_info dl_info;
-                    if (dladdr((void*)CreateEpFactories, &dl_info))
-                    {
-                        std::filesystem::path ep_dir = std::filesystem::path(dl_info.dli_fname).parent_path();
-                        auto plugin_path = ep_dir / "libtensorrt_plugins.so";
 
-                        void* plugin_handle = dlopen(plugin_path.string().c_str(), RTLD_LAZY);
-                        if (plugin_handle)
-                        {
-                            // Log success
-                            std::string msg = "[NvTensorRTRTX EP] External plugins loaded: tensorrt_plugins";
-                            ort_api->Logger_LogMessage(default_logger, ORT_LOGGING_LEVEL_INFO, msg.c_str(), ORT_FILE,
-                                                       __LINE__, __FUNCTION__);
-                        }
-                    }
+                               Dl_info dl_info;
+                               if (!dladdr((void*)CreateEpFactories, &dl_info))
+                               {
+                                   return;
+                               }
+                               plugin_path =
+                                   std::filesystem::path(dl_info.dli_fname).parent_path() / "libtensorrt_plugins.so";
 #endif
-                }
-                catch (...)
-                {
-                    // Silently ignore - plugin loading is optional
-                }
-            });
+                               trt_rtx_ep::LoadExternalPlugins(*ort_api, default_logger, plugin_path);
+                           }
+                           catch (...)
+                           {
+                               // Silently ignore - plugin loading is optional
+                           }
+                       });
 
         // Create factory instance
         std::unique_ptr<OrtEpFactory> factory = std::make_unique<trt_rtx_ep::TensorrtRtxExecutionProviderFactory>(

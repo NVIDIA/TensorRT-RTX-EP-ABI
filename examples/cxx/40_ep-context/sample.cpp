@@ -16,7 +16,9 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "utils.h"
 #include <onnxruntime_run_options_config_keys.h>
@@ -102,7 +104,8 @@ int main(int argc, char* argv[])
         if (!trt_device)
         {
             std::cerr << "ERROR: TensorRT RTX EP device not found. "
-                      << "Ensure onnxruntime_providers_nv_tensorrt_rtx is next to the executable." << std::endl;
+                      << "Ensure onnxruntime_providers_nv_tensorrt_rtx is in the ep directory next to the executable."
+                      << std::endl;
             return 1;
         }
 
@@ -148,6 +151,31 @@ int main(int argc, char* argv[])
             std::cout << "> Model compiled successfully!" << std::endl;
             std::cout << "> Compile time: " << compile_time << " sec" << std::endl;
             std::cout << "> Compiled model saved at " << output_model_path << std::endl;
+        }
+
+        // Validate that the freshly generated context is compatible with the selected device.
+        // Compatibility info is stored in the compiled model and can be checked before loading it.
+        {
+            const auto output_model_path_ort = toOrtFileString(output_model_path);
+            const std::vector<Ort::ConstEpDevice> devices{trt_device};
+            auto compatibility_info = Ort::GetCompatibilityInfoFromModelAllocated(
+                output_model_path_ort.c_str(), trt_device.EpName(), Ort::AllocatorWithDefaultOptions());
+            const auto compatibility = Ort::GetModelCompatibilityForEpDevices(devices, compatibility_info.get());
+            if (compatibility != OrtCompiledModelCompatibility_EP_SUPPORTED_OPTIMAL)
+            {
+                throw std::runtime_error("Freshly compiled EP Context model is not optimally compatible with the selected TensorRT RTX device.");
+            }
+
+            // A malformed compatibility string must be rejected instead of being treated as usable.
+            const auto invalid_compatibility = Ort::GetModelCompatibilityForEpDevices(
+                devices, "not-a-valid-tensorrt-rtx-engine-header");
+            if (invalid_compatibility != OrtCompiledModelCompatibility_EP_UNSUPPORTED)
+            {
+                throw std::runtime_error("Malformed TensorRT RTX compatibility information was not rejected.");
+            }
+
+            std::cout << "> Freshly compiled context compatibility: optimal" << std::endl;
+            std::cout << "> Malformed compatibility information: unsupported" << std::endl;
         }
 
         // Load compiled model

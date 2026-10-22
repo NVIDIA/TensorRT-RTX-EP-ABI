@@ -19,13 +19,21 @@
 #include <cstdint>
 #include <vector>
 
+#include "tensorrt_rtx_provider_options.h"
+
 namespace trt_rtx_ep
 {
 
 inline constexpr uint32_t kNvidiaPciVendorId = 0x10DE;
 // ORT's Linux PCI discovery reports WSL2 / Hyper-V display adapters with this vendor.
 inline constexpr uint32_t kMicrosoftVirtualPciVendorId = 0x1414;
-inline constexpr int kMinimumComputeCapabilityMajor = 8;
+
+// Selection must use the same architecture gate the EP applies at device init, or it would
+// publish a device the EP then refuses to run on. Keep this the single source of truth.
+inline bool IsSupportedComputeCapability(int major, int minor)
+{
+    return onnxruntime::tensorrt_rtx::IsComputeCapabilitySupported(major, minor);
+}
 
 // Windows matches NVIDIA GPUs by LUID, so a Microsoft virtual vendor is not a candidate there.
 // Linux WSL2 reports the NVIDIA GPU as vendor 0x1414 with a PCI id CUDA will not resolve.
@@ -74,10 +82,11 @@ struct SelectedEpDevice
 // Assigns each supported CUDA device to at most one ORT hardware device.
 //
 // Mapped devices claim their resolved CUDA index first. Unmapped Microsoft virtual adapters then
-// take the lowest-index remaining CUDA device with compute capability >= 8, in hardware-list order.
-// Extra virtual adapters are left unselected. WSL2 can expose several identical 0x1414 adapters
-// (the NVIDIA GPU and an iGPU) for a single CUDA device, and those adapters do not share a PCI id
-// with the CUDA driver, so they cannot be matched individually.
+// take the lowest-index remaining CUDA device whose compute capability the EP supports (the same
+// IsComputeCapabilitySupported gate device init applies), in hardware-list order. Extra virtual
+// adapters are left unselected. WSL2 can expose several identical 0x1414 adapters (the NVIDIA GPU
+// and an iGPU) for a single CUDA device, and those adapters do not share a PCI id with the CUDA
+// driver, so they cannot be matched individually.
 //
 // Results are returned in hardware-list order. `cuda_index` is the runtime CUDA index.
 inline std::vector<SelectedEpDevice> SelectSupportedEpDevices(const std::vector<HardwareDeviceMatch>& hardware,
@@ -103,7 +112,8 @@ inline std::vector<SelectedEpDevice> SelectSupportedEpDevices(const std::vector<
         int chosen_index = 0;
         for (size_t i = 0; i < cuda_devices.size(); ++i)
         {
-            if (claimed[i] || cuda_devices[i].compute_capability_major < kMinimumComputeCapabilityMajor)
+            if (claimed[i] || !IsSupportedComputeCapability(cuda_devices[i].compute_capability_major,
+                                                           cuda_devices[i].compute_capability_minor))
             {
                 continue;
             }
@@ -124,7 +134,7 @@ inline std::vector<SelectedEpDevice> SelectSupportedEpDevices(const std::vector<
     {
         if (device.kind == HardwareMatchKind::kMappedToCudaDevice)
         {
-            if (device.compute_capability_major < kMinimumComputeCapabilityMajor)
+            if (!IsSupportedComputeCapability(device.compute_capability_major, device.compute_capability_minor))
             {
                 continue;
             }
@@ -133,7 +143,8 @@ inline std::vector<SelectedEpDevice> SelectSupportedEpDevices(const std::vector<
             {
                 continue;
             }
-            if (cuda_devices[static_cast<size_t>(position)].compute_capability_major < kMinimumComputeCapabilityMajor)
+            if (!IsSupportedComputeCapability(cuda_devices[static_cast<size_t>(position)].compute_capability_major,
+                                              cuda_devices[static_cast<size_t>(position)].compute_capability_minor))
             {
                 continue;
             }

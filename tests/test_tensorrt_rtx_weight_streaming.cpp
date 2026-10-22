@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tensorrt_rtx_provider_options.h"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -29,6 +35,8 @@ extern std::unique_ptr<Ort::Env> ort_env;
 namespace
 {
 
+using onnxruntime::tensorrt_rtx::provider_option_names::kWeightStreamingBudget;
+
 constexpr size_t kMB = 1024ull * 1024;
 constexpr float kDefaultAbsTolerance = 1e-4f;
 constexpr float kDefaultRelTolerance = 1e-4f;
@@ -49,6 +57,50 @@ struct WeightStreamingBudgetLog
     int64_t actual;
     int64_t streamable_size;
     int64_t scratch_size;
+};
+
+struct CudaStreamBlocker
+{
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool released = false;
+};
+
+void CUDART_CB BlockCudaStream(void* user_data)
+{
+    auto& blocker = *static_cast<CudaStreamBlocker*>(user_data);
+    std::unique_lock<std::mutex> lock(blocker.mutex);
+    blocker.entered = true;
+    blocker.condition.notify_all();
+    blocker.condition.wait(lock,
+                           [&]()
+                           {
+                               return blocker.released;
+                           });
+}
+
+void ReleaseCudaStreamBlocker(CudaStreamBlocker& blocker)
+{
+    {
+        std::lock_guard<std::mutex> lock(blocker.mutex);
+        blocker.released = true;
+    }
+    blocker.condition.notify_all();
+}
+
+struct CudaStreamGuard
+{
+    cudaStream_t stream = nullptr;
+
+    ~CudaStreamGuard()
+    {
+        if (stream != nullptr)
+        {
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+        }
+    }
 };
 
 void ORT_API_CALL CaptureWeightStreamingLog(void* param, OrtLoggingLevel /*severity*/, const char* /*category*/,
@@ -74,6 +126,12 @@ std::vector<std::string> CopyCapturedMessages(const LogCapture& log_capture)
 {
     std::lock_guard<std::mutex> lock(log_capture.mutex);
     return log_capture.messages;
+}
+
+void ClearCapturedMessages(LogCapture& log_capture)
+{
+    std::lock_guard<std::mutex> lock(log_capture.mutex);
+    log_capture.messages.clear();
 }
 
 std::optional<WeightStreamingBudgetLog> TryParseWeightStreamingBudgetLog(const std::string& message)
@@ -166,6 +224,15 @@ void ExpectStreamingDisabledByBudget(const LogCapture& log_capture, int64_t requ
     }
 }
 
+void ExpectStreamingDisabledByRunOption(const LogCapture& log_capture)
+{
+    for (const auto& log : ExpectBudgetLogs(log_capture, "0"))
+    {
+        EXPECT_EQ(log.resolved, log.streamable_size);
+        EXPECT_EQ(log.actual, log.streamable_size);
+    }
+}
+
 void ExpectPercentBudgetApplied(const LogCapture& log_capture, const std::string& requested_budget, double percent)
 {
     for (const auto& log : ExpectBudgetLogs(log_capture, requested_budget))
@@ -252,6 +319,13 @@ std::unique_ptr<Ort::Session> CreateSession(const std::filesystem::path& model_p
         AttachLogCapture(session_options, *log_capture);
     }
     return std::make_unique<Ort::Session>(*ort_env, toOrtString(model_path).c_str(), session_options);
+}
+
+void SetWeightStreamingBudget(Ort::Session& session, const char* budget)
+{
+    const char* keys[] = {kWeightStreamingBudget};
+    const char* values[] = {budget};
+    session.SetEpDynamicOptions(keys, values, 1);
 }
 
 void RunOnce(Ort::Session& session)
@@ -352,7 +426,7 @@ void BuildStreamingEpContext(const std::filesystem::path& source_model, const st
     }
     const auto ep_context_path = ep_context_model.string();
     session_options.AddConfigEntry(kOrtSessionOptionEpContextFilePath, ep_context_path.c_str());
-    ep_options["nv_weight_streaming_budget"] = budget;
+    ep_options[kWeightStreamingBudget] = budget;
     AppendTrtRtxEp(session_options, ep_options);
     if (log_capture != nullptr)
     {
@@ -380,7 +454,7 @@ TEST(WeightStreamingTest, RejectsBudgetBelowMinusOne)
     const std::string model_name = "nv_weight_streaming_invalid_budget.onnx";
     model_builder::CreateBaseModel(model_name, "weight_streaming_invalid_budget", {1, 3, 2});
 
-    ExpectProviderOptionsRejectedWith(model_name, {{"nv_weight_streaming_budget", "-2"}},
+    ExpectProviderOptionsRejectedWith(model_name, {{kWeightStreamingBudget, "-2"}},
                                       "Invalid nv_weight_streaming_budget: -2");
 }
 
@@ -389,7 +463,7 @@ TEST(WeightStreamingTest, RejectsInvalidBudgetUnitSuffix)
     const std::string model_name = "nv_weight_streaming_invalid_unit_budget.onnx";
     model_builder::CreateBaseModel(model_name, "weight_streaming_invalid_unit_budget", {1, 3, 2});
 
-    ExpectProviderOptionsRejectedWith(model_name, {{"nv_weight_streaming_budget", "1KB"}},
+    ExpectProviderOptionsRejectedWith(model_name, {{kWeightStreamingBudget, "1KB"}},
                                       "Valid base-2 unit suffixes include: B, K, M, G");
 }
 
@@ -398,7 +472,7 @@ TEST(WeightStreamingTest, RejectsBudgetPercentOutsideRange)
     const std::string model_name = "nv_weight_streaming_invalid_percent_budget.onnx";
     model_builder::CreateBaseModel(model_name, "weight_streaming_invalid_percent_budget", {1, 3, 2});
 
-    ExpectProviderOptionsRejectedWith(model_name, {{"nv_weight_streaming_budget", "101%"}},
+    ExpectProviderOptionsRejectedWith(model_name, {{kWeightStreamingBudget, "101%"}},
                                       "weight streaming percentage must be between 0 and 100");
 }
 
@@ -407,7 +481,7 @@ TEST(WeightStreamingTest, AutomaticBudgetRunsModel)
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
     LogCapture log_capture;
-    auto session = CreateSession(kModelPath, {{"nv_weight_streaming_budget", "-1"}}, &log_capture);
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, "-1"}}, &log_capture);
     RunOnce(*session);
     ExpectAutomaticBudgetApplied(log_capture);
 }
@@ -417,7 +491,7 @@ TEST(WeightStreamingTest, ExplicitByteBudgetRunsModel)
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
     LogCapture log_capture;
-    auto session = CreateSession(kModelPath, {{"nv_weight_streaming_budget", std::to_string(kMB)}}, &log_capture);
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, std::to_string(kMB)}}, &log_capture);
     RunOnce(*session);
     ExpectExplicitBudgetApplied(log_capture, std::to_string(kMB), kMB);
 }
@@ -427,7 +501,7 @@ TEST(WeightStreamingTest, ExplicitByteBudgetWithUnitSuffixRunsModel)
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
     LogCapture log_capture;
-    auto session = CreateSession(kModelPath, {{"nv_weight_streaming_budget", "1B"}}, &log_capture);
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, "1B"}}, &log_capture);
     RunOnce(*session);
     ExpectExplicitBudgetApplied(log_capture, "1B", 1);
 }
@@ -437,7 +511,7 @@ TEST(WeightStreamingTest, MebibyteBudgetWithUnitSuffixRunsModel)
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
     LogCapture log_capture;
-    auto session = CreateSession(kModelPath, {{"nv_weight_streaming_budget", "1M"}}, &log_capture);
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, "1M"}}, &log_capture);
     RunOnce(*session);
     ExpectExplicitBudgetApplied(log_capture, "1M", kMB);
 }
@@ -447,7 +521,7 @@ TEST(WeightStreamingTest, PercentBudgetRunsModel)
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
 
     LogCapture log_capture;
-    auto session = CreateSession(kModelPath, {{"nv_weight_streaming_budget", "50%"}}, &log_capture);
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, "50%"}}, &log_capture);
     RunOnce(*session);
     ExpectPercentBudgetApplied(log_capture, "50%", 50.0);
 }
@@ -459,7 +533,7 @@ TEST(WeightStreamingTest, BudgetAboveStreamableDisablesStreaming)
     LogCapture log_capture;
     constexpr int64_t kOversizedBudget = 1099511627776;
     auto session =
-        CreateSession(kModelPath, {{"nv_weight_streaming_budget", std::to_string(kOversizedBudget)}}, &log_capture);
+        CreateSession(kModelPath, {{kWeightStreamingBudget, std::to_string(kOversizedBudget)}}, &log_capture);
     RunOnce(*session);
     ExpectStreamingDisabledByBudget(log_capture, kOversizedBudget);
 }
@@ -481,8 +555,24 @@ TEST(WeightStreamingTest, EpContextNonStreamingEngineRejectsBudget)
         RunOnce(session);
     }
 
+    {
+        auto session = CreateSession(model_name_ctx);
+        try
+        {
+            SetWeightStreamingBudget(*session, "-1");
+            FAIL() << "Expected a dynamic weight-streaming budget to fail for a non-streamable engine.";
+        }
+        catch (const std::exception& ex)
+        {
+            EXPECT_NE(std::string(ex.what()).find("engine is not weight-streaming-capable"), std::string::npos)
+                << ex.what();
+        }
+
+        RunOnce(*session);
+    }
+
     Ort::SessionOptions session_options;
-    AppendTrtRtxEp(session_options, {{"nv_weight_streaming_budget", "-1"}});
+    AppendTrtRtxEp(session_options, {{kWeightStreamingBudget, "-1"}});
 
     ExpectSessionCreationFailsWith(model_name_ctx, session_options, "Failed to set nv_weight_streaming_budget=-1");
 }
@@ -496,7 +586,7 @@ TEST(WeightStreamingTest, EpContextStreamingEngineRoundTripsWithBudget)
     BuildStreamingEpContext(kModelPath, model_name_ctx, "-1");
 
     LogCapture log_capture;
-    auto session = CreateSession(model_name_ctx, {{"nv_weight_streaming_budget", "-1"}}, &log_capture);
+    auto session = CreateSession(model_name_ctx, {{kWeightStreamingBudget, "-1"}}, &log_capture);
     RunOnce(*session);
     ExpectAutomaticBudgetApplied(log_capture);
 }
@@ -510,7 +600,7 @@ TEST(WeightStreamingTest, EmbeddedEpContextStreamingEngineRunsWithBudget)
     BuildStreamingEpContext(kModelPath, model_name_ctx, "-1", true);
 
     LogCapture log_capture;
-    auto session = CreateSession(model_name_ctx, {{"nv_weight_streaming_budget", "-1"}}, &log_capture);
+    auto session = CreateSession(model_name_ctx, {{kWeightStreamingBudget, "-1"}}, &log_capture);
     RunOnce(*session);
     ExpectAutomaticBudgetApplied(log_capture);
 }
@@ -529,6 +619,130 @@ TEST(WeightStreamingTest, EpContextStreamingCapableEngineRunsWithoutBudget)
     ExpectNoBudgetLogs(log_capture);
 }
 
+TEST(WeightStreamingTest, DynamicOptionChangesBudgetAndPersistsUntilUpdated)
+{
+    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
+
+    LogCapture log_capture;
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, "-1"}}, &log_capture);
+    ClearCapturedMessages(log_capture);
+    const auto baseline_outputs = RunAndCollectFloatOutputs(*session);
+    ExpectNoBudgetLogs(log_capture);
+
+    SetWeightStreamingBudget(*session, "1");
+    const auto minimum_vram_outputs = RunAndCollectFloatOutputs(*session);
+    ExpectMinimumVramBudgetApplied(log_capture);
+
+    ClearCapturedMessages(log_capture);
+    RunOnce(*session);
+    ExpectNoBudgetLogs(log_capture);
+
+    ClearCapturedMessages(log_capture);
+    SetWeightStreamingBudget(*session, "50%");
+    const auto percent_outputs = RunAndCollectFloatOutputs(*session);
+    ExpectPercentBudgetApplied(log_capture, "50%", 50.0);
+
+    ClearCapturedMessages(log_capture);
+    SetWeightStreamingBudget(*session, "0");
+    const auto disabled_outputs = RunAndCollectFloatOutputs(*session);
+    ExpectStreamingDisabledByRunOption(log_capture);
+
+    ClearCapturedMessages(log_capture);
+    SetWeightStreamingBudget(*session, "-1");
+    const auto restored_outputs = RunAndCollectFloatOutputs(*session);
+    ExpectAutomaticBudgetApplied(log_capture);
+
+    ClearCapturedMessages(log_capture);
+    RunOnce(*session);
+    ExpectNoBudgetLogs(log_capture);
+
+    ExpectCloseOutputs(baseline_outputs, minimum_vram_outputs, "automatic vs minimum-VRAM runtime budget",
+                       kIndependentSessionAbsTolerance, kIndependentSessionRelTolerance);
+    ExpectCloseOutputs(baseline_outputs, percent_outputs, "automatic vs percent runtime budget",
+                       kIndependentSessionAbsTolerance, kIndependentSessionRelTolerance);
+    ExpectCloseOutputs(baseline_outputs, disabled_outputs, "automatic vs disabled runtime streaming",
+                       kIndependentSessionAbsTolerance, kIndependentSessionRelTolerance);
+    ExpectCloseOutputs(baseline_outputs, restored_outputs, "automatic session budget restoration",
+                       kIndependentSessionAbsTolerance, kIndependentSessionRelTolerance);
+}
+
+TEST(WeightStreamingTest, DynamicOptionRejectsInvalidBudgetWithoutChangingSession)
+{
+    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
+
+    auto session = CreateSession(kModelPath, {{kWeightStreamingBudget, "-1"}});
+    const auto baseline_outputs = RunAndCollectFloatOutputs(*session);
+
+    try
+    {
+        SetWeightStreamingBudget(*session, "101%");
+        FAIL() << "Expected the invalid dynamic weight-streaming budget to fail.";
+    }
+    catch (const std::exception& ex)
+    {
+        EXPECT_NE(std::string(ex.what()).find("weight streaming percentage must be between 0 and 100"),
+                  std::string::npos)
+            << ex.what();
+    }
+
+    const auto outputs_after_failure = RunAndCollectFloatOutputs(*session);
+    ExpectCloseOutputs(baseline_outputs, outputs_after_failure, "session after invalid runtime budget",
+                       kIndependentSessionAbsTolerance, kIndependentSessionRelTolerance);
+}
+
+TEST(WeightStreamingTest, DynamicOptionWaitsForExternalComputeStream)
+{
+    using namespace std::chrono_literals;
+
+    ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
+
+    CudaStreamBlocker blocker;
+    CudaStreamGuard stream_guard;
+    ASSERT_EQ(cudaStreamCreate(&stream_guard.stream), cudaSuccess);
+    const cudaStream_t stream = stream_guard.stream;
+
+    auto session =
+        CreateSession(kModelPath, {{kWeightStreamingBudget, "-1"},
+                                   {"has_user_compute_stream", "1"},
+                                   {"user_compute_stream", std::to_string(reinterpret_cast<size_t>(stream))}});
+    RunOnce(*session);
+
+    ASSERT_EQ(cudaLaunchHostFunc(stream, BlockCudaStream, &blocker), cudaSuccess);
+    bool callback_entered = false;
+    {
+        std::unique_lock<std::mutex> lock(blocker.mutex);
+        callback_entered = blocker.condition.wait_for(lock, 30s,
+                                                      [&]()
+                                                      {
+                                                          return blocker.entered;
+                                                      });
+    }
+    if (!callback_entered)
+    {
+        ReleaseCudaStreamBlocker(blocker);
+        FAIL() << "Timed out waiting for the external CUDA stream blocker.";
+    }
+
+    auto update = std::async(std::launch::async,
+                             [&]()
+                             {
+                                 SetWeightStreamingBudget(*session, "1");
+                             });
+    const auto blocked_status = update.wait_for(250ms);
+
+    ReleaseCudaStreamBlocker(blocker);
+    EXPECT_EQ(blocked_status, std::future_status::timeout)
+        << "The dynamic update completed while work was still pending on the external compute stream.";
+    ASSERT_EQ(update.wait_for(30s), std::future_status::ready);
+    EXPECT_NO_THROW(update.get());
+
+    RunOnce(*session);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    session.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    stream_guard.stream = nullptr;
+}
+
 TEST(WeightStreamingTest, RuntimeCacheComposesWithWeightStreaming)
 {
     ASSERT_TRUE(std::filesystem::is_regular_file(kModelPath)) << "Model not found at: " << kModelPath;
@@ -539,7 +753,7 @@ TEST(WeightStreamingTest, RuntimeCacheComposesWithWeightStreaming)
     {
         LogCapture log_capture;
         auto session = CreateSession(
-            kModelPath, {{"nv_weight_streaming_budget", "-1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
+            kModelPath, {{kWeightStreamingBudget, "-1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
             &log_capture);
         RunOnce(*session);
         ExpectAutomaticBudgetApplied(log_capture);
@@ -551,7 +765,7 @@ TEST(WeightStreamingTest, RuntimeCacheComposesWithWeightStreaming)
     {
         LogCapture log_capture;
         auto session = CreateSession(
-            kModelPath, {{"nv_weight_streaming_budget", "-1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
+            kModelPath, {{kWeightStreamingBudget, "-1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
             &log_capture);
         RunOnce(*session);
         ExpectAutomaticBudgetApplied(log_capture);
@@ -571,7 +785,7 @@ TEST(WeightStreamingTest, RuntimeCacheAllowsBudgetChangeAcrossSessions)
     {
         LogCapture log_capture;
         auto session = CreateSession(
-            kModelPath, {{"nv_weight_streaming_budget", "-1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
+            kModelPath, {{kWeightStreamingBudget, "-1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
             &log_capture);
         automatic_budget_outputs = RunAndCollectFloatOutputs(*session);
         ExpectAutomaticBudgetApplied(log_capture);
@@ -584,7 +798,7 @@ TEST(WeightStreamingTest, RuntimeCacheAllowsBudgetChangeAcrossSessions)
     {
         LogCapture log_capture;
         auto session = CreateSession(
-            kModelPath, {{"nv_weight_streaming_budget", "1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
+            kModelPath, {{kWeightStreamingBudget, "1"}, {"nv_runtime_cache_path", runtime_cache_dir.string()}},
             &log_capture);
         minimum_vram_outputs = RunAndCollectFloatOutputs(*session);
         ExpectMinimumVramBudgetApplied(log_capture);

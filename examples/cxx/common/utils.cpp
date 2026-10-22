@@ -165,10 +165,16 @@ void saveOutputImage(float* pData, const char* imageFileName)
 
 void register_execution_providers(Ort::Env& env)
 {
-    const auto providers_library = get_executable_parent_path() / DLL_NAME("onnxruntime_providers_nv_tensorrt_rtx");
-    if (!std::filesystem::is_regular_file(providers_library))
+    const std::filesystem::path provider_file_name = DLL_NAME("onnxruntime_providers_nv_tensorrt_rtx");
+    const auto executable_directory = get_executable_parent_path();
+
+    // Examples load only the provider deployed beside their executable. This
+    // avoids a working-directory-dependent provider selection.
+    const std::filesystem::path providers_library = executable_directory / provider_file_name;
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(providers_library, error))
     {
-        LOG("{} does not exist! Skipping execution provider", providers_library.string());
+        LOG("{} does not exist beside the executable! Skipping execution provider", provider_file_name.string());
         return;
     }
 

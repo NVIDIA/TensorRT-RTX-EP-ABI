@@ -40,11 +40,14 @@ def _make_session_options(
     registered_ep: RegisteredEp,
     provider_options=None,
     profiling_prefix: str | Path | None = None,
+    allow_cpu_fallback: bool = False,
 ):
     ort = registered_ep.ort
     ort.set_default_logger_severity(0)
     so = ort.SessionOptions()
     so.log_verbosity_level = 0
+    if not allow_cpu_fallback:
+        so.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
 
     if profiling_prefix is not None:
         so.enable_profiling = True
@@ -103,6 +106,7 @@ def _run_runtime(registered_ep: RegisteredEp, model_path: Path, profile_prefix: 
         model_path,
         provider_options=EXCLUDE_FAST_GELU,
         profiling_prefix=profile_prefix,
+        allow_cpu_fallback=True,
     )
 
     if qdq:
@@ -123,7 +127,11 @@ def _run_compile(registered_ep: RegisteredEp, model_path: Path, compiled_path: P
     if not hasattr(registered_ep.ort, "ModelCompiler"):
         raise RuntimeError("onnxruntime build does not expose ModelCompiler")
 
-    so = _make_session_options(registered_ep, provider_options=EXCLUDE_FAST_GELU)
+    so = _make_session_options(
+        registered_ep,
+        provider_options=EXCLUDE_FAST_GELU,
+        allow_cpu_fallback=True,
+    )
     compiler = registered_ep.ort.ModelCompiler(
         so,
         str(model_path),
@@ -144,7 +152,12 @@ def _run_foreign_source(registered_ep: RegisteredEp, model_path: Path):
     try:
         _create_session(registered_ep, model_path)
     except Exception as exc:
-        if "EPContext" not in str(exc):
+        message = str(exc)
+        unclaimed_markers = (
+            "is not compatible with any execution provider",
+            "Provider type for EPContext node",
+        )
+        if not any(marker in message for marker in unclaimed_markers):
             raise
         return
 
@@ -153,19 +166,18 @@ def _run_foreign_source(registered_ep: RegisteredEp, model_path: Path):
 
 def _run_no_source(registered_ep: RegisteredEp, model_path: Path):
     # A legacy EPContext node without a "source" attribute should still be
-    # claimed by the EP. Three pass conditions:
-    #   - session creation succeeds (full backward compat),
-    #   - session fails with an ORT-level error that doesn't say the node went
-    #     unclaimed (e.g., the dummy context blob fails to deserialize — that
-    #     proves the EP DID claim the node and tried to process it).
-    # Re-raise only on (a) the specific "node unclaimed" marker, or
-    # (b) non-ORT exceptions that would otherwise mask real bugs.
+    # claimed by the EP. Session creation may succeed for full backward
+    # compatibility. A failure is accepted only when it is the expected dummy
+    # context deserialization failure, which proves the NV EP claimed the node.
     try:
         _create_session(registered_ep, model_path)
     except Exception as exc:
-        if not type(exc).__module__.startswith("onnxruntime"):
-            raise
-        if "is not compatible with any execution provider" in str(exc):
+        message = str(exc)
+        expected_error = "TensorRT EP could not deserialize engine from binary data"
+        if (
+            not type(exc).__module__.startswith("onnxruntime")
+            or expected_error not in message
+        ):
             raise
 
 

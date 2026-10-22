@@ -131,20 +131,24 @@ static LONG WINAPI flake_av_capture(EXCEPTION_POINTERS* ep)
 
 // Resolve the EP library path.
 //
-// On Windows the EP DLL delay-loads TRT RTX DLLs at session-creation time.
-// Windows resolves delay-loaded dependencies relative to the loading DLL, so
-// we must load the EP from the test executable's directory (where all sibling
-// DLLs were copied) rather than from the original build output path.
-// EP_LIB_PATH (the build-output absolute path) is used only as a fallback.
+// EP_LIB_PATH is the generated provider target path. Its delay-loaded
+// TensorRT/CUDA runtime dependencies live beside it in bin/<configuration>.
 static std::filesystem::path resolve_ep_lib(const char* argv0)
 {
-    const std::filesystem::path build_path = EP_LIB_PATH;
-    const auto local_path = std::filesystem::absolute(argv0).parent_path() / build_path.filename();
-    if (std::filesystem::is_regular_file(local_path))
+    (void)argv0;
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    constexpr const wchar_t* kEpFileName = L"onnxruntime_providers_nv_tensorrt_rtx.dll";
+#else
+    constexpr const char* kEpFileName = "libonnxruntime_providers_nv_tensorrt_rtx.so";
+#endif
+    std::error_code error;
+    const fs::path local_path = fs::current_path(error) / kEpFileName;
+    if (!error && fs::is_regular_file(local_path, error))
     {
         return local_path;
     }
-    return build_path;
+    return EP_LIB_PATH;
 }
 
 static void register_ep(Ort::Env& env, const char* argv0)

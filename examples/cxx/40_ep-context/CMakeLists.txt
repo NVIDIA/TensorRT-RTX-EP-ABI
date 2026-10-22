@@ -19,52 +19,15 @@ project(ep-context-samples)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
 include(onnxruntimesetup)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
-add_executable(sample sample.cpp)
-target_link_libraries(sample PRIVATE onnxruntime_interface example_utils)
-
-add_executable(sample_buffer sample_buffer.cpp)
-target_link_libraries(sample_buffer PRIVATE onnxruntime_interface example_utils)
-
-add_executable(sample_weightless sample_weightless.cpp)
-target_link_libraries(sample_weightless PRIVATE onnxruntime_interface example_utils)
-
-add_executable(sample_weightless_buffer sample_weightless_buffer.cpp)
-target_link_libraries(sample_weightless_buffer PRIVATE onnxruntime_interface example_utils)
-
-set(ONNX "candy.onnx")
-set(CANDY_ONNX_PATH "${CMAKE_CURRENT_BINARY_DIR}/../candy.onnx")
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${ONNX}")
-    copy_file_to_bin_dir("${CMAKE_CURRENT_SOURCE_DIR}/${ONNX}")
-elseif(EXISTS "${CANDY_ONNX_PATH}")
-    copy_file_to_bin_dir("${CANDY_ONNX_PATH}")
-else()
-    message(STATUS "candy.onnx not found -- sample 40 will need a model at runtime")
-endif()
-
-set_target_properties(sample sample_buffer sample_weightless sample_weightless_buffer
-    PROPERTIES
-    ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-    LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-    RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-)
-
-copy_ep_dll_post_build(sample)
-copy_ep_dll_post_build(sample_buffer)
-copy_ep_dll_post_build(sample_weightless)
-copy_ep_dll_post_build(sample_weightless_buffer)
+add_cxx_example(sample
+    SOURCES sample.cpp
+    TEST_NAME examples/40_ep-context/sample)
+add_cxx_example(sample_buffer SOURCES sample_buffer.cpp)
+add_cxx_example(sample_weightless
+    SOURCES sample_weightless.cpp
+    NO_EP_RUNTIME_DEPENDENCY)
+add_cxx_example(sample_weightless_buffer
+    SOURCES sample_weightless_buffer.cpp
+    NO_EP_RUNTIME_DEPENDENCY)
 
 # sample: no required args, defaults to candy.onnx -> candy_compiled.onnx in the exe dir.
-add_test(
-    NAME    examples/40_ep-context/sample
-    COMMAND $<TARGET_FILE:sample>
-    WORKING_DIRECTORY $<TARGET_FILE_DIR:sample>
-)
-set_tests_properties(examples/40_ep-context/sample PROPERTIES
-    LABELS  "examples"
-    TIMEOUT 300
-)

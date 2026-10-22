@@ -20,51 +20,7 @@ find_package(CUDAToolkit REQUIRED QUIET)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
 include(onnxruntimesetup)
 
-add_executable(syncstreams_cuda
-    main.cpp
-)
-
-set_target_properties(syncstreams_cuda PROPERTIES
-    CXX_STANDARD 20
-    CXX_EXTENSIONS OFF
-)
-target_link_libraries(syncstreams_cuda PRIVATE
-    onnxruntime_interface
-        example_utils
-    CUDA::cudart_static
-)
-
-set(ONNX "candy.onnx")
-set(CANDY_ONNX_PATH "${CMAKE_CURRENT_BINARY_DIR}/../candy.onnx")
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${ONNX}")
-    copy_file_to_bin_dir("${CMAKE_CURRENT_SOURCE_DIR}/${ONNX}")
-elseif(EXISTS "${CANDY_ONNX_PATH}")
-    copy_file_to_bin_dir("${CANDY_ONNX_PATH}")
-else()
-    message(STATUS "candy.onnx not found -- sample 30 will need the model at runtime")
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Input.png")
-    copy_file_to_bin_dir("${CMAKE_CURRENT_SOURCE_DIR}/Input.png")
-elseif(EXISTS "${ASSETS_DIR}/Input.png")
-    copy_file_to_bin_dir("${ASSETS_DIR}/Input.png")
-endif()
-
-set_target_properties(syncstreams_cuda
-    PROPERTIES
-    ARCHIVE_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-    LIBRARY_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-    RUNTIME_OUTPUT_DIRECTORY "${RUNTIME_DIRECTORY}"
-)
-
-copy_ep_dll_post_build(syncstreams_cuda)
-
-add_test(
-    NAME    examples/30_syncstreams-cuda
-    COMMAND $<TARGET_FILE:syncstreams_cuda>
-    WORKING_DIRECTORY $<TARGET_FILE_DIR:syncstreams_cuda>
-)
-set_tests_properties(examples/30_syncstreams-cuda PROPERTIES
-    LABELS  "examples"
-    TIMEOUT 300
-)
+add_cxx_example(syncstreams_cuda
+    SOURCES main.cpp
+    LIBRARIES CUDA::cudart_static
+    TEST_NAME examples/30_syncstreams-cuda)

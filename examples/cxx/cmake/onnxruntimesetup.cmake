@@ -61,9 +61,6 @@ else()
   find_library(ONNXRUNTIME_LIB onnxruntime HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib REQUIRED)
   find_library(ONNXRUNTIME_PROVIDERS_SHARED_LIB onnxruntime_providers_shared HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib REQUIRED)
 
-  # EP libraries (loaded at runtime via RegisterExecutionProviderLibrary, not linked)
-  find_library(ONNXRUNTIME_TRT_EP_LIB onnxruntime_providers_nv_tensorrt_rtx HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib)
-  find_library(ONNXRUNTIME_CUDA_EP_LIB onnxruntime_providers_cuda HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib)
   # Detect TensorRT RTX version from NvInferVersion.h instead of hardcoding
   set(_trt_rtx_lib_names "")
   set(_trt_rtx_parser_lib_names "")
@@ -88,8 +85,6 @@ else()
   if(WIN32)
     find_file(ONNXRUNTIME_DLL onnxruntime.dll HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib REQUIRED)
     find_file(ONNXRUNTIME_PROVIDERS_SHARED_DLL onnxruntime_providers_shared.dll HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib REQUIRED)
-    find_file(ONNXRUNTIME_TRT_EP_DLL onnxruntime_providers_nv_tensorrt_rtx.dll HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib)
-    find_file(ONNXRUNTIME_CUDA_EP_DLL onnxruntime_providers_cuda.dll HINTS ${ONNX_RUNTIME_PATH} ${ONNX_RUNTIME_PATH}/lib)
 
     set(_trt_rtx_dll_names "")
     set(_trt_rtx_parser_dll_names "")
@@ -127,78 +122,120 @@ else()
 
   message(STATUS "ONNX runtime include \"${ONNXRUNTIME_INCLUDE}\"")
   message(STATUS "ONNX runtime lib \"${ONNXRUNTIME_LIB}\"")
-  if(ONNXRUNTIME_TRT_EP_LIB)
-    message(STATUS "TRT RTX EP lib \"${ONNXRUNTIME_TRT_EP_LIB}\"")
-  else()
-    message(STATUS "TRT RTX EP lib not found (will be loaded at runtime)")
-  endif()
 endif()
 
-# =============================================================================
-# copy_ep_dll_post_build(<target>)
-#
-# When the samples are built from the root CMakeLists.txt the TensorRTRtxEp
-# target is available. Call this macro after defining each sample executable
-# to add a POST_BUILD step that copies the freshly-built EP DLL next to the
-# executable so the sample can load it via RegisterExecutionProviderLibrary.
-# The macro is a no-op when building the examples standalone.
-# =============================================================================
-macro(copy_ep_dll_post_build _target)
-    if(TARGET TensorRTRtxEp)
-        add_custom_command(TARGET ${_target} POST_BUILD
+if(NOT DEFINED TRT_RTX_BIN_DIR)
+    set(TRT_RTX_BIN_DIR "${CMAKE_BINARY_DIR}/bin")
+endif()
+if(NOT DEFINED TRT_RTX_EP_BIN_DIR)
+    set(TRT_RTX_EP_BIN_DIR "${TRT_RTX_BIN_DIR}")
+endif()
+if(NOT DEFINED TRT_RTX_ARCHIVE_DIR)
+    set(TRT_RTX_ARCHIVE_DIR "${CMAKE_BINARY_DIR}/lib")
+endif()
+
+set(RUNTIME_DIRECTORY "${TRT_RTX_BIN_DIR}")
+set(EP_RUNTIME_DIRECTORY "${TRT_RTX_EP_BIN_DIR}")
+
+function(copy_file_to_target_runtime_dir target file)
+    if(file AND EXISTS "${file}")
+        add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:TensorRTRtxEp>
-                $<TARGET_FILE_DIR:${_target}>
-            COMMENT "Copying TRT RTX EP to ${_target} output directory"
-        )
+                "${file}"
+                "$<TARGET_FILE_DIR:${target}>"
+            VERBATIM)
     endif()
-endmacro()
+endfunction()
 
-set(RUNTIME_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+function(add_ep_runtime_dependency target)
+    if(TARGET TensorRTRtxEp)
+        add_dependencies(${target} TensorRTRtxEp)
+    elseif(TARGET trt_rtx_example_ep_runtime_dependencies)
+        add_dependencies(${target} trt_rtx_example_ep_runtime_dependencies)
+    endif()
+endfunction()
 
-macro (copy_file_to_bin_dir file)
-    get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-    if(${is_multi_config})
-      foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
-          set(OUTPUT_DIR ${RUNTIME_DIRECTORY}/${config})
-          execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${OUTPUT_DIR}")
-          file(COPY ${file} DESTINATION ${OUTPUT_DIR} FOLLOW_SYMLINK_CHAIN)
-      endforeach()
-  else()
-      file(COPY ${file} DESTINATION ${RUNTIME_DIRECTORY} FOLLOW_SYMLINK_CHAIN)
-  endif()
-endmacro()
+if(NOT CUDAToolkit_FOUND)
+    find_package(CUDAToolkit QUIET)
+endif()
+if(CUDAToolkit_FOUND)
+    get_target_property(_cudart_loc CUDA::cudart IMPORTED_LOCATION_RELEASE)
+    if(NOT _cudart_loc)
+        get_target_property(_cudart_loc CUDA::cudart IMPORTED_LOCATION)
+    endif()
+    if(WIN32 AND _cudart_loc)
+        get_filename_component(_cudart_dir "${_cudart_loc}" DIRECTORY)
+        get_filename_component(_cudart_name "${_cudart_loc}" NAME_WE)
+        find_file(CUDART_DLL
+            NAMES "${_cudart_name}.dll" "cudart64_${CUDAToolkit_VERSION_MAJOR}.dll" "cudart64_12.dll" "cudart64.dll"
+            HINTS "${CUDAToolkit_BIN_DIR}" "${_cudart_dir}" "${_cudart_dir}/../bin")
+    endif()
+endif()
 
-# Copy only the core ORT DLLs that are always needed.
-# EP DLLs and TRT RTX runtime are optional — copied if found.
+set(_onnxruntime_example_runtime_files "")
 if(WIN32)
-    copy_file_to_bin_dir(${ONNXRUNTIME_DLL})
-    copy_file_to_bin_dir(${ONNXRUNTIME_PROVIDERS_SHARED_DLL})
-    if(ONNXRUNTIME_TRT_EP_DLL)
-        copy_file_to_bin_dir(${ONNXRUNTIME_TRT_EP_DLL})
+    if(ONNXRUNTIME_DLL)
+        list(APPEND _onnxruntime_example_runtime_files "${ONNXRUNTIME_DLL}")
     endif()
-    if(TRTRTX_DLL)
-        copy_file_to_bin_dir(${TRTRTX_DLL})
-    endif()
-    if(TRTRTX_PARSER_DLL)
-        copy_file_to_bin_dir(${TRTRTX_PARSER_DLL})
-    endif()
-    if(ONNXRUNTIME_CUDA_EP_DLL)
-        copy_file_to_bin_dir(${ONNXRUNTIME_CUDA_EP_DLL})
+    if(ONNXRUNTIME_PROVIDERS_SHARED_DLL)
+        list(APPEND _onnxruntime_example_runtime_files "${ONNXRUNTIME_PROVIDERS_SHARED_DLL}")
     endif()
 else()
-    copy_file_to_bin_dir(${ONNXRUNTIME_LIB})
-    copy_file_to_bin_dir(${ONNXRUNTIME_PROVIDERS_SHARED_LIB})
-    if(ONNXRUNTIME_TRT_EP_LIB)
-        copy_file_to_bin_dir(${ONNXRUNTIME_TRT_EP_LIB})
+    if(ONNXRUNTIME_LIB)
+        list(APPEND _onnxruntime_example_runtime_files "${ONNXRUNTIME_LIB}")
     endif()
-    if(TRTRTX_LIB)
-        copy_file_to_bin_dir(${TRTRTX_LIB})
-    endif()
-    if(TRTRTX_PARSER_LIB)
-        copy_file_to_bin_dir(${TRTRTX_PARSER_LIB})
-    endif()
-    if(ONNXRUNTIME_CUDA_EP_LIB)
-        copy_file_to_bin_dir(${ONNXRUNTIME_CUDA_EP_LIB})
+    if(ONNXRUNTIME_PROVIDERS_SHARED_LIB)
+        list(APPEND _onnxruntime_example_runtime_files "${ONNXRUNTIME_PROVIDERS_SHARED_LIB}")
     endif()
 endif()
+
+if(NOT TARGET onnxruntime_runtime_dependencies AND _onnxruntime_example_runtime_files)
+    add_custom_target(onnxruntime_runtime_dependencies
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${RUNTIME_DIRECTORY}/$<CONFIG>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_onnxruntime_example_runtime_files}
+            "${RUNTIME_DIRECTORY}/$<CONFIG>"
+        COMMENT "Copying ONNX Runtime runtime dependencies"
+        VERBATIM
+    )
+endif()
+if(TARGET onnxruntime_runtime_dependencies)
+    add_dependencies(onnxruntime_interface onnxruntime_runtime_dependencies)
+endif()
+unset(_onnxruntime_example_runtime_files)
+
+# Stage the EP and all of its dependencies beside the executables in bin.
+set(_trt_rtx_example_ep_runtime_files "")
+if(WIN32)
+    if(TRTRTX_DLL)
+        list(APPEND _trt_rtx_example_ep_runtime_files "${TRTRTX_DLL}")
+    endif()
+    if(TRTRTX_PARSER_DLL)
+        list(APPEND _trt_rtx_example_ep_runtime_files "${TRTRTX_PARSER_DLL}")
+    endif()
+    if(CUDART_DLL)
+        list(APPEND _trt_rtx_example_ep_runtime_files "${CUDART_DLL}")
+    endif()
+else()
+    if(TRTRTX_LIB)
+        list(APPEND _trt_rtx_example_ep_runtime_files "${TRTRTX_LIB}")
+    endif()
+    if(TRTRTX_PARSER_LIB)
+        list(APPEND _trt_rtx_example_ep_runtime_files "${TRTRTX_PARSER_LIB}")
+    endif()
+    if(_cudart_loc)
+        list(APPEND _trt_rtx_example_ep_runtime_files "${_cudart_loc}")
+    endif()
+endif()
+
+if(NOT TARGET TensorRTRtxEp AND _trt_rtx_example_ep_runtime_files)
+    add_custom_target(trt_rtx_example_ep_runtime_dependencies
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${RUNTIME_DIRECTORY}/$<CONFIG>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_trt_rtx_example_ep_runtime_files}
+            "${RUNTIME_DIRECTORY}/$<CONFIG>"
+        COMMENT "Copying TensorRT RTX EP runtime dependencies"
+        VERBATIM
+    )
+endif()
+unset(_trt_rtx_example_ep_runtime_files)

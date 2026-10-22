@@ -1315,9 +1315,14 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
                                      int32_t arithmetic_type, std::optional<int64_t> axis_attr, int64_t block_size,
                                      size_t& unique_id, LoweredQdqInfo& lowered_qdq_info)
 {
-    // Only fp32/fp64 folding is safe; fp16/bf16 folding would lose precision
-    // relative to what the runtime path would have produced.
-    if (arithmetic_type != onnx::TensorProto_DataType_FLOAT && arithmetic_type != onnx::TensorProto_DataType_DOUBLE)
+    // fp32/fp64 fold directly. fp16/bf16 fold in fp32 then Cast to the output
+    // dtype (keeps precision). Not folding fp16/bf16 would fall back to
+    // int8 const -> Cast -> Sub -> Mul, which TRT rejects (a quantized constant
+    // may only feed a DQ node), so the engine build fails.
+    const bool fold_in_fp32_then_cast =
+        arithmetic_type == onnx::TensorProto_DataType_FLOAT16 || arithmetic_type == onnx::TensorProto_DataType_BFLOAT16;
+    const int32_t storage_type = fold_in_fp32_then_cast ? onnx::TensorProto_DataType_FLOAT : arithmetic_type;
+    if (storage_type != onnx::TensorProto_DataType_FLOAT && storage_type != onnx::TensorProto_DataType_DOUBLE)
     {
         return false;
     }
@@ -1338,14 +1343,14 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
     const std::string folded_output_name = MakeLoweredName(node.output(0), "folded_constant", ++unique_id);
     auto* tensor_proto = graph.add_initializer();
     tensor_proto->set_name(folded_output_name);
-    tensor_proto->set_data_type(arithmetic_type);
+    tensor_proto->set_data_type(storage_type);
     tensor_proto->set_data_location(onnx::TensorProto_DataLocation_DEFAULT);
     for (const auto dim : input_tensor.dims())
     {
         tensor_proto->add_dims(dim);
     }
 
-    if (arithmetic_type == onnx::TensorProto_DataType_FLOAT)
+    if (storage_type == onnx::TensorProto_DataType_FLOAT)
     {
         std::vector<float> output_values(element_count);
         for (size_t i = 0; i < element_count; ++i)
@@ -1392,8 +1397,22 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
     }
     index.NoteInitializer(*tensor_proto);
 
-    AppendNode(nodes, node, "Identity", MakeLoweredName(node.output(0), "folded_identity", ++unique_id),
-               {folded_output_name}, {node.output(0)});
+    if (fold_in_fp32_then_cast)
+    {
+        // Real Cast (not Identity) so TRT won't prune it; ownership rides on
+        // its doc_string, with folded_constant_nodes as the remap safety net.
+        auto* cast_node = AppendNode(nodes, node, "Cast", MakeLoweredName(node.output(0), "folded_cast", ++unique_id),
+                                     {folded_output_name}, {node.output(0)});
+        auto* cast_attr = cast_node->add_attribute();
+        cast_attr->set_name("to");
+        cast_attr->set_type(onnx::AttributeProto_AttributeType_INT);
+        cast_attr->set_i(arithmetic_type);
+    }
+    else
+    {
+        AppendNode(nodes, node, "Identity", MakeLoweredName(node.output(0), "folded_identity", ++unique_id),
+                   {folded_output_name}, {node.output(0)});
+    }
     if (auto node_id = TryParseNodeId(node.doc_string()))
     {
         lowered_qdq_info.folded_constant_nodes.push_back({*node_id, node.output(0)});

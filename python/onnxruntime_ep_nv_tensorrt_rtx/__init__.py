@@ -39,7 +39,7 @@ _EP_DLL_NAMES = (
     "onnxruntime_providers_nv_tensorrt_rtx.dll",    # Windows
     "libonnxruntime_providers_nv_tensorrt_rtx.so",  # Linux
 )
-_KNOWN_EP_NAME = "nv_tensorrt_rtx"
+_KNOWN_EP_NAME = "NvTensorRTRTXExecutionProvider"
 _module_dir = pathlib.Path(__file__).parent.resolve()
 
 _LINUX_PRELOAD_ORDER = (

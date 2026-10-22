@@ -3,8 +3,8 @@
 The TensorRT RTX Execution Provider C++ Coding Guidelines are derived from several sources, primarily:
 
 - [NVIDIA TensorRT Coding Guidelines](https://github.com/NVIDIA/TensorRT/blob/main/CODING-GUIDELINES.md)
-- [AUTOSAR C++ 2014](https://www.autosar.org/fileadmin/user_upload/standards/adaptive/17-03/AUTOSAR_RS_CPP14Guidelines.pdf)
-- [MISRA C++ 2008](https://www.misra.org.uk/Activities/MISRAC/tabid/171/Default.aspx)
+- AUTOSAR C++14 Guidelines (AUTOSAR_RS_CPP14Guidelines)
+- MISRA C++:2008
 - [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)
 
 ---

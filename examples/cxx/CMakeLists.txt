@@ -70,6 +70,77 @@ endif()
 # Shared assets directory for Input.png used by samples 10, 20, and 30.
 set(ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
 
+# Stage the shared model and input image next to every sample executable.
+# Target-local post-build copies automatically follow each multi-config output
+# directory, so individual sample CMake files only need to name their targets.
+function(stage_candy_sample_assets)
+    if(NOT EXISTS "${CANDY_ONNX_PATH}")
+        message(WARNING "candy.onnx was not downloaded; samples will need it at runtime")
+        return()
+    endif()
+    foreach(_sample_target IN LISTS ARGN)
+        copy_file_to_target_runtime_dir(${_sample_target} "${CANDY_ONNX_PATH}")
+        if(EXISTS "${ASSETS_DIR}/Input.png")
+            copy_file_to_target_runtime_dir(${_sample_target} "${ASSETS_DIR}/Input.png")
+        endif()
+    endforeach()
+endfunction()
+
+# Add a Candy-based example with the common ORT links, EP dependency, shared
+# assets, model compile definition, and configuration-aware output layout.
+function(add_cxx_example target)
+    cmake_parse_arguments(ARG
+        "NO_COMMON_LIBRARIES;NO_EP_RUNTIME_DEPENDENCY"
+        "RUNTIME_DIRECTORY;MODEL_DEFINITION;TEST_NAME;INSTALL_COMPONENT"
+        "SOURCES;LIBRARIES"
+        ${ARGN})
+    if(NOT ARG_SOURCES)
+        message(FATAL_ERROR "add_cxx_example(${target}) requires SOURCES")
+    endif()
+    if(NOT ARG_RUNTIME_DIRECTORY)
+        set(ARG_RUNTIME_DIRECTORY "${RUNTIME_DIRECTORY}")
+    endif()
+    if(NOT ARG_INSTALL_COMPONENT)
+        set(ARG_INSTALL_COMPONENT examples)
+    endif()
+
+    add_executable(${target} ${ARG_SOURCES})
+    if(NOT ARG_NO_COMMON_LIBRARIES)
+        target_link_libraries(${target} PRIVATE onnxruntime_interface example_utils)
+    endif()
+    if(ARG_LIBRARIES)
+        target_link_libraries(${target} PRIVATE ${ARG_LIBRARIES})
+    endif()
+    if(NOT ARG_NO_EP_RUNTIME_DEPENDENCY)
+        add_ep_runtime_dependency(${target})
+    endif()
+    if(ARG_MODEL_DEFINITION)
+        target_compile_definitions(${target} PRIVATE ${ARG_MODEL_DEFINITION}="candy.onnx")
+    endif()
+
+    stage_candy_sample_assets(${target})
+    set_target_properties(${target} PROPERTIES
+        CXX_STANDARD 20
+        CXX_EXTENSIONS OFF
+        ARCHIVE_OUTPUT_DIRECTORY "${TRT_RTX_ARCHIVE_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY "${ARG_RUNTIME_DIRECTORY}"
+        RUNTIME_OUTPUT_DIRECTORY "${ARG_RUNTIME_DIRECTORY}"
+        TRT_RTX_INSTALL_COMPONENT "${ARG_INSTALL_COMPONENT}"
+    )
+    set_property(GLOBAL APPEND PROPERTY TRT_RTX_CXX_EXAMPLE_TARGETS ${target})
+    if(ARG_TEST_NAME)
+        add_test(
+            NAME "${ARG_TEST_NAME}"
+            COMMAND $<TARGET_FILE:${target}>
+            WORKING_DIRECTORY $<TARGET_FILE_DIR:${target}>
+        )
+        set_tests_properties("${ARG_TEST_NAME}" PROPERTIES
+            LABELS "examples"
+            TIMEOUT 300
+        )
+    endif()
+endfunction()
+
 add_subdirectory(10_ep-device-selection)
 add_subdirectory(20_devicetensors-datatransfer)
 add_subdirectory(21_devicetensors-datatransfer-async)

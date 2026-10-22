@@ -1,14 +1,19 @@
-# NvTensorRTRTX EP Technical Notes
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Provider technical notes
 
 In-depth notes on selected features and behaviors of the NvTensorRTRTX execution provider.
 Each section is self-contained; new topics are appended as they come up.
 
-- [Synchronous GPU allocation (`nv_use_sync_gpu_allocator`)](#synchronous-gpu-allocation-nv_use_sync_gpu_allocator)
-- [Weightless EPContext refit (`nv_weight_stripped_engine_enable_experimental`) — experimental](#weightless-epcontext-refit-nv_weight_stripped_engine_enable_experimental--experimental)
+- [Synchronous GPU allocation](#synchronous-gpu-allocation)
+- [Weightless EPContext refit — experimental](#weightless-epcontext-refit--experimental)
 
 ---
 
-## Synchronous GPU allocation (`nv_use_sync_gpu_allocator`)
+## Synchronous GPU allocation
 
 How to disable TensorRT RTX's asynchronous CUDA memory allocation (`cudaMallocAsync`) in the
 NvTensorRTRTX execution provider, why you would want to, and what it costs.
@@ -28,7 +33,7 @@ graphs. However, it has proven unreliable in some RTX deployment environments:
 - Under **CiG (CUDA in Graphics)** — D3D12/Vulkan interop scenarios — `cudaMallocAsync` can fail
   outright.
 - On Windows, the async pool can exhaust the process **virtual address space while VRAM is still
-  available** (a known CUDA driver bug), producing out-of-memory failures that depend on
+  available** (a CUDA driver issue), producing out-of-memory failures that depend on
   process history rather than actual memory pressure.
 - The resulting behavior differs across configurations (dedicated GPU vs. shared/iGPU, app VA
   layout), making failures nondeterministic and hard to reproduce.
@@ -73,8 +78,8 @@ variable; async mode is restored by omitting the option or passing `"0"`.
 ```python
 import onnxruntime as ort
 
-ort.register_execution_provider_library("nv_tensorrt_rtx", ep_library_path)
-devices = [d for d in ort.get_ep_devices() if d.ep_name == "nv_tensorrt_rtx"]
+ort.register_execution_provider_library("NvTensorRTRTXExecutionProvider", ep_library_path)
+devices = [d for d in ort.get_ep_devices() if d.ep_name == "NvTensorRTRTXExecutionProvider"]
 
 so = ort.SessionOptions()
 # Disable async CUDA malloc (force synchronous allocation):
@@ -88,7 +93,7 @@ session = ort.InferenceSession("model.onnx", sess_options=so)
 
 ```cpp
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING);
-env.RegisterExecutionProviderLibrary("nv_tensorrt_rtx", ep_library_path);
+env.RegisterExecutionProviderLibrary("NvTensorRTRTXExecutionProvider", ep_library_path);
 
 std::vector<Ort::ConstEpDevice> selected;   // filter env.GetEpDevices() by EpName()
 
@@ -142,7 +147,7 @@ benefit from CUDA graph capture.
 
 ---
 
-## Weightless EPContext refit (`nv_weight_stripped_engine_enable_experimental`) — experimental
+## Weightless EPContext refit — experimental
 
 > **⚠️ EXPERIMENTAL — opt-in, not enabled by default.** The behavior, the provider-option name, and
 > the on-disk refit-table format may change or be removed in a future release. Enabling the option
@@ -163,28 +168,39 @@ with TensorRT-RTX's refitter.
 
 ### Requirements
 
-- **TensorRT-RTX 1.6 or newer — required.** The weightless capture/replay API and the weight-strip
-  build capability are only available from 1.6. Building or running this feature against an older
-  TensorRT-RTX is not supported.
+- **TensorRT-RTX 1.7 or newer — required.** The weight-strip build capability, the
+  `IRefitterObserver`/`RefitRecord` API and the parse-time emission point the capture uses,
+  `IParser::setRefitObserver`, are all taken from the TensorRT-RTX 1.7 release (also in the 1.8
+  development branch). Building or running this feature against an older TensorRT-RTX is not
+  supported (enforced at CMake configure time and by a compile-time guard in `src/nv_includes.h`).
 - **ONNX Runtime 1.27 or newer** — the feature relies on ORT's external-initializer-location callback
   and EPContext model-editor APIs.
 - **GPU-architecture floor.** Weight-stripping (`kSTRIP_PLAN`) is a build-time capability of the
   TensorRT-RTX builder (Myelin); whether it can be honored depends on the target GPU architecture
-  together with the installed TensorRT-RTX version. Some architectures need a specific patch build —
-  for example **SM120 / RTX 5090 requires TensorRT-RTX >= 1.6.1.106**. This floor is resolved when the
-  engine is actually built, so an unsupported combination fails at build time (see *Failure behavior*).
+  together with the installed TensorRT-RTX version. With the 1.7 minimum every architecture the EP
+  targets, including SM120 / RTX 50-series, is covered; the check is still resolved when the engine is
+  actually built, so an unsupported combination fails at build time (see *Failure behavior*).
 
 ### How it works
 
-- **Compile (capture).** With the option on, the EP builds the engine with the `kSTRIP_PLAN` and
-  `kREFIT_IDENTICAL` builder flags (a weight-stripped, refittable engine) and records a compact
-  **`ep_refit_table`**: for each engine weight, which ONNX initializer(s) it comes from and any
-  transform applied (identity, dtype cast, BatchNorm fold, constant). The refit-source initializers
-  are preserved as inputs on the exported EPContext node, so they travel with the model and can be
-  resolved by name at load.
-- **Load (refit).** The EP reads the `ep_refit_table`, resolves each source weight from the model's
-  kept initializers, and refits them into the deserialized engine via `IRefitter::setNamedWeights`
-  followed by `refitCudaEngine()`. No original ONNX model is required. The weightless path is selected
+- **Compile (capture).** With the option on, the EP attaches an observer to the ONNX parser
+  (`IParser::setRefitObserver`) before the compile parse and builds the engine with the `kSTRIP_PLAN`
+  and `kREFIT_IDENTICAL` builder flags (a weight-stripped, refittable engine). The parser emits one
+  record per refittable weight at the weight's creation site during the parse — no throwaway engine,
+  no refit pass — and the EP persists them as a compact **`ep_refit_table`**: for each engine weight,
+  which ONNX initializer(s) it comes from and any transform applied (identity, dtype cast/reinterpret,
+  BatchNorm fold, constant). Parse-time records are a candidate superset of the built engine's
+  refittable weights (the builder may fold some away); when the session has a live engine anyway they
+  are filtered against `IRefitter::getAllWeights` before export, otherwise (compile-only) the superset
+  is persisted and filtered at load. The refit-source initializers are preserved as inputs on the
+  exported EPContext node, so they travel with the model and can be resolved by name at load.
+- **Load (refit).** The EP reads the `ep_refit_table`, skips records the deserialized engine's
+  `IRefitter` does not report (the superset filter), resolves each remaining source weight from the
+  model's kept initializers, refits them via `IRefitter::setNamedWeights`, verifies that every weight
+  the engine reports as refittable was set (TensorRT-RTX's refitter reports no missing weights on a
+  stripped engine and `refitCudaEngine()` succeeds with weights left unset, so the EP performs this
+  coverage check itself and fails the load otherwise), and commits with `refitCudaEngine()`. No
+  original ONNX model is required. The weightless path is selected
   by the **presence of the `ep_refit_table` marker** on the node; a model without it loads normally.
   Weights are fully refit before execution, so **inference time is unchanged** — only load does extra
   work.
@@ -238,39 +254,41 @@ On enable, the session log shows (level WARNING):
 
 Because the feature is opt-in, failures surface as **clear errors** rather than silently degrading:
 
-- **Weight-strip build fails** (unsupported architecture/SDK — e.g. SM120 below 1.6.1.106): the compile
-  fails with `ORT_EP_FAIL` and a message naming the SDK floor. There is **no** automatic retry as a
-  non-stripped engine.
+- **Weight-strip build fails** (unsupported architecture/SDK combination): the compile fails with
+  `ORT_EP_FAIL` and a message naming the detected GPU and TensorRT-RTX version. There is **no**
+  automatic retry as a non-stripped engine.
 - **A refit source cannot be resolved at load** (e.g. the external weights file is missing): the load
   fails with `ORT_EP_FAIL` ("source weight … was not supplied"). The weights are required in order to
   refit; there is no fallback.
-- **Refit-table capture fails** (rare — the strip build succeeded but the table could not be produced):
-  the EP logs a warning and emits a stripped engine **without** a refit table. Such a model then
-  requires the **original ONNX** at load (the legacy original-ONNX refit path) and is not
-  self-contained.
+- **The refit table is empty after export filtering.** A weight-stripped compile always persists the
+  `ep_refit_table` attribute, even empty, because it is the marker the load path keys on. If the built
+  engine reports no refittable weights (the builder folded every candidate), the empty table is
+  correct and the model loads with nothing to refit. If instead the parse emitted no records for an
+  engine that does have refittable weights (rare), the compile logs a warning and the load fails with
+  the coverage error ("refit table does not cover N of N refittable engine weight(s)") rather than
+  running unrefitted weights. A capture that failed on allocation fails the compile itself.
 - **The option must be set at both compile and load.** If it is omitted at load, the kept refit-source
   initializers are pruned during partitioning and the refit fails with "source weight … not supplied".
 
 ### Known limitations (current version)
 
 - **Opt-in only, not default** — the option must be set at compile *and* load.
-- **TensorRT-RTX 1.6+ required**; older SDKs are not supported.
+- **TensorRT-RTX 1.7+ required**; older SDKs are not supported.
 - **Not a single self-contained file** when weights are externalized — the weights file/buffer is
   needed at load.
 - **No fallback** — an unsupported arch/SDK, a failed capture, or a missing weight is a hard, clear
   error, by design for an opt-in experimental path.
 - **BatchNorm fold supports float32 sources only** — fp16/double BatchNorm sources are rejected with a
   clear error.
-- **Quantized / MatMulNBits (INT4) weights are not refit-captured.** The refit table only records the
-  weights the TensorRT-RTX parser reports as standard refittable weights; it has no transform for a
-  `MatMulNBits`-style packed set (`{INT4 weight + scales + zero-points}`). When such an op is executed by
-  a TensorRT plugin, its weights live in the plugin's own serialized state and are invisible to the
-  capture — they stay baked into the "stripped" engine (so weightless yields no size/dedup benefit for
-  them, and there is a risk of incorrect results if the SDK strips them without the capture re-reporting
-  them). When the op is lowered to `DequantizeLinear` + `MatMul`, the scale/zero-point initializers may be
-  pruned during partitioning, in which case the export aborts with a clear "refit source … was not
-  preserved" error. Net: **INT4-quantized LLMs (e.g. `MatMulNBits` produced by WebNN/Olive) are not
-  reliably supported by weightless in this version.**
+- **Plugin-owned weights are not stripped and not captured.** Ops whose weights travel as plugin
+  creation fields (e.g. the Edge-LLM plugin family) keep those bytes in the plugin's serialized state
+  inside the plan; they are not TensorRT weights, so `kSTRIP_PLAN` leaves them in place and refit never
+  sees them — correct results, but no size/dedup benefit for those tensors. (`MatMulNBits` INT4 packed
+  weights, by contrast, *are* captured: the parser names its INT8 reinterpret of the UINT8 initializer
+  as a refittable weight and emits a byte-identical `kIDENTITY` record for it — TensorRT-RTX >= 1.7.)
+  If a refit source initializer is pruned during partitioning, the
+  export aborts with a clear "refit source … was not preserved" error rather than shipping an
+  unusable artifact.
 - **Limited model coverage.** Validated bit-exact on selected fp16 models (including a model above
   2 GB). Other classes may fail — see the INT4/`MatMulNBits` note above, and note computer-vision models
   are still under investigation. Validate on your target models.
@@ -279,8 +297,7 @@ Because the feature is opt-in, failures surface as **clear errors** rather than 
 
 The intent is to graduate weightless to the default engine format once it is robust and broadly
 validated — mirroring how TensorRT introduces experimental engine-builder flags before promoting them
-to defaults. Planned follow-ups include: enforcing the TensorRT-RTX 1.6 minimum at build configuration,
-making loading fully format-driven (no option required at load), adding a build-time fallback if it
+to defaults. Planned follow-ups include: making loading fully format-driven (no option required at load), adding a build-time fallback if it
 becomes the default, and adopting an ORT-side initializer-prune-suppression change to simplify the
 compile path.
 
@@ -292,6 +309,7 @@ compile path.
   strip → reload → run test.
 - `src/weightless_refit.h`, `src/weightless_refit.cc` — refit-table format (serialize/deserialize) and
   source-name collection.
-- `src/tensorrt_rtx_execution_provider.cc` — capture (`CaptureWeightlessRefitTable`) and replay
+- `src/tensorrt_rtx_execution_provider.cc` — capture (`WeightlessRefitCaptureObserver` attached to the
+  compile parse via `IParser::setRefitObserver`, plus `FilterRefitRecordsToEngine`) and replay
   (`WeightlessRefitEngineImpl`).
 - `src/onnx_ctx_model_helper.cc` — EPContext export and the load-time refit (`TryWeightlessRefit`).

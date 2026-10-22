@@ -72,6 +72,7 @@ struct TestParameters
 
 struct VkResources
 {
+    vk::detail::DynamicLoader dynamic_loader;
     vk::detail::DispatchLoaderDynamic loader;
     VkInstance instance{};
     VkDevice device{};
@@ -229,7 +230,13 @@ std::optional<uint32_t> FindQueueFamily(VkResources& resources, VkPhysicalDevice
 
 void InitVulkanInterop(VkResources& resources)
 {
-    resources.loader.init();
+    auto get_instance_proc_addr =
+        resources.dynamic_loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    if (!get_instance_proc_addr)
+    {
+        GTEST_SKIP() << "Vulkan loader is not available";
+    }
+    resources.loader.init(get_instance_proc_addr);
 
     VkApplicationInfo app_info{};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -623,6 +630,10 @@ void TestVulkanInterop(const TestParameters& test_parameters)
 
     VkResources resources;
     InitVulkanInterop(resources);
+    if (::testing::Test::IsSkipped() || ::testing::Test::HasFatalFailure())
+    {
+        return;
+    }
 
     ASSERT_FALSE(resources.nv_devices.empty());
     ASSERT_FALSE(resources.nv_devices[0].ep_devices.empty());
@@ -680,6 +691,7 @@ void TestVulkanInterop(const TestParameters& test_parameters)
             break;
         }
     }
+    ASSERT_NE(selected_device, -1) << "No CUDA device matched the selected Vulkan device UUID";
 
     int cig_supported = 0;
     ASSERT_EQ(cudaSuccess, cudaDeviceGetAttribute(&cig_supported, cudaDevAttrVulkanCigSupported, selected_device));
